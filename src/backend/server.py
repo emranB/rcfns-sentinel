@@ -84,7 +84,8 @@ ANSWER_INSTRUCTIONS = (
     "For a question with several parts, answer each part and connect the relevant documents. "
     "Preserve row and column associations, dates, units, and qualifications. In tables, "
     "use the original column order and only pair a value with a heading if the alignment is clear. "
-    "Use indentation to interpret the hierarchy of outlines. "
+    "In outlines, equally indented items are siblings. Use the section headings "
+    "and surrounding structure in the same document to identify their parent. "
     "For a current question, use the newest applicable dated record and reconcile later changes "
     "against earlier records. Give the date of the evidence. Treat targets, capacity, and "
     "interview samples as different from actual counts. To answer a membership count from a roll "
@@ -1085,7 +1086,7 @@ async def respond_to_question(
         baseline = select_evidence(chain(named_hits, broad_hits), EXCERPT_BUDGET)
     dialogue = conversation(payload.history)
     evidence = baseline
-    answer_question = scoped
+    follow_up_context = ""
     mode: Literal["standard", "agentic"] = "standard"
     if payload.mode == "agentic":
         try:
@@ -1096,8 +1097,11 @@ async def respond_to_question(
             )
             if additional:
                 evidence = [*baseline, *additional]
-                answer_question = investigation.question
                 mode = "agentic"
+                if payload.history and investigation.question != scoped:
+                    follow_up_context = (
+                        f"\nResolved follow-up context: {investigation.question}"
+                    )
         except (
             httpx.HTTPError,
             TimeoutError,
@@ -1122,8 +1126,8 @@ async def respond_to_question(
         generated = await generate(
             state,
             ANSWER_INSTRUCTIONS,
-            f"Recent conversation:\n{dialogue}\n\nSource paths:\n{paths}\n\n"
-            f"Document text:\n{excerpts}\n\nQuestion:\n{answer_question}",
+            f"Recent conversation:\n{dialogue}{follow_up_context}\n\nSource paths:\n{paths}\n\n"
+            f"Document text:\n{excerpts}\n\nQuestion:\n{scoped}",
         )
         answer, sources = cited_answer(generated.strip() or answer, sources)
     return ChatResponse(answer=answer, sources=sources, mode_used=mode)

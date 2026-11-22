@@ -35,7 +35,7 @@ class OfficeTextRecoveryTests(unittest.TestCase):
                 recover_office_text(path).text, "Header\nOpening line\nText box\nFooter"
             )
 
-    # Restore explicit Word offsets only where complete excerpt lines match uniquely.
+    # Restore equivalent visual indents and keep ambiguous or partial lines unchanged.
     def test_word_outline_retains_verified_indentation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = make_package(
@@ -46,7 +46,9 @@ class OfficeTextRecoveryTests(unittest.TestCase):
                         "<w:p><w:r><w:t>Heading</w:t></w:r></w:p>"
                         '<w:p><w:pPr><w:ind w:left="720"/></w:pPr>'
                         "<w:r><w:t>First child</w:t></w:r></w:p>"
-                        '<w:p><w:pPr><w:ind w:start="1440"/></w:pPr>'
+                        '<w:p><w:pPr><w:ind w:firstLine="720"/></w:pPr>'
+                        "<w:r><w:t>Second child</w:t></w:r></w:p>"
+                        '<w:p><w:pPr><w:ind w:start="720" w:firstLine="720"/></w:pPr>'
                         "<w:r><w:t>Grandchild</w:t></w:r></w:p>"
                         '<w:p><w:pPr><w:ind w:left="720"/></w:pPr>'
                         "<w:r><w:t>Duplicate</w:t></w:r></w:p>"
@@ -55,10 +57,11 @@ class OfficeTextRecoveryTests(unittest.TestCase):
                     ),
                 },
             )
-            text = "Heading\r\nFirst   child\r\nGrandchild\r\nDuplicate\r\nFirst\r\n"
+            text = "Heading\r\nFirst   child\r\nSecond child\r\nGrandchild\r\nDuplicate\r\nFirst\r\n"
             self.assertEqual(
                 restore_word_outline(path.read_bytes(), text),
-                "Heading\r\n    First   child\r\n        Grandchild\r\nDuplicate\r\nFirst\r\n",
+                "Heading\r\n    First   child\r\n    Second child\r\n"
+                "        Grandchild\r\nDuplicate\r\nFirst\r\n",
             )
 
     # Retain the evidence if the original package or markup cannot be read.

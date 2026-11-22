@@ -304,7 +304,9 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         question = "Summarize the key numbers in 1 line."
         filename = "data/Annual Accounts.pdf"
         async with httpx.AsyncClient() as client:
-            state = RagflowSession(client, source_paths={"Annual Accounts.pdf": filename})
+            state = RagflowSession(
+                client, source_paths={"Annual Accounts.pdf": filename}
+            )
             with patch.object(
                 server, "retrieve", AsyncMock(return_value=[])
             ) as retrieve:
@@ -352,22 +354,34 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 ) as generate,
             ):
                 question = "What do I need to bring, and when can I go?"
-                result = await server.respond_to_question(
-                    state, question, server.Question(question=question, mode="agentic")
+                earlier = server.ChatMessage(
+                    role="user", content="I need a replacement card."
                 )
-                self.assertEqual(result.mode_used, "agentic")
-                self.assertEqual(
-                    [source.url for source in result.sources],
-                    ["/sources/guide", "/sources/notice"],
-                )
-                args = generate.await_args
-                assert args is not None
-                prompt = str(args.args[2])
-                self.assertIn("When and how can I pick up my replacement card?", prompt)
-                self.assertLess(
-                    prompt.index(baseline.content),
-                    prompt.index(additional.content),
-                )
+                for history in ([], [earlier]):
+                    result = await server.respond_to_question(
+                        state,
+                        question,
+                        server.Question(
+                            question=question, mode="agentic", history=history
+                        ),
+                    )
+                    self.assertEqual(result.mode_used, "agentic")
+                    self.assertEqual(
+                        [source.url for source in result.sources],
+                        ["/sources/guide", "/sources/notice"],
+                    )
+                    args = generate.await_args
+                    assert args is not None
+                    prompt = str(args.args[2])
+                    self.assertTrue(prompt.endswith(f"\nQuestion:\n{question}"))
+                    self.assertEqual(
+                        "When and how can I pick up my replacement card?" in prompt,
+                        bool(history),
+                    )
+                    self.assertLess(
+                        prompt.index(baseline.content),
+                        prompt.index(additional.content),
+                    )
 
     # Verify that an unavailable agent generates the same prompt and sources as Standard.
     async def test_agentic_failure_preserves_standard_answer(self) -> None:

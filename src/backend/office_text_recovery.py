@@ -121,14 +121,15 @@ def paragraph_text(paragraph: Element) -> str:
     return "".join(parts).strip()
 
 
-# Read explicit paragraph indentation in twips from transitional or strict Word XML.
+# Read the first line's explicit visual offset in twips from Word XML.
 def word_indent(paragraph: Element, namespace: str) -> int | None:
     indent = paragraph.find(f"{namespace}pPr/{namespace}ind")
     if indent is None:
         return 0
     offset = indent.get(f"{namespace}start", indent.get(f"{namespace}left", "0"))
+    first_line = indent.get(f"{namespace}firstLine", "0")
     try:
-        return max(0, int(offset))
+        return max(0, int(offset) + int(first_line))
     except ValueError:
         return None
 
