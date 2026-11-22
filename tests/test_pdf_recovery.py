@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from src.backend.pdf_recovery import normalize_pdf
+from src.backend.pdf_recovery import has_shifted_pdf_index, normalize_pdf
 
 
 # Build a PDF prefix and a traditional xref with actual byte offsets.
@@ -41,6 +41,27 @@ LEGACY = pdf_sample(b"\r", 4, 4, 7)
 NORMAL = pdf_sample(b"\n", 0, 1, 0)
 
 
+# Add a normal classic revision while leaving its previous table as supplied.
+def append_revision(base: bytes, trailer: bytes = b"/Prev {previous}") -> bytes:
+    previous = base.rsplit(b"startxref", 1)[1].split()[0]
+    body = base + b"9 0 obj\n<< >>\nendobj\n"
+    current = str(len(body)).encode()
+    trailer = trailer.replace(b"{previous}", previous).replace(b"{current}", current)
+    return body + b"\n".join(
+        (
+            b"xref",
+            b"9 1",
+            f"{len(base):010d} 00000 n ".encode(),
+            b"trailer",
+            b"<< /Size 10 " + trailer + b" >>",
+            b"startxref",
+            current,
+            b"%%EOF",
+            b"",
+        )
+    )
+
+
 class PdfRecoveryTests(TestCase):
     # Keep valid index offsets untouched regardless of line-ending convention.
     def test_bypass_unaffected_files(self) -> None:
@@ -63,6 +84,23 @@ class PdfRecoveryTests(TestCase):
                         self.assertEqual(source.read_bytes(), data)
                 command.assert_not_called()
             self.assertFalse(cache.exists())
+
+    # Find an earlier defective table only through real decreasing Prev entries.
+    def test_checks_earlier_classic_revisions(self) -> None:
+        examples = (
+            (append_revision(append_revision(LEGACY)), True),
+            (append_revision(NORMAL), False),
+            (append_revision(LEGACY, b"/ID [(text /Prev {previous}) <ab>]"), False),
+            (append_revision(LEGACY, b"% /Prev {previous}\n"), False),
+            (append_revision(LEGACY, b"/Prev {current}"), False),
+            (append_revision(LEGACY, b"/Prev 9999999999"), False),
+        )
+        with TemporaryDirectory() as work:
+            source = Path(work) / "revisions.pdf"
+            for data, expected in examples:
+                with self.subTest(expected=expected, trailer=data[-105:]):
+                    source.write_bytes(data)
+                    self.assertIs(has_shifted_pdf_index(source), expected)
 
     # Write a complete derivative once even if the same bytes have another name.
     def test_normalize_legacy_and_reuse_cache(self) -> None:

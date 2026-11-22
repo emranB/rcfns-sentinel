@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from src.backend.source_recovery import recovery_folder
 
 PDF_TAIL_BYTES = 64 * 1024
+PDF_XREF_BYTES = 1024 * 1024
+MAX_XREF_REVISIONS = 16
 PDF_LINE_END = rb"(?:\r\n|\r|\n)"
 PDF_HEADER = re.compile(rb"\A%PDF-[0-9]\.[0-9][ \t]*" + PDF_LINE_END)
 NORMAL_PDF_HEADER = re.compile(rb"\A%PDF-[0-9]\.[0-9]\r?\n")
@@ -33,9 +35,66 @@ SKEWED_XREF = re.compile(
     )
 )
 OBJECT_HEADER = re.compile(rb"\A([0-9]{1,20})[ \t]+([0-9]{1,5})[ \t]+obj(?=[ \t\r\n])")
+CLASSIC_XREF = re.compile(rb"\Axref[ \t]*" + PDF_LINE_END)
+PDF_SPACE = rb"[\x00\t\n\f\r ]"
+TRAILER_SPACE = rb"(?:" + PDF_SPACE + rb"|%[^\r\n]*" + PDF_LINE_END + rb")*"
+PDF_INTEGER = rb"[0-9]{1,20}"
+PDF_STRING = rb"(?:<[0-9A-Fa-f\x00\t\n\f\r ]*>|\((?:\\[\s\S]|[^\\()])*\))"
+XREF_TRAILER = re.compile(
+    rb"(?:\A|[\r\n])trailer"
+    + TRAILER_SPACE
+    + rb"<<(.*?)>>"
+    + TRAILER_SPACE
+    + rb"startxref"
+    + PDF_SPACE
+    + rb"+("
+    + PDF_INTEGER
+    + rb")"
+    + PDF_SPACE
+    + rb"+%%EOF",
+    re.DOTALL,
+)
+TRAILER_ENTRY = re.compile(
+    TRAILER_SPACE
+    + rb"/([^\x00\t\n\f\r ()<>\[\]{}/%]+)"
+    + TRAILER_SPACE
+    + rb"("
+    + PDF_INTEGER
+    + rb"(?:"
+    + PDF_SPACE
+    + rb"+[0-9]{1,5}"
+    + PDF_SPACE
+    + rb"+R\b)?|"
+    + PDF_STRING
+    + rb"|\[(?:"
+    + TRAILER_SPACE
+    + PDF_STRING
+    + rb")*"
+    + TRAILER_SPACE
+    + rb"\])"
+)
+TRAILER_GAP = re.compile(TRAILER_SPACE)
 
 
-# Inspect the last classic xref for a misplaced object-zero sentinel.
+# Accept a direct Prev entry in the trailer that names the current table.
+def previous_xref(data: bytes, offset: int) -> int | None:
+    for trailer in XREF_TRAILER.finditer(data):
+        if int(trailer[2]) != offset:
+            continue
+        body = trailer[1]
+        cursor = 0
+        previous = None
+        while entry := TRAILER_ENTRY.match(body, cursor):
+            if entry[1] == b"Prev":
+                if previous is not None or not entry[2].isdigit():
+                    return None
+                previous = int(entry[2])
+            cursor = entry.end()
+        return previous if TRAILER_GAP.fullmatch(body, cursor) else None
+    return None
+
+
+# Inspect the classic xref chain for a misplaced object-zero sentinel.
 # The first in-use entry must point to the subsection's first object, one ID
 # lower than the xref row declares. Valid CR-only PDFs pass through.
 def has_shifted_pdf_index(source: Path) -> bool:
@@ -43,26 +102,43 @@ def has_shifted_pdf_index(source: Path) -> bool:
         if not PDF_HEADER.match(document.read(64)):
             return False
         size = document.seek(0, SEEK_END)
-        document.seek(max(0, size - PDF_TAIL_BYTES))
-        start = FINAL_STARTXREF.search(document.read(PDF_TAIL_BYTES))
+        tail_offset = max(0, size - PDF_TAIL_BYTES)
+        document.seek(tail_offset)
+        tail = document.read(PDF_TAIL_BYTES)
+        start = FINAL_STARTXREF.search(tail)
         if start is None or not 0 < int(start[1]) < size:
             return False
 
-        document.seek(int(start[1]))
-        table = SKEWED_XREF.match(document.read(512))
-        if table is None:
-            return False
-        first, count, offset, generation = map(int, table.groups())
-        if first == 0 or count < 2 or not 0 < offset < size:
-            return False
+        offset = int(start[1])
+        upper = size
+        for revision in range(MAX_XREF_REVISIONS):
+            document.seek(offset)
+            heading = document.read(512)
+            if not CLASSIC_XREF.match(heading):
+                return False
+            if table := SKEWED_XREF.match(heading):
+                first, count, object_offset, generation = map(int, table.groups())
+                if first and count >= 2 and 0 < object_offset < offset:
+                    document.seek(object_offset)
+                    actual = OBJECT_HEADER.match(document.read(64))
+                    if (
+                        actual
+                        and int(actual[1]) == first
+                        and int(actual[2]) == generation
+                    ):
+                        return True
 
-        document.seek(offset)
-        actual = OBJECT_HEADER.match(document.read(64))
-        return (
-            actual is not None
-            and int(actual[1]) == first
-            and int(actual[2]) == generation
-        )
+            if revision == 0:
+                data = tail[max(0, offset - tail_offset) :]
+            else:
+                document.seek(offset)
+                data = document.read(min(PDF_XREF_BYTES, upper - offset))
+            previous = previous_xref(data, offset)
+            if previous is None or not 0 < previous < offset:
+                return False
+            upper, offset = offset, previous
+
+    return False
 
 
 # Check that a cached or newly written derivative has a normal header and EOF.
