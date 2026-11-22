@@ -1,0 +1,9 @@
+**
+!main.py
+!requirements.txt
+!src/
+!src/**
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/dist

@@ -1,0 +1,139 @@
+name: rcfns-sentinel
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:-9388}:8000"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${DATA_DIRECTORY:-./data}
+        target: /app/data
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./config.json:/app/config.json:ro
+      - app-state:/state
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_THREADS: ${OLLAMA_THREADS:-0}
+      OLLAMA_SECONDARY_VISION_URL: ${OLLAMA_SECONDARY_VISION_URL:-}
+      OLLAMA_SECONDARY_VISION_THREADS: ${OLLAMA_SECONDARY_VISION_THREADS:-2}
+      RAGFLOW_URL: http://ragflow:9380/api/v1
+      CHAT_MODEL: ${CHAT_MODEL:-}
+      MAX_DOCUMENT_UPLOAD_SIZE: "${MAX_DOCUMENT_UPLOAD_SIZE:-268435456}"
+    depends_on:
+      - ragflow
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          status = urllib.request.urlopen('http://127.0.0.1:8000/status', timeout=3);
+          assert json.load(status)['ready']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30m
+
+  ragflow:
+    image: infiniflow/ragflow:v1.0.0
+    restart: unless-stopped
+    environment:
+      DOC_ENGINE: elasticsearch
+      ENABLE_REGISTER: "1"
+      REGISTER_ENABLED: "1"
+      NATS_HOST: nats
+      MAX_DOCUMENT_UPLOAD_SIZE: "${MAX_DOCUMENT_UPLOAD_SIZE:-268435456}"
+      RAGFLOW_INGESTOR_CONCURRENT_WORKERS: ${RAGFLOW_INGESTOR_CONCURRENT_WORKERS:-2}
+      RAGFLOW_INGESTOR_PAGE_CONCURRENCY: ${RAGFLOW_INGESTOR_PAGE_CONCURRENCY:-2}
+      RAGFLOW_DEEPDOC_INFERENCE_CONCURRENCY: ${RAGFLOW_DEEPDOC_INFERENCE_CONCURRENCY:-1}
+      RAGFLOW_DEEPDOC_INFERENCE_CPU_CORES: ${RAGFLOW_DEEPDOC_INFERENCE_CPU_CORES:-4}
+      REGISTER_LIMIT: "0"
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-infini_rag_flow}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-infini_rag_flow}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:-infini_rag_flow}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-infini_rag_flow}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      es01:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      kvrocks:
+        condition: service_started
+      nats:
+        condition: service_started
+
+  mysql:
+    image: mysql:8.0.40
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-infini_rag_flow}
+      MYSQL_DATABASE: rag_flow
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysql -uroot -h 127.0.0.1 rag_flow -e "SELECT 1"']
+      interval: 5s
+      retries: 30
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  es01:
+    image: elasticsearch:8.11.3
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-infini_rag_flow}
+      ES_JAVA_OPTS: -Xms768m -Xmx768m
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS -u "elastic:$$ELASTIC_PASSWORD" http://localhost:9200/']
+      interval: 5s
+      retries: 30
+    volumes:
+      - search-data:/usr/share/elasticsearch/data
+
+  minio:
+    image: pgsty/silo:RELEASE.2026-08-06T00-00-00Z
+    restart: unless-stopped
+    command: [server, /data]
+    environment:
+      MINIO_ROOT_USER: rag_flow
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-infini_rag_flow}
+    volumes:
+      - object-data:/data
+
+  kvrocks:
+    image: apache/kvrocks:2.16.0
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    entrypoint: [/bin/sh, /etc/kvrocks/entrypoint.sh]
+    user: "0:0"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-infini_rag_flow}
+    volumes:
+      - queue-data:/var/lib/kvrocks
+      - ./src/backend/kvrocks-entrypoint.sh:/etc/kvrocks/entrypoint.sh:ro
+
+  nats:
+    image: nats:2.14.2
+    restart: unless-stopped
+    command: [-js, -sd, /data]
+    volumes:
+      - event-data:/data
+
+volumes:
+  app-state:
+  mysql-data:
+  search-data:
+  object-data:
+  queue-data:
+  event-data:

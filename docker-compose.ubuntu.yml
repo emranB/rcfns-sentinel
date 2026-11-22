@@ -1,0 +1,52 @@
+services:
+  app:
+    environment:
+      OLLAMA_THREADS: ${OLLAMA_THREADS:-2}
+    depends_on:
+      ragflow:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+
+  ragflow:
+    cpus: ${RAGFLOW_CPU_LIMIT:-15}
+    mem_limit: ${RAGFLOW_MEMORY_LIMIT:-12g}
+    environment:
+      RAGFLOW_INGESTOR_CONCURRENT_WORKERS: ${RAGFLOW_INGESTOR_CONCURRENT_WORKERS:-6}
+      RAGFLOW_INGESTOR_PAGE_CONCURRENCY: ${RAGFLOW_INGESTOR_PAGE_CONCURRENCY:-3}
+      RAGFLOW_DEEPDOC_INFERENCE_CONCURRENCY: ${RAGFLOW_DEEPDOC_INFERENCE_CONCURRENCY:-3}
+      RAGFLOW_DEEPDOC_INFERENCE_CPU_CORES: ${RAGFLOW_DEEPDOC_INFERENCE_CPU_CORES:-12}
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  es01:
+    environment:
+      node.store.allow_mmap: "false"
+
+  ollama:
+    image: ollama/ollama:0.40.16
+    restart: unless-stopped
+    gpus: all
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_MODELS: /models
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_CONTEXT_LENGTH: "8192"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+    volumes:
+      - ollama-models:/models
+    networks:
+      default:
+        aliases:
+          - host.docker.internal
+    healthcheck:
+      test: [CMD, ollama, list]
+      interval: 5s
+      retries: 12
+
+volumes:
+  ollama-models:
