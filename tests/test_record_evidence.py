@@ -22,6 +22,49 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Compare tied facts only within the requested event, subject, and value type.
+    def test_approved_amount_and_form_count_require_their_own_evidence(self) -> None:
+        proposal = (
+            "Previous program total funding: $61,000.\n"
+            "The proposed budget is $18,000.\n"
+            "The panel approved $9,000 for tree planting.\n"
+            "How many endorsements are required to submit an application?: 2"
+        )
+        self.assertEqual(
+            field_evidence(
+                "What dollar amount was actually approved for trail repairs?", proposal
+            ),
+            "",
+        )
+        self.assertEqual(
+            field_evidence(
+                "What dollar amount was actually approved for tree planting?", proposal
+            ),
+            "The panel approved $9,000 for tree planting.",
+        )
+        self.assertEqual(
+            field_evidence(
+                "How many endorsements does the form say are required?", proposal
+            ),
+            "How many endorsements are required to submit an application?: 2",
+        )
+
+    # Preserve prerequisites from each numbered stage and the original day unit.
+    def test_prerequisites_and_relative_deadlines_are_complete(self) -> None:
+        policy = (
+            "Inspection 1: April\nFollowing receipt of the submitted drawings.\n"
+            "Inspection 2: May\nOnce the final checklist has been submitted.\n"
+            "Inspection forms must be filed within 5 business days."
+        )
+        self.assertEqual(
+            labeled_passage("What must be submitted before each inspection?", policy),
+            "\n".join(policy.splitlines()[:4]),
+        )
+        self.assertEqual(
+            labeled_passage("Explain the inspection form filing deadline", policy),
+            "Inspection forms must be filed within 5 business days.",
+        )
+
     # Each named duration must use its own amount and its own evidence.
     def test_coordinated_time_fields_are_verified_separately(self) -> None:
         first, second = requested_fields(

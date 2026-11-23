@@ -124,7 +124,7 @@ ANOTHER_QUESTION = re.compile(
     r"\band (?:what|when|where|why|who|how|whether)\b", re.IGNORECASE
 )
 PART_REQUEST = re.compile(
-    r"\b(?:what|when|where|who|how|why|which)\b|^\s*(?:report|give|list|identify|extract|provide)\b",
+    r"\b(?:what|when|where|who|how|why|which)\b|^\s*(?:report|give|list|identify|extract|provide|explain)\b",
     re.IGNORECASE,
 )
 LIST_REQUEST = re.compile(
@@ -158,16 +158,21 @@ NUMERIC_PART = re.compile(
 REQUESTED_LABEL = re.compile(r"\b(?:deadline|update)\b", re.IGNORECASE)
 CAP_TERMS = frozenset({"ceiling", "cap", "maximum", "limit"})
 FIELD_JOIN = re.compile(
-    r"[,;]?\s+and\s+(?=(?:what|when|where|who|how|whether|did|does|were)\b"
+    r"(?:[,;]\s+(?:and\s+)?|\s+and\s+)(?=(?:what|when|where|who|how|whether|did|does|were|(?:above|below|over|under) what)\b"
     r"|(?:the\s+)?(?:(?:actual|approved|exact|recorded|specific|annual)\s+)?"
-    r"(?:dates?|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|vote (?:count|tally)"
+    r"(?:dates?|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|salary|stipend|vote (?:count|tally)"
     r"|hours? (?:cap|limit)|reporting (?:cadence|frequency)|review interval)\b)",
+    re.IGNORECASE,
+)
+FIELD_SCOPE = re.compile(
+    r"^(?:and\s+)?(?:in|under|back to)\s+(?:that|the|this)\s+same\s+[^,:?]+[,:]\s*"
+    r"(?=(?:what|when|where|who|how|which|for)\b)",
     re.IGNORECASE,
 )
 EVENT_DATE_FIELD = re.compile(
     r"^(?:(?:what|which|give|report)(?:['\u2019]s|\s+is)?\s+)?(?:the\s+)?"
     r"(?:(?:exact|calendar|actual|specific|scheduled|recorded)\s+)?"
-    r"(?P<event>(?:[\w-]+\s+){0,3}?)dates?\b",
+    r"(?P<event>(?:[\w-]+\s+){0,3}?)(?:dates?|calendar day)\b",
     re.IGNORECASE,
 )
 PERIOD_FIELD = re.compile(
@@ -221,16 +226,21 @@ ROLE_ACCEPTANCE = re.compile(
 )
 ACCEPTED_ROLE = re.compile(r"\baccept(?:ed|s)\b", re.IGNORECASE)
 AWARD_AMOUNT = re.compile(
-    r"\b(?:how much|amount|total)\b[^?]{0,100}\b(?:awarded|disbursed|paid out)\b",
+    r"\b(?:how much|amount|total)\b[^?]{0,100}\b(?:awarded|disbursed|paid out|was (?:actually )?approved)\b",
     re.IGNORECASE,
 )
-REALIZED_PAYMENT = re.compile(r"\b(?:awarded|disbursed|paid out)\b", re.IGNORECASE)
+REALIZED_PAYMENT = re.compile(
+    r"\b(?:awarded|disbursed|paid out|approved (?:funding|grant|payment|amount|budget|[$])"
+    r"|(?:funding|grant|payment|amount|budget) (?:was )?approved)\b",
+    re.IGNORECASE,
+)
 REQUEST_AMOUNT = re.compile(
     r"\b(?:how much|what amount)\b[^?]{0,120}\brequest\w*\b", re.IGNORECASE
 )
 REQUESTED_PAYMENT = re.compile(r"\brequest\w*\b", re.IGNORECASE)
 PENDING_PAYMENT = re.compile(
-    r"\b(?:will|may|would|could|if|pending|maximum|up to)\b", re.IGNORECASE
+    r"\b(?:will|may|would|could|if|pending|maximum|up to|forecast\w*|proposed|requested)\b",
+    re.IGNORECASE,
 )
 UNIT_FIELD = re.compile(
     r"\b(?:how many\s+(?P<count>hours?|days?)|(?:annual\s+)?(?P<limit>hours?)\s+(?:cap|limit))\b",
@@ -250,8 +260,30 @@ RELATIVE_DELAY = re.compile(
     re.IGNORECASE,
 )
 COUNT_REQUIREMENT = re.compile(
-    r"\bhow many\s+(?P<item>[\w-]+(?:\s+[\w-]+){0,4}?)\s+(?:are|were)\s+(?:required|needed|expected)\b",
+    r"\bhow many\s+(?P<item>[\w-]+(?:\s+[\w-]+){0,4}?)\s+"
+    r"(?:does\s+.{1,45}?\s+(?:say|state|show)\s+)?(?:are|were)\s+(?:required|needed|expected)\b",
     re.IGNORECASE,
+)
+COUNT_LABEL = re.compile(rf"\?\s*:?\s*(?P<count>{TALLY_NUMBER})\s*\.?$", re.IGNORECASE)
+PERCENT_FIELD = re.compile(
+    r"^(?:what|which)\s+(?:percentage|percent)\b.*\bfor\s+(?P<subject>[^?]+)$",
+    re.IGNORECASE,
+)
+LIMIT_FIELD = re.compile(
+    r"^(?:above|over|below|under) what dollar amount\s+(?:is|are)\s+(?P<threshold>.+?)\s+(?:ineligible|eligible|allowed|permitted)\b"
+    r"|\bwhat dollar amount\s+is\s+(?:the\s+)?(?P<limit>combined [^?]+? limit)\b"
+    r"|\bwhat dollar amount\b[^?]*\b(?P<bound>minimum|maximum)\s+(?:size|value|amount)\s+of\s+(?P<subject>[^?]+)",
+    re.IGNORECASE,
+)
+STATED_COMPENSATION = re.compile(
+    r"^(?:what\s+(?:(?:annual|per[- ]\w+)\s+)?|(?:annual\s+)?)(salary|stipend)\b",
+    re.IGNORECASE,
+)
+CONTACT_FIELD = re.compile(
+    r"^what\s+[^?]*\b(?:hotline|phone|telephone)\s+number\b", re.IGNORECASE
+)
+PHONE_NUMBER = re.compile(
+    r"(?<!\d)(?:\+?\d{1,3}[- .]+)?(?:\(\d{3}\)|\d{3})[- .]*\d{3}[- .]+\d{4}\b"
 )
 MONEY_RANGE_FIELD = re.compile(
     r"\b(?:what|which)\s+range\s+of\s+[^?]{0,65}\b(?:amounts?|costs?|prices?|payments?)\b",
@@ -285,8 +317,50 @@ CADENCE_FIELD = re.compile(
     re.IGNORECASE,
 )
 DURATION_FIELD = re.compile(r"\b(?P<subject>[\w-]+) duration\b", re.IGNORECASE)
+LENGTH_FIELD = re.compile(
+    r"^how long (?:is|was|are|were)\s+(?P<subject>[^?]+)", re.IGNORECASE
+)
+RELATIVE_REVIEW = re.compile(
+    r"^when (?:is|was) (?:the |its )?(?P<position>mid[- ]?point|mid[- ]?term|end[- ]?of[- ]?term) review\b",
+    re.IGNORECASE,
+)
 DURATION_VALUE = re.compile(
-    rf"\b{TALLY_NUMBER}[- ]+(?:days?|weeks?|months?|years?|hours?)\b", re.IGNORECASE
+    rf"\b{TALLY_NUMBER}[- ]+(?:(?:business|working|calendar)\s+)?(?:days?|weeks?|months?|years?|hours?)\b",
+    re.IGNORECASE,
+)
+RECIPIENT_QUESTION = re.compile(
+    r"who (?:\w+ or )?(?:receives|reviews|gets) each\??", re.IGNORECASE
+)
+CADENCE_SUBJECT = re.compile(
+    r"^how often\s+(?:are\s+)?(?:(?P<subject>.+?)\s+(?:are\s+)?(?:prepared|issued|sent|published|produced)\b"
+    r"|.+?\s+(?:gives?|issues?|sends?|publishes|produces|provides?)\s+(?P<object>[^?;(]+))",
+    re.IGNORECASE,
+)
+RECIPIENT_PROOF = re.compile(
+    r"\b(?:for [\w ]{1,45} review|to (?:the |both )?\w+|reviewed by \w+)\b",
+    re.IGNORECASE,
+)
+RELATIVE_DEADLINE = re.compile(r"\b(?:within|no later than|at least)\b", re.IGNORECASE)
+ROLE_NOTIFICATION = re.compile(
+    r"\bfor (?:the )?(?P<first>[^,?]+?) and (?:the )?(?P<second>[^,?]+?) separately,\s*"
+    r"who (?:must|should|needs to) be (?:notified|informed) if (?P<event>[^?]+)",
+    re.IGNORECASE,
+)
+RELATIONSHIP_REQUEST = re.compile(
+    r"^which\b[^?]+?\bdoes\b[^?]+?\b(?P<relation>coordinate with|report to|collaborate with|consult with)\s+on\s+(?P<topic>[^?]+)",
+    re.IGNORECASE,
+)
+EACH_PREREQUISITE = re.compile(
+    r"^what (?:must|should|needs to) be (?P<action>\w+) before each (?P<step>[\w -]+)",
+    re.IGNORECASE,
+)
+NEGATIVE_CONDITION = re.compile(
+    r"^what (?:is done|happens) when (?P<event>.+?)\s+(?:can(?:not|'t)|is not|does not)\b",
+    re.IGNORECASE,
+)
+NEGATIVE_RULE = re.compile(
+    r"\b(?:when|if|where)\s+(?P<event>[^.,;]+?)\s+(?:can(?:not|'t)|is not|does not)\b[^,.;]+,\s*[^.;]+[.;]",
+    re.IGNORECASE,
 )
 APPROVAL_AUTHORITY = re.compile(
     r"\bwho\s+(?:(?:would|will|can|must|should)\s+)?"
@@ -410,6 +484,13 @@ def requested_parts(question: str) -> list[str]:
     for line in re.split(r"(?<=[.?!])\s+", question.strip()):
         if not PART_REQUEST.search(line):
             continue
+        if parts and RECIPIENT_QUESTION.fullmatch(line.strip()):
+            fields = requested_fields(parts[-1])
+            if len(fields) > 1 and all(
+                CADENCE_SUBJECT.search(field) for field in fields
+            ):
+                parts[-1:] = [f"{field} ({line})" for field in fields]
+                continue
         if command := LIST_REQUEST.match(line):
             parts.extend(
                 f"{command[0]}{item}"
@@ -425,9 +506,12 @@ def requested_parts(question: str) -> list[str]:
 # Keep an explicitly coordinated factual request separate from its neighbor.
 def requested_fields(part: str) -> list[str]:
     fields: list[str] = []
-    for piece in FIELD_JOIN.split(part):
+    pieces = FIELD_JOIN.split(FIELD_SCOPE.sub("", part.strip()))
+    if len(pieces) > 1 and not PART_REQUEST.search(pieces[0]):
+        pieces[:2] = [", ".join(pieces[:2])]
+    for piece in pieces:
         text = re.sub(
-            r"^(?:give|report|list|and|also)\s+(?=(?:who|what|when|where|how)\b)",
+            r"^(?:give|report|list|compare|and|also)\s+(?=(?:who|what|when|where|how)\b)",
             "",
             piece.strip().rstrip(" ?,.;"),
             flags=re.IGNORECASE,
@@ -437,6 +521,22 @@ def requested_fields(part: str) -> list[str]:
         else:
             fields.append(text)
     return fields
+
+
+# Return one literal passage when distinct phrasings give the same value.
+def matching_measure(
+    lines: list[str], measure: re.Pattern[str], terms: set[str]
+) -> str:
+    candidates: dict[frozenset[Decimal], str] = {}
+    for line in lines:
+        if focus_matches(frozenset(source_terms(line)), terms) != len(terms):
+            continue
+        numbers = frozenset(
+            number for match in measure.finditer(line) for number in values(match[0])
+        )
+        if numbers:
+            candidates.setdefault(numbers, line)
+    return next(iter(candidates.values())) if len(candidates) == 1 else ""
 
 
 # Match the event and value together before exposing a date, amount, or count to generation.
@@ -460,7 +560,7 @@ def field_evidence(question: str, text: str) -> str | None:
                 flags=re.IGNORECASE,
             )[0]
         )
-        terms = source_terms(event) - STOP - FIELD_TERMS
+        terms = source_terms(event) - STOP - FIELD_TERMS - {"actually"}
         if terms:
             dated = [
                 line
@@ -478,12 +578,27 @@ def field_evidence(question: str, text: str) -> str | None:
             )
             return "\n".join(dated)
     if AWARD_AMOUNT.search(question):
+        subject_match = re.search(
+            r"\b(?:awarded|disbursed|approved) (?:to|for)\s+([^?]+)",
+            question,
+            re.IGNORECASE,
+        )
+        recipient = (
+            source_terms(subject_match[1])
+            - STOP
+            - FIELD_TERMS
+            - {"specific", "project", "program"}
+            if subject_match
+            else set()
+        )
         return "\n".join(
             line
             for line in lines
             if CURRENCY_VALUE.search(line)
             and REALIZED_PAYMENT.search(line)
             and not PENDING_PAYMENT.search(line)
+            and focus_matches(frozenset(source_terms(line)), recipient)
+            == len(recipient)
         )
     if REQUEST_AMOUNT.search(question):
         stated = [
@@ -520,16 +635,29 @@ def field_evidence(question: str, text: str) -> str | None:
             and focus_matches(frozenset(source_terms(line)), trigger) == len(trigger)
         )
     if count := COUNT_REQUIREMENT.search(question):
-        terms = source_terms(count["item"]) - FIELD_TERMS
+        terms = source_terms(count["item"]) - STOP - FIELD_TERMS
         last = count["item"].split()[-1]
         amount = re.compile(
             rf"\b{TALLY_NUMBER}\s+(?:[\w-]+\s+){{0,4}}{re.escape(last)}\b",
             re.IGNORECASE,
         )
-        return "\n".join(
+        statements = [
             line
             for line in lines
             if amount.search(line) and terms <= source_terms(line)
+        ]
+        if statements:
+            return "\n".join(statements)
+        prompts = [*lines, *(f"{one} {two}" for one, two in pairwise(lines))]
+        return next(
+            (
+                line
+                for line in prompts
+                if (echo := COUNT_REQUIREMENT.search(line))
+                and terms == source_terms(echo["item"]) - STOP - FIELD_TERMS
+                and COUNT_LABEL.search(line)
+            ),
+            "",
         )
     if MONEY_RANGE_FIELD.search(question):
         ranged = []
@@ -542,6 +670,22 @@ def field_evidence(question: str, text: str) -> str | None:
             ):
                 ranged.append(line)
         return "\n".join(ranged)
+    if scheduled := CADENCE_SUBJECT.search(question):
+        topics = (
+            source_terms(scheduled["subject"] or scheduled["object"])
+            - STOP
+            - FIELD_TERMS
+        )
+        matches = [
+            line
+            for line in lines
+            if FREQUENCY.search(line)
+            and focus_matches(frozenset(source_terms(line)), topics) == len(topics)
+            and (
+                not RECIPIENT_QUESTION.search(question) or RECIPIENT_PROOF.search(line)
+            )
+        ]
+        return "\n".join(dict.fromkeys(matches[:2]))
     if cadence := CADENCE_FIELD.search(question):
         activity = (cadence["label"] or cadence["verb"]).casefold().removesuffix("ing")
         event = r"(?:updates?|report\w*)" if activity == "report" else rf"{activity}\w*"
@@ -571,8 +715,20 @@ def field_evidence(question: str, text: str) -> str | None:
                 == len(subjects)
             ]
         return "\n".join(matches)
-    if duration := DURATION_FIELD.search(question):
-        terms = source_terms(duration["subject"])
+    if midway := RELATIVE_REVIEW.search(question):
+        label = re.sub(r"[-\s]", "", midway["position"].casefold())
+        return next(
+            (
+                line
+                for previous, line in pairwise(lines)
+                if "review" in previous.casefold()
+                and DURATION_VALUE.search(line)
+                and label in re.sub(r"[-\s]", "", line.casefold())
+            ),
+            "",
+        )
+    if duration := DURATION_FIELD.search(question) or LENGTH_FIELD.match(question):
+        terms = source_terms(duration["subject"]) - STOP - FIELD_TERMS
         return "\n".join(
             line
             for line in lines
@@ -617,19 +773,44 @@ def field_evidence(question: str, text: str) -> str | None:
                 for match in PERIOD_FIELD.finditer(piece)
             )
         )
-    if re.search(r"\bdollar amount\b", question, re.IGNORECASE):
-        anchor = re.search(
+    if percentage := PERCENT_FIELD.search(question):
+        terms = source_terms(percentage["subject"]) - STOP - FIELD_TERMS
+        return matching_measure(
+            lines,
+            re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|percent\b)", re.IGNORECASE),
+            terms,
+        )
+    if limit := LIMIT_FIELD.search(question):
+        target = limit["threshold"] or limit["limit"] or limit["subject"]
+        terms = source_terms(target) - STOP - FIELD_TERMS
+        if limit["bound"]:
+            terms.add(limit["bound"].casefold())
+            terms.discard("eligible")
+        return matching_measure(lines, CURRENCY_VALUE, terms)
+    if compensation := STATED_COMPENSATION.search(question):
+        return matching_measure(lines, CURRENCY_VALUE, {compensation[1].casefold()})
+    if CONTACT_FIELD.search(question):
+        topics = (
+            source_terms(question)
+            - STOP
+            - PART_NOISE
+            - FIELD_TERMS
+            - {"direct", "provide", "policy", "number"}
+        )
+        return "\n".join(
+            line
+            for line in lines
+            if PHONE_NUMBER.search(line) and source_terms(line) & topics
+        )
+    if re.search(r"\bdollar amount\b", question, re.IGNORECASE) and (
+        anchor := re.search(
             r"\b(?:beside|next to|for)\s+(.+?)(?=\s+(?:on|in)\b|$)",
             question,
             re.IGNORECASE,
         )
-        terms = source_terms(anchor[1]) - STOP - {"a", "an", "the"} if anchor else set()
-        return "\n".join(
-            line
-            for line in lines
-            if CURRENCY_VALUE.search(line)
-            and focus_matches(frozenset(source_terms(line)), terms) == len(terms)
-        )
+    ):
+        terms = source_terms(anchor[1]) - STOP - FIELD_TERMS
+        return matching_measure(lines, CURRENCY_VALUE, terms)
     return None
 
 
@@ -659,6 +840,59 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if relationship := RELATIONSHIP_REQUEST.match(question):
+        topics = source_terms(relationship["topic"]) - STOP - FIELD_TERMS
+        contacts = {
+            line
+            for line in lines
+            if relationship["relation"].casefold() in normalized(line)
+            and focus_matches(frozenset(source_terms(line)), topics) == len(topics)
+        }
+        if len(contacts) == 1:
+            return next(iter(contacts))
+    if prerequisite := EACH_PREREQUISITE.match(question):
+        step = re.escape(prerequisite["step"].strip())
+        prerequisite_action = {prerequisite["action"].casefold()}
+        section = re.compile(rf"^{step}\s+\d+\b", re.IGNORECASE)
+        conditions: dict[str, str] = {}
+        headings = 0
+        label = ""
+        for line in lines:
+            if section.match(line):
+                label = line
+                headings += 1
+            elif label and focus_matches(
+                frozenset(source_terms(line)), prerequisite_action
+            ):
+                conditions.setdefault(label, line)
+        if len(conditions) == headings and headings > 1:
+            return "\n".join(f"{label}\n{proof}" for label, proof in conditions.items())
+    if condition := NEGATIVE_CONDITION.match(question):
+        event = source_terms(condition["event"]) - STOP - FIELD_TERMS
+        for rule in NEGATIVE_RULE.finditer(" ".join(lines)):
+            if event and event == source_terms(rule["event"]) - STOP - FIELD_TERMS:
+                return rule[0]
+    if notification := ROLE_NOTIFICATION.search(question):
+        roles = [normalized(notification[key]) for key in ("first", "second")]
+        event = source_terms(notification["event"]) - STOP - FIELD_TERMS
+        rules: dict[str, str] = {}
+        active = heading = ""
+        for line in lines:
+            heading_text = re.sub(r"^(?:title|role):\s*", "", normalized(line))
+            if heading_text in roles:
+                active, heading = heading_text, line
+            elif (
+                active
+                and re.search(
+                    r"\b(?:reported|communicated|disclosed|notified)\b",
+                    line,
+                    re.IGNORECASE,
+                )
+                and focus_matches(frozenset(source_terms(line)), event) == len(event)
+            ):
+                rules.setdefault(active, f"{heading}\n{line}")
+        if len(rules) == len(roles):
+            return "\n".join(rules[role] for role in roles)
     if method := SELECTION_METHOD.search(question):
         subjects = source_terms(method["object"]) - STOP - FIELD_TERMS
         matches = {
@@ -756,6 +990,19 @@ def labeled_passage(question: str, text: str) -> str:
     label = match[0].casefold()
     if label == "deadline":
         requested = source_terms(question)
+        topics = requested - STOP - PART_NOISE - FIELD_TERMS - {label, "explain"}
+        relative: dict[str, str] = {}
+        for line in lines:
+            if (
+                (delay := DURATION_VALUE.search(line))
+                and RELATIVE_DEADLINE.search(line)
+                and topics
+                and focus_matches(frozenset(source_terms(line)), topics)
+                >= min(2, len(topics))
+            ):
+                relative.setdefault(delay[0].casefold(), line)
+        if len(relative) == 1:
+            return next(iter(relative.values()))
         fields = sorted(
             (len(source_terms(heading) & requested), heading, value)
             for heading, value in pairwise(lines)

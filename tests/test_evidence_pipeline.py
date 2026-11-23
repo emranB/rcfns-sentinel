@@ -95,7 +95,24 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     state, part, server.Question(question=part, history=history)
                 )
         self.assertEqual([call.args[1] for call in select.await_args_list], [subject])
+        self.assertEqual(select.await_args_list[0].kwargs, {"pinned": ("maintenance",)})
         self.assertEqual(answer.await_args_list[0].args[1], part)
+
+    # Match the named record in a follow-up without letting the new topic change it.
+    def test_follow_up_refers_to_named_document_before_its_facts(self) -> None:
+        originals = [
+            ("meeting", "Operations/Weekly Planning/Team Charter.pdf"),
+            ("staff", "Personnel/Staff Charter.pdf"),
+        ]
+        previous = "Use Team Charter.pdf and Staff Charter.pdf. Summarize both."
+        self.assertEqual(
+            server.referenced_originals(
+                "Back to that same weekly planning charter: What staff expenses are covered?",
+                previous,
+                originals,
+            ),
+            ("meeting",),
+        )
 
     # Clear a draft warning only after checking the actual requested details.
     async def test_scoped_coverage_preserves_genuine_gaps(self) -> None:

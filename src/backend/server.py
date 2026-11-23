@@ -298,6 +298,10 @@ SAME_RECORD = re.compile(
     r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
     re.IGNORECASE,
 )
+REFERENCE_END = re.compile(
+    r"[,;:?!]|\s+(?:and|what|when|where|who|how|which|does|did|can|should|must)\b",
+    re.IGNORECASE,
+)
 COMPARISON_PART = re.compile(
     r"\b(?:compare|changed?|versus|difference)\b", re.IGNORECASE
 )
@@ -1160,6 +1164,31 @@ def earlier_record_scope(state: RagflowSession, history: list[ChatMessage]) -> s
     return ""
 
 
+# Resolve a follow-up by its document reference, excluding the facts it asks about.
+def referenced_originals(
+    question: str, earlier: str, originals: list[tuple[str, str]]
+) -> tuple[str, ...]:
+    if not (reference := SAME_RECORD.search(question)):
+        return ()
+    named = set(explicit_ids(earlier, originals))
+    if not named:
+        return ()
+    descriptor = REFERENCE_END.split(question[reference.end() :].strip(), maxsplit=1)[0]
+    terms = source_terms(descriptor)
+    ranked = []
+    for key, label in originals:
+        if key not in named:
+            continue
+        path = Path(label)
+        title = terms & source_terms(" ".join(title_tokens(path.stem)))
+        folders = terms & source_terms(" ".join(path.parts[-4:-1]))
+        ranked.append(((len(title | folders), len(title)), key))
+    ranked.sort(reverse=True)
+    if len(ranked) == 1 or (ranked[0][0] > ranked[1][0] and ranked[0][0][0]):
+        return (ranked[0][1],)
+    return ()
+
+
 # Merge repeated stand-alone quotes and carry all their proof references forward.
 def merge_quoted_passages(answer: str) -> str:
     blocks = answer.split("\n\n")
@@ -1427,13 +1456,16 @@ def inventory_answer(question: str, library: Library | None) -> str:
 
 
 # Fetch bounded primary evidence for each explicit title and each requested date.
-async def select_records(state: RagflowSession, scoped: str) -> RecordSelection:
+async def select_records(
+    state: RagflowSession, scoped: str, *, pinned: tuple[str, ...] = ()
+) -> RecordSelection:
     originals = list(indexed_originals(state))
-    named = explicit_ids(scoped, originals)
-    dated = dated_references(scoped, originals)
+    filenames = [] if pinned else explicit_ids(scoped, originals, filenames_only=True)
+    named = list(pinned) or filenames or explicit_ids(scoped, originals)
+    dated = [] if pinned else dated_references(scoped, originals)
     if not named and not dated:
         return RecordSelection()
-    if named and not dated:
+    if named and not dated and not pinned and not filenames:
         named = list(dict.fromkeys([*named, *named_document_ids(scoped, originals)]))
 
     # A date in the heading distinguishes undated filenames from their neighbors.
@@ -1899,7 +1931,8 @@ async def read_claims(
         instructions=(
             "Answer only the requested details. Keep the original labels for dates and events. "
             "Respect headings and paragraph groups. A question or suggestion does not "
-            "establish a decision."
+            "establish a decision. Keep each record's facts tied to its own subject, "
+            "including when comparing unrelated records."
         ),
         question=question,
     )
@@ -2003,6 +2036,28 @@ async def answer_parts(
         return RecordAnswer()
 
     originals = [(url, sources[indices[0]].path) for url, indices in by_source.items()]
+
+    # Separate coordinated clauses when they clearly name different originals.
+    def source_clause(field: str) -> str:
+        if len(originals) < 2:
+            return ""
+        terms = source_terms(field)
+        ranked = sorted(
+            (
+                (len(terms & source_terms(Path(path).stem)), url)
+                for url, path in originals
+            ),
+            reverse=True,
+        )
+        if ranked[0][0] >= 2 and ranked[0][0] > ranked[1][0]:
+            return ranked[0][1]
+        return ""
+
+    routed_parts = []
+    for part in parts:
+        fields = requested_fields(part)
+        owners = {source_clause(field) for field in fields}
+        routed_parts.extend(fields if "" not in owners and len(owners) > 1 else [part])
     plan: list[tuple[tuple[str, ...], str]] = []
     opening = re.split(r"(?<=[.?!])\s+", scoped.strip(), maxsplit=1)[0]
     comparison_ids = (
@@ -2010,7 +2065,7 @@ async def answer_parts(
         if COMPARISON_PART.search(opening)
         else ()
     )
-    for part in parts:
+    for part in routed_parts:
         if paired and comparison_focus(part):
             continue
         direct = explicit_ids(part, originals)
@@ -2037,6 +2092,9 @@ async def answer_parts(
         ]
         if len(versions) == 1:
             plan.append(((versions[0],), part))
+            continue
+        if not COMPARISON_PART.search(part) and (owner := source_clause(part)):
+            plan.append(((owner,), part))
             continue
         name_tables = [
             url
@@ -2091,7 +2149,7 @@ async def answer_parts(
             indices = [first]
         original_text = ""
         typed = any(field_evidence(part, "") is not None for part in fields)
-        if len(urls) == 1 and file_type == ".docx" and typed:
+        if len(urls) == 1 and file_type == ".docx":
             with suppress(httpx.HTTPError, OSError, TimeoutError):
                 async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
                     original_text = await asyncio.to_thread(
@@ -2108,6 +2166,9 @@ async def answer_parts(
                         state, original, suffix=".pdf", limit=PDF_TEXT_ARCHIVE_LIMIT
                     )
                     original_text = await asyncio.to_thread(pdf_text, payload)
+                    original_text = re.sub(
+                        r"(?<=[\w,])\n[ \t]+(?=[a-z])", " ", original_text
+                    )
 
         # A quote from the original PDF gets a document link when its page location is unknown.
         def original_reference(passage: str) -> int:
@@ -2535,6 +2596,7 @@ async def respond_to_question(
     record_question = question
     async with asyncio.timeout(25):
         record_scope = question
+        pinned: tuple[str, ...] = ()
         if payload.history and SAME_RECORD.search(question):
             originals = list(indexed_originals(state))
             if (
@@ -2543,7 +2605,12 @@ async def respond_to_question(
                 and (earlier := earlier_record_scope(state, payload.history))
             ):
                 record_scope = earlier
-        records = await select_records(state, record_scope)
+                pinned = referenced_originals(question, earlier, originals)
+        records = (
+            await select_records(state, record_scope, pinned=pinned)
+            if pinned
+            else await select_records(state, record_scope)
+        )
         if (
             not records.requested
             and record_scope == question
