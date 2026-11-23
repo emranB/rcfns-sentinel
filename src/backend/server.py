@@ -98,10 +98,16 @@ from src.backend.ragflow import (
 )
 from src.backend.record_lookup import (
     MAX_EXPLICIT_ORIGINALS,
+    MONTH_NUMBER,
+    FileAvailability,
     dated_references,
+    document_period,
+    exact_record_total,
     explicit_ids,
+    file_availability,
     has_record_date,
     mentioned_dates,
+    referenced_file,
     title_tokens,
 )
 from src.backend.roll_call import (
@@ -296,6 +302,10 @@ REFERENTIAL_QUESTION = re.compile(
     r"how much did (?:it|that|this) change|what about (?:it|that|the previous))\b",
     re.IGNORECASE,
 )
+SOURCE_PRONOUN = re.compile(
+    r"\b(?:its|this (?:file|document|record|report)|that (?:file|document|record|report))\b",
+    re.IGNORECASE,
+)
 RECORD_FOLLOW_UP = re.compile(
     r"^\s*(?:and|also|what about|how about)\b|\b(?:that|this|the same|the earlier|the other) "
     r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
@@ -396,6 +406,7 @@ class ChatResponse(BaseModel):
     mode_used: Literal["standard", "agentic"]
     roll_call: RollCallScope | None = None
     period_subject: str | None = None
+    evidence_context: EvidenceContext | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -423,6 +434,7 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
     roll_call: RollCallScope | None = None
     period_subject: str | None = Field(default=None, max_length=4000)
+    evidence_context: EvidenceContext | None = None
 
 
 class Question(BaseModel):
@@ -434,6 +446,27 @@ class Question(BaseModel):
 class FollowUpPlan(BaseModel):
     question: str = Field(min_length=1)
     queries: list[str] = Field(max_length=3)
+
+
+class EvidenceContext(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    document_ids: list[str] = Field(max_length=MAX_EXPLICIT_ORIGINALS)
+
+
+class SearchPlan(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    queries: list[str] = Field(max_length=2)
+    reuse_sources: bool
+    file_title: str = Field(max_length=160)
+    open_file: bool
+
+
+@dataclass(frozen=True)
+class VerifiedFile:
+    document_id: str
+    source: Citation
+    day: date | None
+    text: str
 
 
 class RollCallView(BaseModel):
@@ -1163,6 +1196,79 @@ def conversation(history: list[ChatMessage]) -> str:
     return "\n".join(f"{message.role}: {message.content[-500:]}" for message in history)
 
 
+# Save the resolved subject with the exact originals that supported the answer.
+def remember_evidence(response: ChatResponse, question: str) -> ChatResponse:
+    if response.evidence_context is not None or not response.sources:
+        return response
+    ids = list(
+        dict.fromkeys(
+            source.url.removeprefix("/sources/") for source in response.sources
+        )
+    )
+    return response.model_copy(
+        update={
+            "evidence_context": EvidenceContext(
+                question=question[:4000], document_ids=ids[:MAX_EXPLICIT_ORIGINALS]
+            )
+        }
+    )
+
+
+# Resolve conversational references and suggest searches before either mode retrieves.
+async def semantic_plan(
+    state: RagflowSession,
+    question: str,
+    history: list[ChatMessage],
+    prior: EvidenceContext | None,
+) -> SearchPlan:
+    references = ""
+    if prior is not None:
+        originals = [
+            state.source_paths.get(original[1], original[1])
+            for key in prior.document_ids
+            if (original := state.locate_document(key)) is not None
+        ]
+        references = f"Previous cited request: {prior.question}\nCited originals: {', '.join(originals)}\n"
+    fallback = SearchPlan(
+        question=question[:4000],
+        queries=[],
+        reuse_sources=False,
+        file_title="",
+        open_file=False,
+    )
+    with suppress(httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            answer = await generate(
+                state,
+                "Plan searches for a document library. Resolve the current question as a standalone request. "
+                "Preserve its action, entities, dates and other qualifiers. Do not answer or invent facts. "
+                "Resolve references using the conversation. Set reuse_sources only when the user asks about "
+                "the same cited original or continues the same request for facts from it. A new subject, year, "
+                "source, or request for other documents calls for a fresh search. "
+                "Provide up to two concise alternative search phrases using the vocabulary a document might use. "
+                "If the question clearly identifies a type or title of original, place its shortest distinctive "
+                "title phrase in file_title. Leave it empty for broad or multi-document questions. "
+                "Set open_file only when the user is asking to locate or open the file itself. "
+                "Return every field in the schema. Resolve possessives and pronouns such as its or it "
+                "to the previously cited original when the user is asking a follow-up about that record.",
+                f"{references}Conversation:\n{conversation(history)}\nCurrent question: {question}",
+                output_format=SearchPlan.model_json_schema(),
+                answer_tokens=280,
+            )
+            plan = SearchPlan.model_validate_json(answer)
+            explicit = set(YEAR.findall(question))
+            if explicit and explicit != set(YEAR.findall(plan.question)):
+                return fallback
+            if (
+                explicit
+                and prior is not None
+                and explicit != set(YEAR.findall(prior.question))
+            ):
+                plan = plan.model_copy(update={"reuse_sources": False})
+            return plan
+    return fallback
+
+
 # Identify search terms without mistaking a length instruction for a subject.
 def question_words(question: str) -> set[str]:
     return set(QUESTION_WORD.findall(WORD_LIMIT.sub("", question.casefold())))
@@ -1475,7 +1581,7 @@ async def record_opening(
 
 
 # Prefer the original text and layout when indexed excerpts split roster entries.
-async def membership_text(
+async def original_record_text(
     state: RagflowSession, opening: RetrievedChunk, source: Citation
 ) -> str:
     document_id = opening.document_id
@@ -1503,7 +1609,7 @@ async def load_roll_call(
     day = filename_date(Path(source.path).stem)
     if day is None or day.year != scope.year:
         return None
-    text = await membership_text(state, opening, source)
+    text = await original_record_text(state, opening, source)
     question = f"How many {scope.group} members do we have?"
     call = parse_roll_call(question, text, source=source.path)
     return RollCallRecord(scope, day, source, call) if call is not None else None
@@ -1537,6 +1643,140 @@ def membership_directory_rank(path: str, group: str, year: int) -> int | None:
     return None
 
 
+# Resolve a named document family to the best verified original for the requested period.
+async def resolve_file(
+    state: RagflowSession, requested: FileAvailability
+) -> tuple[bool, VerifiedFile | None]:
+    terms = source_terms(" ".join(title_tokens(requested.title)))
+    if not terms:
+        return False, None
+    year = str(requested.year)
+    candidates: list[tuple[str, str]] = []
+    named = False
+    for key, path in indexed_originals(state):
+        if not terms <= source_terms(" ".join(title_tokens(Path(path).stem))):
+            continue
+        named = True
+        candidates.append((key, path))
+    if not named:
+        return False, None
+
+    # Give the document itself priority over a draft, note, or attachment about it.
+    def auxiliary(path: str) -> bool:
+        qualifiers = {
+            "draft",
+            "template",
+            "agenda",
+            "kpi",
+            "note",
+            "checklist",
+            "summary",
+            "appendix",
+            "extract",
+        }
+        words = source_terms(" ".join(title_tokens(Path(path).stem)))
+        return bool((words - terms) & qualifiers)
+
+    # Prefer recent paths and the requested month when the original's date is still unknown.
+    def priority(candidate: tuple[str, str]) -> tuple[bool, bool, bool, int, int, str]:
+        path = candidate[1]
+        months = [
+            MONTH_NUMBER[word] for word in title_tokens(path) if word in MONTH_NUMBER
+        ]
+        month = months[-1] if months else 0
+        stem = Path(path).stem
+        return (
+            year not in YEAR.findall(path),
+            auxiliary(path),
+            requested.month is not None and month != requested.month,
+            -month,
+            len(title_tokens(stem)),
+            path,
+        )
+
+    workers = asyncio.Semaphore(4)
+
+    # Confirm dates from the heading before making a claim about any matching file.
+    async def verify(key: str) -> VerifiedFile | None:
+        async with workers:
+            with suppress(
+                httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError
+            ):
+                async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                    if (opening := await record_opening(state, key)) is None:
+                        return None
+                    source = citation(state, opening).model_copy(update={"regions": []})
+                    text = await original_record_text(state, opening, source)
+                    heading = "\n".join(
+                        line for line in text.splitlines() if line.strip()
+                    )[:1300]
+                    day = document_period(Path(source.name).stem, heading)
+                    if day is None:
+                        if requested.month is None and year in YEAR.findall(
+                            source.name
+                        ):
+                            return VerifiedFile(key, source, None, text)
+                    elif (
+                        day.year == requested.year
+                        and requested.month in (None, day.month)
+                        and requested.day in (None, day.day)
+                    ):
+                        return VerifiedFile(key, source, day, text)
+        return None
+
+    ranked = sorted(candidates, key=priority)[: 3 * MAX_EXPLICIT_ORIGINALS]
+    matches = [
+        match
+        for match in await asyncio.gather(*(verify(key) for key, _ in ranked))
+        if match
+    ]
+    return True, max(
+        matches,
+        key=lambda match: (not auxiliary(match.source.path), match.day or date.min),
+        default=None,
+    )
+
+
+# Return the original file directly when the user is asking to locate it.
+async def available_record(
+    state: RagflowSession, question: str, mode: Literal["standard", "agentic"]
+) -> ChatResponse | None:
+    if not (requested := file_availability(question)):
+        return None
+    named, match = await resolve_file(state, requested)
+    if not named:
+        return None
+    year = str(requested.year)
+    subject = f"Do you have the {requested.title}"
+    if match:
+        return verified_file_reply(requested, match, mode)
+    period = (
+        f"{date(requested.year, requested.month, 1):%B %Y}" if requested.month else year
+    )
+    return ChatResponse(
+        answer=f"I could not verify an indexed {requested.title} for {period}.",
+        sources=[],
+        mode_used=mode,
+        period_subject=subject,
+    )
+
+
+# Cite a located original without asking generation to prove catalog membership.
+def verified_file_reply(
+    requested: FileAvailability,
+    match: VerifiedFile,
+    mode: Literal["standard", "agentic"],
+) -> ChatResponse:
+    day, source = match.day, match.source
+    period = f"dated {day:%B} {day.day}, {day.year}" if day else f"for {requested.year}"
+    return ChatResponse(
+        answer=f"Yes. I found **{source.name}**, {period} [1].",
+        sources=[source],
+        mode_used=mode,
+        period_subject=f"Do you have the {requested.title}",
+    )
+
+
 # Verify a dated directory or interpret explicit service intervals from a register.
 async def load_membership_directory(
     state: RagflowSession, scope: RollCallScope
@@ -1548,7 +1788,9 @@ async def load_membership_directory(
     if rank is None:
         return None
     if rank < 2:
-        if result := contact_directory(await membership_text(state, opening, source)):
+        if result := contact_directory(
+            await original_record_text(state, opening, source)
+        ):
             heading, names = result
             return MembershipDirectory(scope, heading, source, names)
     else:
@@ -2861,11 +3103,40 @@ async def respond_to_question(
             payload.mode,
             RollCallView(output=prior.output, members=prior.members),
         )
-    response = await answer_question(state, question, scoped, payload, library)
+    response = remember_evidence(
+        await answer_question(state, question, scoped, payload, library),
+        scoped or question,
+    )
     subject = single_year_subject(scoped)
     if subject and len(subject) <= 4000:
         return response.model_copy(update={"period_subject": subject})
     return response
+
+
+# Route factual questions to the same verified original used for file lookup.
+async def answer_verified_file(
+    state: RagflowSession, question: str, payload: Question, match: VerifiedFile
+) -> ChatResponse:
+    if total := exact_record_total(question, match.text):
+        stamp = (
+            f"As of {match.day:%B} {match.day.day}, {match.day.year}\n\n"
+            if match.day
+            else ""
+        )
+        return remember_evidence(
+            ChatResponse(
+                answer=f"{stamp}> {total} [1]",
+                sources=[match.source],
+                mode_used=payload.mode,
+            ),
+            question,
+        )
+    selection = await select_records(state, question, pinned=(match.document_id,))
+    if match.day is not None:
+        selection.dates[match.document_id] = match.day
+    return remember_evidence(
+        await answer_records(state, question, payload, selection), question
+    )
 
 
 # Give the same verified membership evidence for names and counts in a specified year.
@@ -2926,6 +3197,8 @@ async def answer_question(
     inventory = inventory_answer(scoped, library)
     if inventory:
         return ChatResponse(answer=inventory, sources=[], mode_used="standard")
+    if available := await available_record(state, scoped, payload.mode):
+        return available
     years = requested_years(scoped)
     count_scope = dated_count_scope(scoped)
     group = roster_group(scoped)
@@ -2996,10 +3269,79 @@ async def answer_question(
         state, question, payload.history, payload.mode
     ):
         return membership
+    if target := referenced_file(scoped):
+        _, file_match = await resolve_file(state, target)
+        if file_match is not None:
+            return await answer_verified_file(state, scoped, payload, file_match)
     recent_hits = await retrieve_recent(state, scoped)
     membership = documented_membership(state, question, recent_hits, payload.mode)
     if membership is not None:
         return membership
+    prior = next(
+        (
+            message.evidence_context
+            for message in reversed(payload.history)
+            if message.role == "assistant" and message.evidence_context is not None
+        ),
+        None,
+    )
+    plan = await semantic_plan(state, scoped, payload.history, prior)
+    if prior is not None and (
+        plan.reuse_sources or (not years and SOURCE_PRONOUN.search(scoped))
+    ):
+        documents = tuple(
+            key for key in prior.document_ids if state.locate_document(key) is not None
+        )
+        if documents:
+            if len(documents) == 1:
+                original = None
+                with suppress(
+                    httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError
+                ):
+                    async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                        if opening := await record_opening(state, documents[0]):
+                            source = citation(state, opening).model_copy(
+                                update={"regions": []}
+                            )
+                            text = await original_record_text(state, opening, source)
+                            day = document_period(Path(source.name).stem, text[:1300])
+                            original = VerifiedFile(documents[0], source, day, text)
+                if original is not None:
+                    return await answer_verified_file(
+                        state, plan.question, payload, original
+                    )
+            selection = await select_records(state, plan.question, pinned=documents)
+            if selection.evidence:
+                return remember_evidence(
+                    await answer_records(state, plan.question, payload, selection),
+                    plan.question,
+                )
+    lookup = file_availability(scoped)
+    if lookup is None and plan.open_file and len(years) == 1:
+        lookup = FileAvailability(plan.file_title, years[0])
+    if lookup is not None:
+        aliases = list(
+            dict.fromkeys(
+                title
+                for candidate in (plan.file_title, *plan.queries)
+                if (title := YEAR.sub("", candidate).strip(" ,.-"))
+            )
+        )
+        for alias in aliases:
+            alternate = FileAvailability(alias, lookup.year, lookup.month, lookup.day)
+            _, file_match = await resolve_file(state, alternate)
+            if file_match is not None:
+                return verified_file_reply(
+                    lookup if lookup.title else alternate, file_match, payload.mode
+                )
+    elif plan.file_title and len(years) == 1:
+        _, file_match = await resolve_file(
+            state, FileAvailability(plan.file_title, years[0])
+        )
+        if file_match is not None:
+            return await answer_verified_file(state, plan.question, payload, file_match)
+    raw_scope, scoped = scoped, plan.question
+    years = requested_years(scoped) or years
     baseline = select_evidence(recent_hits, RECENT_EVIDENCE_BUDGET)
     periods = dated_document_ids(scoped, indexed_originals(state)) if years else {}
     if periods:
@@ -3023,6 +3365,36 @@ async def answer_question(
             retrieve_named(state, scoped), retrieve(state, scoped)
         )
         baseline = select_evidence(chain(named_hits, broad_hits), EXCERPT_BUDGET)
+    search_terms = list(
+        dict.fromkeys(
+            q.strip()[:500]
+            for q in plan.queries
+            if q.strip() and q.strip().casefold() != scoped.casefold()
+        )
+    )
+    if scoped != raw_scope:
+        search_terms.append(raw_scope[:500])
+    if search_terms:
+        scoped_ids = [key for ids in periods.values() for key in ids]
+        with suppress(TimeoutError):
+            async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                results = await asyncio.gather(
+                    *(
+                        retrieve(state, q, 6, document_ids=scoped_ids or None)
+                        for q in search_terms[:3]
+                    ),
+                    return_exceptions=True,
+                )
+                baseline += select_evidence(
+                    (
+                        item
+                        for batch in results
+                        if isinstance(batch, list)
+                        for item in batch
+                    ),
+                    2200,
+                    baseline,
+                )
     dialogue = conversation(payload.history)
     evidence = baseline
     follow_up_context = ""
@@ -3101,8 +3473,14 @@ async def answer_question(
                 proof_indices,
                 instructions=ANSWER_INSTRUCTIONS,
             )
-        answer, sources = cited_answer(generated.strip() or answer, sources)
-    return ChatResponse(answer=answer, sources=sources, mode_used=mode)
+        answer, sources = cited_answer(
+            generated.strip()
+            or "I found potentially relevant records, but could not verify the requested detail in their text.",
+            sources,
+        )
+    return remember_evidence(
+        ChatResponse(answer=answer, sources=sources, mode_used=mode), scoped
+    )
 
 
 # Create the app with its own HTTP client, startup task, and index state.

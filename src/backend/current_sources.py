@@ -1,6 +1,7 @@
 '''Find dated originals that match the subject and periods of a question.'''
 
 import re
+from calendar import month_abbr, month_name
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -21,6 +22,12 @@ MONTHS = (
     "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
     "aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
 )
+MONTH_HINT = {
+    alias.lower(): month
+    for month in range(1, 13)
+    for alias in (month_name[month], month_abbr[month])
+}
+MONTH_HINT["sept"] = 9
 EXPLICIT_PERIOD = re.compile(
     r"(?<!\d)(?:19|20)\d{2}(?:[-_.]?\d{2}){0,2}(?!\d)"
     r"|\b(?:yesterday|tomorrow)\b"
@@ -72,6 +79,7 @@ class DatedSource:
     topics: set[str]
     title_matches: int
     folder_matches: int
+    month_known: bool = True
 
 
 # Treat common singular and plural forms as the same search term.
@@ -126,10 +134,22 @@ def match_source(
 ) -> DatedSource | None:
     original = PurePosixPath(path.replace("\\", "/"))
     record_date = filename_date(original.stem)
+    month_known = record_date is not None
     if record_date is None and year_only:
-        for part in (original.stem, *reversed(original.parts[:-1])):
+        parts = (original.stem, *reversed(original.parts[:-1]))
+        for index, part in enumerate(parts):
             if len(years := YEAR.findall(part)) == 1:
-                record_date = date(int(years[0]), 1, 1)
+                month = next(
+                    (
+                        MONTH_HINT[word]
+                        for section in parts[: index + 1]
+                        for word in WORD.findall(section.casefold())
+                        if word in MONTH_HINT
+                    ),
+                    None,
+                )
+                month_known = month is not None
+                record_date = date(int(years[0]), month or 1, 1)
                 break
     if record_date is None or record_date > today:
         return None
@@ -147,7 +167,7 @@ def match_source(
         proximity * len(terms) for proximity, terms in enumerate(folders, 1)
     )
     return DatedSource(
-        document_id, path, record_date, matches, len(title), folder_score
+        document_id, path, record_date, matches, len(title), folder_score, month_known
     )
 
 
@@ -259,6 +279,7 @@ def dated_document_ids(
 # Reserve one record per month and sample across the full year when a series is large.
 def representative_ids(records: list[DatedSource]) -> list[str]:
     monthly: dict[int, DatedSource] = {}
+    undated = []
     for record in sorted(
         records,
         key=lambda item: (
@@ -268,11 +289,16 @@ def representative_ids(records: list[DatedSource]) -> list[str]:
             *source_order(item),
         ),
     ):
-        monthly.setdefault(record.record_date.month, record)
+        if record.month_known:
+            monthly.setdefault(record.record_date.month, record)
+        else:
+            undated.append(record)
     ordered = sorted(monthly.values(), key=lambda record: record.record_date)
     if len(ordered) > MAX_COMPARISON_DOCUMENTS:
         last = MAX_COMPARISON_DOCUMENTS - 1
         ordered = [
             ordered[round(i * (len(ordered) - 1) / last)] for i in range(last + 1)
         ]
-    return [record.document_id for record in ordered]
+    return [
+        record.document_id for record in [*ordered, *undated][:MAX_COMPARISON_DOCUMENTS]
+    ]

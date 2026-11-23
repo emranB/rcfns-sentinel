@@ -9,11 +9,17 @@ interface RollCallScope {
   directory?: boolean;
 }
 
+interface EvidenceContext {
+  question: string;
+  document_ids: string[];
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   roll_call?: RollCallScope;
   period_subject?: string;
+  evidence_context?: EvidenceContext;
 }
 
 export interface CitationRegion {
@@ -49,6 +55,7 @@ export interface ChatResponse {
   mode: AnswerMode;
   rollCall?: RollCallScope;
   periodSubject?: string;
+  evidenceContext?: EvidenceContext;
 }
 
 export const connecting: IndexStatus = {
@@ -81,6 +88,16 @@ function readRollCall(value: unknown): RollCallScope | undefined {
     output: output === 'names' ? 'names' : 'count',
     directory: directory === true,
   };
+}
+
+function readEvidenceContext(value: unknown): EvidenceContext | undefined {
+  if (!isObject(value) || typeof value.question !== 'string' || !Array.isArray(value.document_ids)) {
+    return undefined;
+  }
+  const documentIds = value.document_ids.filter((id): id is string =>
+    typeof id === 'string' && /^[A-Za-z0-9_-]+$/.test(id)
+  );
+  return documentIds.length ? { question: value.question, document_ids: documentIds } : undefined;
 }
 
 function isCoordinate(value: unknown): value is number {
@@ -161,5 +178,6 @@ export async function askQuestion(
     mode: data.mode_used === 'agentic' ? 'agentic' : 'standard',
     rollCall: readRollCall(data.roll_call),
     periodSubject: typeof data.period_subject === 'string' ? data.period_subject : undefined,
+    evidenceContext: readEvidenceContext(data.evidence_context),
   };
 }

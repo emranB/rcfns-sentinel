@@ -198,6 +198,7 @@ function recentHistory(turns: Turn[]): ChatMessage[] {
         content: turn.result.answer.slice(0, 8000),
         roll_call: turn.result.rollCall,
         period_subject: turn.result.periodSubject,
+        evidence_context: turn.result.evidenceContext,
       },
     );
   }

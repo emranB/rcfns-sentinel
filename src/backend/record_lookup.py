@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import PurePosixPath
 
-from src.backend.current_sources import TITLE_BOUNDARY, YEAR, filename_date
+from src.backend.current_sources import (
+    TITLE_BOUNDARY,
+    YEAR,
+    filename_date,
+    source_terms,
+)
 from src.backend.named_sources import TITLE_STOP_WORDS, title_words
 
 MONTH_NUMBER = {
@@ -36,6 +41,34 @@ DATE_CONTEXT_LIMIT = 40
 MAX_DATE_CANDIDATES = 12
 MAX_EXPLICIT_ORIGINALS = 6
 
+FILE_REQUEST = re.compile(
+    r"^(?:do (?:you|we) have|is there|where (?:is|are|can (?:i|we) find)|"
+    r"(?:can|could) you (?:find|show|open|give)|find|show|open)\s+"
+    r"(?:me\s+)?(?:a copy of\s+)?(?:(?:the|a|an|any)\s+)?(?P<target>[^?!.]{2,160})[?!.]*$",
+    re.IGNORECASE,
+)
+FILE_PERIOD = re.compile(
+    r"\s+(?:in|for|from|as of)\s+(?:(?P<month>[a-z]+)\s+(?:(?P<day>\d{1,2}),?\s+)?)?"
+    r"(?P<year>(?:19|20)\d{2})$",
+    re.IGNORECASE,
+)
+LEADING_FILE_YEAR = re.compile(r"^(?P<year>(?:19|20)\d{2})\s+(?P<title>.+)$")
+FILE_REFERENCES = re.compile(
+    r"\b(?:on|in|under|from|according to)\s+(?:(?:the|our)\s+)?", re.IGNORECASE
+)
+REPORT_PERIOD_LABEL = re.compile(
+    r"\b(?:as of|(?:period|year|month|quarter)\s+end(?:ing|ed)?|reporting date)\s*[:-]?\s*",
+    re.IGNORECASE,
+)
+TOTAL_REQUEST = re.compile(
+    r"\btotal\s+(?:for\s+)?(?P<label>[^?!\n]+?)(?=\s+(?:on|in|from|according to|for|as of)\b|[?!]|$)",
+    re.IGNORECASE,
+)
+TOTAL_ROW = re.compile(
+    r"^\s*total\s+(?:for\s+)?(?P<label>\S.*?)(?:\s{2,}|\s+(?=[$£€]))\s*(?P<value>[$£€]?\s*-?\d[\d,]*\.\d{2})\s*$",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class DatedReference:
@@ -43,6 +76,67 @@ class DatedReference:
     kind: str
     exact: tuple[str, ...]
     inspect: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FileAvailability:
+    title: str
+    year: int
+    month: int | None = None
+    day: int | None = None
+
+
+# Identify requests for a document itself and keep its period separate from its title.
+def file_availability(question: str) -> FileAvailability | None:
+    if not (match := FILE_REQUEST.fullmatch(" ".join(question.split()))):
+        return None
+    target = match["target"].strip()
+    if period := FILE_PERIOD.search(target):
+        month = MONTH_NUMBER.get((period["month"] or "").casefold())
+        if period["month"] and month is None:
+            return None
+        title = target[: period.start()].strip()
+        year = int(period["year"])
+        day = int(period["day"]) if period["day"] else None
+        return FileAvailability(title, year, month, day) if title else None
+    if leading := LEADING_FILE_YEAR.fullmatch(target):
+        return FileAvailability(leading["title"], int(leading["year"]))
+    return None
+
+
+# Recognize a document reference inside a factual question, keeping its requested period.
+def referenced_file(question: str) -> FileAvailability | None:
+    for boundary in FILE_REFERENCES.finditer(question):
+        target = question[boundary.end() :]
+        if target and (reference := file_availability(f"Find {target}")):
+            return reference
+    return None
+
+
+# Prefer the reporting date in the original over a generated or printed date.
+def document_period(title: str, heading: str) -> date | None:
+    for label in REPORT_PERIOD_LABEL.finditer(heading):
+        if match := DATE.match(heading, label.end()):
+            dated = mentioned_dates(match[0])
+            if dated:
+                return dated[0][0]
+    dates = mentioned_dates(title)
+    return dates[0][0] if dates else filename_date(title)
+
+
+# Match an unambiguous single-value total to its full printed row label.
+def exact_record_total(question: str, text: str) -> str:
+    if not (request := TOTAL_REQUEST.search(question)):
+        return ""
+    label = source_terms(request["label"])
+    if not label:
+        return ""
+    lines = {
+        " ".join(line.split())
+        for line in text.splitlines()
+        if (row := TOTAL_ROW.fullmatch(line)) and source_terms(row["label"]) == label
+    }
+    return next(iter(lines)) if len(lines) == 1 else ""
 
 
 # Split filename identifiers at word, case and digit boundaries.

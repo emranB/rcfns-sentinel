@@ -7,6 +7,19 @@ from src.backend.current_sources import dated_document_ids, latest_document_ids
 
 
 class CurrentSourceTests(unittest.TestCase):
+    # Keep distinct originals when the year is known but the filename has no exact date.
+    def test_year_search_preserves_month_folders_and_undated_sources(self) -> None:
+        documents = [
+            ("march", "Facilities/2020/March/Equipment Log.pdf"),
+            ("july", "Facilities/2020/July/Equipment Log.pdf"),
+            ("scans", "Facilities/2020/Equipment Log Scans.pdf"),
+            ("supplement", "Facilities/2020/Equipment Log Supplement.pdf"),
+        ]
+        result = dated_document_ids(
+            "What equipment was logged in 2020?", documents, today=date(2021, 1, 1)
+        )
+        self.assertEqual(set(result[2020]), {"march", "july", "scans", "supplement"})
+
     # Keep records from both years, including older entries that fall outside a recent lookup.
     def test_comparison_covers_each_year_and_prefers_a_consistent_series(self) -> None:
         documents = [

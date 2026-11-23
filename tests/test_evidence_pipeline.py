@@ -33,6 +33,221 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Recover a source through semantic expansion when the raw question retrieves nothing.
+    async def test_both_modes_retrieve_planned_terms_for_an_unfamiliar_subject(
+        self,
+    ) -> None:
+        question = "Who should I ask if a tool stops working?"
+        query = "damaged equipment maintenance contact"
+        proof = "Send damaged equipment requests to the facilities supervisor."
+        chunk = server.RetrievedChunk(
+            id="passage", document_id="maintenance", content=proof
+        )
+        plan = server.SearchPlan(
+            question=question,
+            queries=[query],
+            reuse_sources=False,
+            file_title="",
+            open_file=False,
+        )
+
+        # Simulate a relevant indexed excerpt found only by the alternate wording.
+        async def search(
+            state: RagflowSession,
+            text: str,
+            size: int = 8,
+            *,
+            document_ids: list[str] | None = None,
+        ) -> list[server.RetrievedChunk]:
+            return [chunk] if text == query else []
+
+        # Use the same mocked planning and proof outputs in Standard and Agentic.
+        async def generate(
+            state: RagflowSession,
+            instructions: str,
+            prompt: str,
+            *,
+            output_format: dict[str, object] | None = None,
+            answer_tokens: int | None = None,
+        ) -> str:
+            return (
+                plan.model_dump_json()
+                if output_format == server.SearchPlan.model_json_schema()
+                else literal_claims(proof)
+            )
+
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client,
+                dataset_id="other-archive",
+                documents={"maintenance": "Facilities Memo.txt"},
+            )
+            with (
+                patch.object(server, "retrieve", search),
+                patch.object(server, "generate", generate),
+                patch.object(
+                    server,
+                    "investigate",
+                    AsyncMock(return_value=server.Investigation(question, [])),
+                ),
+            ):
+                for mode in ("standard", "agentic"):
+                    result = await server.respond_to_question(
+                        state,
+                        question,
+                        server.Question.model_validate(
+                            {"question": question, "mode": mode}
+                        ),
+                    )
+                    self.assertEqual(result.mode_used, mode)
+                    self.assertIn("facilities supervisor", result.answer)
+                    self.assertEqual(
+                        [source.url for source in result.sources],
+                        ["/sources/maintenance"],
+                    )
+
+    # Pass semantic aliases to the shared catalog and verify the requested reporting period.
+    async def test_semantic_alias_uses_original_catalog_in_both_modes(self) -> None:
+        question = "Where can I find the property condition assessment for 2019?"
+        path = "other-data/Facilities/Inspection Report.pdf"
+        chunk = server.RetrievedChunk(document_id="report", content="Inspection Report")
+        plan = server.SearchPlan(
+            question=question,
+            queries=["2019 inspection report"],
+            reuse_sources=False,
+            file_title="",
+            open_file=False,
+        )
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client, dataset_id="new-library", documents={"report": path}
+            )
+            with (
+                patch.object(
+                    server, "generate", AsyncMock(return_value=plan.model_dump_json())
+                ),
+                patch.object(server, "record_opening", AsyncMock(return_value=chunk)),
+                patch.object(
+                    server,
+                    "original_record_text",
+                    AsyncMock(
+                        return_value="Inspection Report\nAs of September 25, 2019"
+                    ),
+                ),
+            ):
+                for mode in ("standard", "agentic"):
+                    payload = server.Question.model_validate(
+                        {"mode": mode, "question": question}
+                    )
+                    result = await server.respond_to_question(state, question, payload)
+                    self.assertEqual(result.mode_used, mode)
+                    self.assertIn("September 25, 2019", result.answer)
+                    self.assertEqual(
+                        [s.url for s in result.sources], ["/sources/report"]
+                    )
+                    self.assertEqual(
+                        result.evidence_context,
+                        server.EvidenceContext(
+                            question=question, document_ids=["report"]
+                        ),
+                    )
+
+    # Reopen the cited original for an elliptical question instead of starting over globally.
+    async def test_semantic_follow_up_uses_previous_original_in_both_modes(
+        self,
+    ) -> None:
+        previous = "Find the stock register for 2018"
+        question = "What are its total reserves?"
+        path = "other-data/Inventory/2018/Stock Register.pdf"
+        chunk = server.RetrievedChunk(
+            document_id="original", content="Register excerpt"
+        )
+        history = [
+            server.ChatMessage(role="user", content=previous),
+            server.ChatMessage(
+                role="assistant",
+                content="I found the original [1].",
+                evidence_context=server.EvidenceContext(
+                    question=previous, document_ids=["original"]
+                ),
+            ),
+        ]
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client, dataset_id="new-library", documents={"original": path}
+            )
+            with (
+                patch.object(server, "generate", AsyncMock(return_value="{}")),
+                patch.object(server, "record_opening", AsyncMock(return_value=chunk)),
+                patch.object(
+                    server,
+                    "original_record_text",
+                    AsyncMock(
+                        return_value=(
+                            "Stock Register\nAs of March 31, 2018\nTotal reserves  $330.00\nTotal reserves and deposits  $700.00"
+                        )
+                    ),
+                ),
+            ):
+                for mode in ("standard", "agentic"):
+                    payload = server.Question.model_validate(
+                        {"mode": mode, "question": question, "history": history}
+                    )
+                    result = await server.respond_to_question(state, question, payload)
+                    self.assertEqual(result.mode_used, mode)
+                    self.assertEqual(
+                        [s.url for s in result.sources], ["/sources/original"]
+                    )
+                    self.assertIn("$330.00", result.answer)
+                    self.assertNotIn("$700.00", result.answer)
+
+    # Answer file availability directly and use the reporting date over a folder or print date.
+    async def test_document_availability_checks_original_period(self) -> None:
+        paths = {
+            "later": "data/Services/2024/Service Register.pdf",
+            "older": "data/Services/2024/Service Register Copy.pdf",
+        }
+        chunks = {
+            key: server.RetrievedChunk(document_id=key, content="Service Register")
+            for key in paths
+        }
+        originals = {
+            "later": "Service Register\nAs of October 15, 2024\nPrinted January 2, 2025",
+            "older": "Service Register\nAs of December 31, 2023\nPrinted December 31, 2024",
+        }
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client, dataset_id="library", documents=paths)
+            with (
+                patch.object(
+                    server,
+                    "record_opening",
+                    AsyncMock(side_effect=lambda _, key: chunks[key]),
+                ),
+                patch.object(
+                    server,
+                    "original_record_text",
+                    AsyncMock(
+                        side_effect=lambda _, opening, __: originals[
+                            opening.document_id
+                        ]
+                    ),
+                ),
+            ):
+                answer = await server.available_record(
+                    state, "Do you have the service register for 2024?", "agentic"
+                )
+                missing = await server.available_record(
+                    state,
+                    "Can you find the service register for December 2024?",
+                    "standard",
+                )
+        assert answer is not None and missing is not None
+        self.assertIn("October 15, 2024", answer.answer)
+        self.assertEqual([source.url for source in answer.sources], ["/sources/later"])
+        self.assertEqual(answer.mode_used, "agentic")
+        self.assertEqual(missing.sources, [])
+        self.assertIn("December 2024", missing.answer)
+
     # Reuse the member view across a year sequence that exceeds the chat history window.
     async def test_member_year_chain_works_on_a_different_collection(self) -> None:
         records = {
@@ -870,9 +1085,12 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
             state = RagflowSession(
                 client, source_paths={"Annual Accounts.pdf": filename}
             )
-            with patch.object(
-                server, "retrieve", AsyncMock(return_value=[])
-            ) as retrieve:
+            with (
+                patch.object(
+                    server, "retrieve", AsyncMock(return_value=[])
+                ) as retrieve,
+                patch.object(server, "generate", AsyncMock(return_value="{}")),
+            ):
                 await server.respond_to_question(
                     state, question, server.Question(question=question)
                 )
@@ -984,9 +1202,14 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     server.Question(question=question, history=history, mode="agentic"),
                 )
                 self.assertEqual(agentic, standard)
-                self.assertEqual(
-                    generate.await_args_list[0], generate.await_args_list[1]
-                )
+                answers = [
+                    call
+                    for call in generate.await_args_list
+                    if call.kwargs.get("output_format")
+                    == ClaimAnswer.model_json_schema()
+                ]
+                self.assertEqual(len(answers), 2)
+                self.assertEqual(*answers)
 
 
 class EvidenceRankingTests(unittest.TestCase):
