@@ -39,7 +39,7 @@ OPERATORS = {
 
 
 # Preserve an explicitly requested operation when the question asks for one calculation.
-def requested_operation(question: str) -> str:
+def requested_operation(question: str) -> Literal["share", "ratio", "difference", ""]:
     if re.search(
         r"\b(?:percent(?:age)? change|percent(?:age)? (?:increase|decrease))\b",
         question,
@@ -166,16 +166,36 @@ def requested_equations(question: str, plan: QuantityPlan) -> list[Equation]:
                 )
             ]
 
-    if (
-        len(plan.measures) == 2
-        and (operation := requested_operation(question))
-        and (
-            equation := next(
-                (item for item in plan.equations if len(item.inputs) == 2), None
-            )
+    if len(plan.measures) == 2 and (operation := requested_operation(question)):
+        equation = next(
+            (item for item in plan.equations if len(item.inputs) == 2), None
         )
-    ):
-        return [equation.model_copy(update={"operation": operation})]
+        wording = metric_phrase(question)
+        operand_positions = [
+            wording.find(metric_phrase(item.row).removeprefix("total "))
+            for item in plan.measures
+        ]
+        explicit_order = re.search(
+            r"\bas (?:a )?(?:share|percent(?:age)?|proportion|fraction) of\b",
+            question,
+            re.IGNORECASE,
+        )
+        if (
+            (explicit_order or operation == "ratio")
+            and min(operand_positions) >= 0
+            and operand_positions[0] != operand_positions[1]
+        ):
+            order = [1, 2] if operand_positions[0] < operand_positions[1] else [2, 1]
+            return [
+                Equation(
+                    label=equation.label if equation else operation.title(),
+                    operation=operation,
+                    inputs=order,
+                    precision=equation.precision if equation else 2,
+                )
+            ]
+        if equation is not None:
+            return [equation.model_copy(update={"operation": operation})]
     return plan.equations
 
 
@@ -218,6 +238,7 @@ def measure_rows(
     }
     column = " ".join(measure.column.casefold().split())
     column_terms = source_terms(column)
+    role = source_terms(measure.row) & {"actual", "budget"}
     metric = re.sub(r"\byear[ -]to[ -]date\b", "", measure.row, flags=re.IGNORECASE)
     requested = (
         source_terms(metric) - ignored - column_terms - MONTH_HINT.keys() - {"only"}
@@ -225,6 +246,7 @@ def measure_rows(
     if not requested:
         return []
     queries = source_terms(question)
+    request_words = f" {metric_phrase(question)} "
     dimensions: dict[int, set[str]] = {}
     parsed: list[tuple[int, CitedAmount, str, str]] = []
     for index, item in enumerate(rows, 1):
@@ -235,11 +257,22 @@ def measure_rows(
         dimensions.setdefault(item.source, set()).update(source_terms(heading))
         parsed.append((index, item, fields[0], heading))
 
+    named_totals = {
+        phrase
+        for _, _, label, _ in parsed
+        if (phrase := metric_phrase(label)).startswith("total ")
+        and f" {phrase} " in request_words
+    }
+    budget_comparison = {"budget", "variance"} & queries and (
+        source_terms(measure.row) | column_terms
+    ) & {"actual", "budget"}
+    if budget_comparison and len(named_totals) == 1:
+        requested = source_terms(next(iter(named_totals))) - ignored
+
     candidates: list[tuple[tuple[int, int, int, int, int, int], int]] = []
     for index, amount, label, heading in parsed:
         headings = source_terms(heading)
         qualifier = column_terms
-        role = requested & {"actual", "budget"}
         if len(role) == 1:
             qualifier = (qualifier - {"actual", "budget"}) | role
         if (
@@ -249,7 +282,13 @@ def measure_rows(
             qualifier = set()
         wanted = requested - headings
         terms = source_terms(label) - ignored
-        if not wanted or not wanted <= terms:
+        compatible_total = (
+            "expense" in wanted
+            and bool(terms)
+            and (wanted - {"expense"} == terms)
+            and label.casefold().startswith("total ")
+        )
+        if not wanted or (not wanted <= terms and not compatible_total):
             continue
         if (
             qualifier
@@ -282,6 +321,12 @@ def measure_rows(
         candidates.append((score, index))
     highest = max((score for score, _ in candidates), default=None)
     return [index for score, index in candidates if score == highest][:6]
+
+
+# Match literal rows across harmless punctuation, pluralization, and separator differences.
+def metric_phrase(text: str) -> str:
+    words = (next(iter(source_terms(word))) for word in re.findall(r"[^\W\d_]+", text))
+    return " ".join(word for word in words if word not in {"for", "of", "the"})
 
 
 # Read a single printed numeric token without changing its sign or unit.

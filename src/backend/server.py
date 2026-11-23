@@ -1983,6 +1983,9 @@ async def quantify(
         if key in originals
     ]
     operation = requested_operation(question)
+    earlier_requests = "\n".join(
+        message.content[-600:] for message in payload.history if message.role == "user"
+    )
     try:
         raw = await generate(
             state,
@@ -1991,6 +1994,8 @@ async def quantify(
             "period monthly only for a single-month report, cumulative for YTD, any for snapshots such as balance sheets. "
             "For an unidentified report leave its title empty. Query is a short natural-language search phrase. "
             "Set reuse_sources only when the user wants the same originals. Do not reuse when they change a date or source. "
+            "Reusing an original carries forward only the document. A different measure in the current question replaces "
+            "the previous measure. Use the previous request only to resolve a reference with no measure of its own. "
             "List a measure for each input, with row as the metric's likely printed label without dates or column qualifiers. "
             "Fill column only for a class, group, or column stated by the user. Otherwise it must be an empty string. "
             "Combine explicit dimensions when needed. Record is the one-based index in sources, or null. "
@@ -2003,7 +2008,7 @@ async def quantify(
             "Ratio is a quotient. Share is a quotient shown as a percent. Percent_change is (new minus old) divided by old, "
             "so 'how far above budget as a percentage of budget' uses percent_change with [actual, budget]. "
             "The same measures can appear in several equations. Do not assume alternate inputs when the requested ones are unavailable.",
-            f"Conversation:\n{conversation(payload.history)}\nPrevious originals: {', '.join(references)}\n"
+            f"Earlier user requests:\n{earlier_requests}\nPrevious originals: {', '.join(references)}\n"
             f"Question: {question}"
             + (f"\nRequested operation: {operation}." if operation else ""),
             output_format=QuantityPlan.model_json_schema(),
@@ -2044,6 +2049,7 @@ async def quantify(
                 reasoning=True,
             )
             plan.equations = Equations.model_validate_json(result).equations
+            plan.equations = requested_equations(question, plan)
 
     # Verify the planned period against the printed original.
     async def resolve(target: OperandSource) -> VerifiedFile | None:
@@ -2184,7 +2190,7 @@ async def quantify(
             amounts,
             source_ids.get(record_ids.get(measure.record or 0, "")),
             titles,
-            f"{question}\n{plan.question}",
+            question,
         )
         for measure in plan.measures
     ]

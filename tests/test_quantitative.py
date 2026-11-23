@@ -58,11 +58,14 @@ class QuantityTests(unittest.TestCase):
             "Total Transportation | East | $160.00\n"
             "Total Transportation | West | $335.00\n"
             "Transportation Permits | East | $45.00\n"
-            "Cash Balance | East | $650.00",
+            "Cash Balance | East | $650.00\n"
+            "Total for Travel | East | $50.00",
             1,
         )
         field = Measure(row="Transportation", column="East", record=1)
         self.assertEqual(measure_rows(field, rows, 1, ["Transit Summary"]), [2])
+        travel = field.model_copy(update={"row": "Total Travel Expenses"})
+        self.assertEqual(measure_rows(travel, rows, 1, ["Transit Summary"]), [6])
         self.assertEqual(
             measure_rows(
                 field.model_copy(update={"column": "Total for East"}),
@@ -92,13 +95,19 @@ class QuantityTests(unittest.TestCase):
             "Total Payroll | West / Actual | Costs!D18 | 415.00\n"
             "Total Payroll | East / Actual | Costs!H18 | 997.00\n"
             "Total Payroll | East / Budget | Costs!I18 | 600.00\n"
-            "Total Payroll | East / % of Budget | Costs!J18 | 166.17%",
+            "Total Payroll | East / % of Budget | Costs!J18 | 166.17%\n"
+            "Total Expenses | East / Actual | Costs!H42 | 1,311.00\n"
+            "Total Expenses | East / Budget | Costs!I42 | 1,440.00",
             1,
         )
         payroll = Measure(row="East Actual Payroll", column="Actual", record=1)
         self.assertEqual(measure_rows(payroll, workbook, 1, ["Employee Costs"]), [2])
         budget = Measure(row="East Payroll Budget", column="", record=1)
         self.assertEqual(measure_rows(budget, workbook, 1, ["Employee Costs"]), [3])
+        follow_up = "In the same workbook, what was the East total expense variance?"
+        self.assertEqual(
+            measure_rows(budget, workbook, 1, ["Employee Costs"], follow_up), [6]
+        )
 
     # Keep a percentage request distinct from a ratio or a compound variance question.
     def test_preserves_explicit_operation(self) -> None:
