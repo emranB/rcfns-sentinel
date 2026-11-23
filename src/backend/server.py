@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from src.backend.current_sources import (
+    LEADING_YEAR_QUALIFIER,
     YEAR,
     YEAR_FOLLOW_UP,
     YEAR_QUALIFIER,
@@ -135,6 +136,14 @@ from src.backend.source_recovery import (
     render_eps,
 )
 from src.backend.sources import SourceCollection, resolve_sources
+from src.backend.statement_checks import (
+    REQUIRED_TOTALS,
+    Statement,
+    parse_statement,
+    period_label,
+    statement_candidates,
+    statement_years,
+)
 from src.backend.tabular import (
     count_named_rows,
     name_count_sheet,
@@ -1289,18 +1298,21 @@ def year_follow_up(year: str, history: list[ChatMessage]) -> str | None:
             continue
         if YEAR_FOLLOW_UP.fullmatch(previous):
             continue
-        subject = YEAR_QUALIFIER.sub("", previous).rstrip("?.! ")
-        if YEAR.search(subject) or not question_words(subject) - UNSCOPED_WORDS:
-            return None
-        return f"{subject} for {year}"
+        subject = single_year_subject(previous) or previous.rstrip("?.! ")
+        if not YEAR.search(subject) and question_words(subject) - UNSCOPED_WORDS:
+            return f"{subject} for {year}"
+        return None
     return None
 
 
 # Store only a reusable single-year subject, leaving named files and other dates intact.
 def single_year_subject(question: str | None) -> str | None:
-    if question is None or not YEAR_QUALIFIER.search(question):
+    if question is None:
         return None
-    subject = YEAR_QUALIFIER.sub("", question).rstrip("?.! ")
+    subject = LEADING_YEAR_QUALIFIER.sub("", YEAR_QUALIFIER.sub("", question))
+    if subject == question:
+        return None
+    subject = subject.rstrip("?.! ")
     if (
         not subject
         or YEAR.search(subject)
@@ -1473,7 +1485,7 @@ async def investigate(
         if len(queries) == 3:
             break
 
-    # Keep year-specific follow-ups inside the applicable record set when available.
+    # Search the full index for inferred periods and keep explicit originals pinned.
     async def search(query: str) -> list[RetrievedChunk]:
         if document_ids:
             return await retrieve(state, query, 5, document_ids=document_ids)
@@ -1481,17 +1493,9 @@ async def investigate(
         scopes = periods or {}
         if scopes and query_years and not query_years.intersection(scopes):
             return []
-        ids = [
-            doc
-            for year, group in scopes.items()
-            if not query_years or year in query_years
-            for doc in group
-        ]
-        return (
-            await retrieve(state, query, 5, document_ids=ids)
-            if ids
-            else await retrieve(state, query, 5)
-        )
+        if len(scopes) == 1 and not query_years:
+            query = f"{query}\nPeriod: {next(iter(scopes))}"
+        return await retrieve(state, query, 5)
 
     batches = await asyncio.gather(
         *(search(query) for query in queries), return_exceptions=True
@@ -1596,6 +1600,139 @@ async def original_record_text(
             )
             return await asyncio.to_thread(pdf_text, archive) or text
     return text
+
+
+# Reconcile every matching original before any top-k passage selection or summarization.
+async def reconcile_statements(
+    state: RagflowSession, years: tuple[int, ...], mode: Literal["standard", "agentic"]
+) -> ChatResponse | None:
+    originals = dict(indexed_originals(state))
+    candidates = statement_candidates(originals.items())
+    known_titles = set(candidates)
+    try:
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            hits = await retrieve(
+                state,
+                f"Profit and Loss, income statement, total income, total expenses, net profit. "
+                f"Reporting year {' or '.join(map(str, years))}.",
+                24,
+            )
+            for hit in hits:
+                path = originals.get(hit.document_id)
+                if path and Path(path).suffix.casefold() == ".pdf":
+                    candidates.setdefault(hit.document_id, path)
+    except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError) as error:
+        LOGGER.warning("Supplemental statement search failed: %s", error)
+    slots = asyncio.Semaphore(8)
+
+    # Bound concurrent native reads and surface originals that could not be checked.
+    async def inspect(key: str) -> tuple[str, Statement | None, bool]:
+        async with slots:
+            try:
+                async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                    original = await original_archive(
+                        state, key, suffix=".pdf", limit=PDF_TEXT_ARCHIVE_LIMIT
+                    )
+                    text = await asyncio.to_thread(pdf_text, original)
+            except (OSError, httpx.HTTPError, TimeoutError, RuntimeError) as error:
+                LOGGER.warning("Statement %s could not be read: %s", key, error)
+                return key, None, False
+            return key, parse_statement(text), bool(text)
+
+    results = await asyncio.gather(*(inspect(key) for key in candidates))
+    rows: list[tuple[date, date, str, Statement]] = []
+    missing: dict[str, str] = {}
+    seen: set[str] = set()
+    for key, statement, readable in results:
+        path = candidates[key]
+        if path in seen:
+            continue
+        seen.add(path)
+        year_hints = {int(year) for year in YEAR.findall(path)}
+        relevant = not year_hints or year_hints.intersection(years)
+        if not readable and key in known_titles and relevant:
+            missing[key] = "could not extract readable original text"
+        if statement is None:
+            continue
+        if statement.start is None or statement.end is None:
+            if relevant:
+                missing[key] = "printed period could not be read"
+            continue
+        if not any(
+            statement.start.year <= year <= statement.end.year for year in years
+        ):
+            continue
+        if gaps := REQUIRED_TOTALS.difference(statement.rows):
+            missing[key] = "missing grand totals for " + ", ".join(sorted(gaps))
+        elif statement.conflicts:
+            missing[key] = "conflicting grand totals for " + ", ".join(
+                sorted(statement.conflicts)
+            )
+        else:
+            rows.append((statement.end, statement.start, key, statement))
+    if not rows and not missing:
+        return None
+
+    sources: list[Citation] = []
+    table = [
+        "| Printed period | Original | Income | Expenses | Net adjustments | Reported profit (loss) | Check |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    mismatches = 0
+    for end, start, key, statement in sorted(rows, key=lambda item: item[:3]):
+        source = citation(state, RetrievedChunk(document_id=key, content=""))
+        sources.append(source)
+        differences = statement.differences()
+        mismatches += bool(differences)
+        check = (
+            ", ".join(f"{label} {value:+,.2f}" for label, value in differences.items())
+            or "Matches"
+        )
+        figures = (
+            statement.rows["income"],
+            statement.rows["expenses"],
+            statement.adjustment(),
+            statement.rows["net"],
+        )
+        name = source.name.replace("|", r"\|")
+        amounts = " | ".join(f"{value:,.2f}" for value in figures)
+        table.append(
+            f"| {period_label(start, end)} | {name} [{len(sources)}] | {amounts} | {check} |"
+        )
+
+    answer: list[str] = []
+    if rows:
+        through = max(row[0] for row in rows)
+        answer.extend(
+            (
+                (
+                    f"The printed totals add up in **all {len(rows)} reports checked**."
+                    if not mismatches
+                    else f"**{mismatches} of {len(rows)} reports checked** have a difference in their printed totals."
+                ),
+                f"The latest report checked ends on {through:%Y-%m-%d}."
+                if len(years) == 1
+                else "",
+                "\n".join(table),
+                (
+                    "Net adjustments are other income minus other expenses and cost of sales. "
+                    "The reports can cover overlapping dates and different funds or classes, so their figures cannot be added into a single annual total. "
+                    "This check uses the printed totals. A ledger reconciliation would require the underlying transactions."
+                ),
+            )
+        )
+    if missing:
+        details = []
+        for key, reason in sorted(
+            missing.items(), key=lambda item: candidates[item[0]]
+        ):
+            source = citation(state, RetrievedChunk(document_id=key, content=""))
+            sources.append(source)
+            details.append(f"- {source.name} [{len(sources)}] ({reason})")
+        answer.append("**Could not check these originals**\n\n" + "\n".join(details))
+    return ChatResponse(
+        answer="\n\n".join(filter(None, answer)), sources=sources, mode_used=mode
+    )
 
 
 # Reopen a cited roll call and verify its year, group and attendance sections.
@@ -2984,25 +3121,21 @@ async def answer_records(
     return ChatResponse(answer=answer, sources=sources, mode_used=mode)
 
 
-# Search each year independently with space for introductions and semantic hits.
+# Search each year independently and use filename matches as additional evidence.
 async def period_evidence(
     state: RagflowSession, question: str, periods: dict[int, list[str]], budget: int
 ) -> list[Excerpt]:
     subject = YEAR.sub(" ", question)
 
-    # Keep each representative original even if its best match is the opening chunk.
+    # Search outside filename matches and keep part of the budget for record headings.
     async def search(year: int, document_ids: list[str]) -> list[Excerpt]:
         query = f"{subject}\nPeriod: {year}"
         try:
             async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
                 if not document_ids:
-                    return [
-                        Excerpt(item.chunk, item.text, year)
-                        for item in select_evidence(
-                            await retrieve(state, query), budget
-                        )
-                    ]
-                ranked, *openings = await asyncio.gather(
+                    return select_evidence(await retrieve(state, query, 12), budget)
+                broad, ranked, *openings = await asyncio.gather(
+                    retrieve(state, query, 12),
                     retrieve(state, query, 64, document_ids=document_ids),
                     *(
                         record_opening(state, document_id)
@@ -3019,8 +3152,16 @@ async def period_evidence(
                 by_document.setdefault(hit.document_id, hit)
         elif isinstance(ranked, BaseException):
             LOGGER.warning("Ranked period search for %s failed: %s", year, ranked)
+        if isinstance(broad, BaseException):
+            LOGGER.warning("Library search for %s failed: %s", year, broad)
+        broad_hits = broad if isinstance(broad, list) else []
+        scoped_ids = set(document_ids)
+        semantic = select_evidence(
+            (hit for hit in broad_hits if hit.document_id not in scoped_ids),
+            budget // 3,
+        )
+        limit = (budget - sum(len(item.text) for item in semantic)) // len(document_ids)
         selected = []
-        limit = budget // len(document_ids)
         for document_id, opening in zip(document_ids, openings, strict=True):
             if isinstance(opening, BaseException):
                 LOGGER.warning(
@@ -3039,7 +3180,9 @@ async def period_evidence(
                 selected.append(Excerpt(opening, opening_text[:size], year))
             if best and (text := format_excerpt(best.content)):
                 selected.append(Excerpt(best, text[: limit - size], year))
-        return selected
+        return (
+            [*selected, *semantic] if selected else select_evidence(broad_hits, budget)
+        )
 
     groups = await asyncio.gather(*(search(year, ids) for year, ids in periods.items()))
     return [item for group in groups for item in group]
@@ -3209,6 +3352,11 @@ async def answer_question(
     inventory = inventory_answer(scoped, library)
     if inventory:
         return ChatResponse(answer=inventory, sources=[], mode_used="standard")
+    check_years = statement_years(scoped)
+    if check_years and (
+        checked := await reconcile_statements(state, check_years, payload.mode)
+    ):
+        return checked
     if available := await available_record(state, scoped, payload.mode):
         return available
     years = requested_years(scoped)
@@ -3298,6 +3446,12 @@ async def answer_question(
         None,
     )
     plan = await semantic_plan(state, scoped, payload.history, prior)
+    if (
+        not check_years
+        and (resolved_years := statement_years(plan.question))
+        and (checked := await reconcile_statements(state, resolved_years, payload.mode))
+    ):
+        return checked
     if prior is not None and (
         plan.reuse_sources or (not years and SOURCE_PRONOUN.search(scoped))
     ):
@@ -3346,7 +3500,7 @@ async def answer_question(
                 return verified_file_reply(
                     lookup if lookup.title else alternate, file_match, payload.mode
                 )
-    elif plan.file_title and len(years) == 1:
+    elif plan.file_title and len(years) == 1 and referenced_file(plan.question):
         _, file_match = await resolve_file(
             state, FileAvailability(plan.file_title, years[0])
         )
@@ -3387,14 +3541,10 @@ async def answer_question(
     if scoped != raw_scope:
         search_terms.append(raw_scope[:500])
     if search_terms:
-        scoped_ids = [key for ids in periods.values() for key in ids]
         with suppress(TimeoutError):
             async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
                 results = await asyncio.gather(
-                    *(
-                        retrieve(state, q, 6, document_ids=scoped_ids or None)
-                        for q in search_terms[:3]
-                    ),
+                    *(retrieve(state, q, 6) for q in search_terms[:3]),
                     return_exceptions=True,
                 )
                 baseline += select_evidence(
@@ -3457,7 +3607,7 @@ async def answer_question(
             generated = roster
         elif periods:
             excerpts = "\n\n".join(
-                f"[{index}] {f'Period {item.period}: ' if item.period else ''}{source.name}\n{item.text}"
+                f"[{index}] {source.path}\n{item.text}"
                 for index, (item, source) in enumerate(
                     zip(evidence, sources, strict=True), 1
                 )

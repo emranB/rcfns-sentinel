@@ -746,15 +746,31 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         later = server.RetrievedChunk(
             id="later", document_id="late", content="Later inventory counts."
         )
+        overlooked = server.RetrievedChunk(
+            id="hidden",
+            document_id="unlabeled",
+            content="2022 equipment totals in an unrelated folder.",
+        )
+
+        # Return a relevant original only when the search includes the whole library.
+        async def search(
+            _state: RagflowSession,
+            query: str,
+            _limit: int,
+            *,
+            document_ids: list[str] | None = None,
+        ) -> list[server.RetrievedChunk]:
+            if document_ids is None:
+                return [overlooked] if query.endswith("2022") else []
+            return [later] if document_ids == ["late"] else [ranked]
+
         async with httpx.AsyncClient() as client:
             state = RagflowSession(client)
             with (
                 patch.object(
                     server, "record_opening", AsyncMock(side_effect=[later, opening])
                 ),
-                patch.object(
-                    server, "retrieve", AsyncMock(side_effect=[[later], [ranked]])
-                ) as retrieve,
+                patch.object(server, "retrieve", side_effect=search) as retrieve,
             ):
                 evidence = await server.period_evidence(
                     state,
@@ -764,11 +780,11 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(
             [(item.period, item.chunk.id) for item in evidence],
-            [(2024, "later"), (2022, "opening"), (2022, "ranked")],
+            [(2024, "later"), (2022, "opening"), (2022, "ranked"), (None, "hidden")],
         )
         self.assertEqual(
-            [call.kwargs["document_ids"] for call in retrieve.await_args_list],
-            [["late"], ["early"]],
+            [call.kwargs.get("document_ids") for call in retrieve.await_args_list],
+            [None, ["late"], None, ["early"]],
         )
 
     # Count a clear roll call from the dated original in either requested mode.

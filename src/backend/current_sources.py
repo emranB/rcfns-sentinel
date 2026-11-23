@@ -43,6 +43,9 @@ YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 YEAR_QUALIFIER = re.compile(
     r"\s+(?:in|for|during)\s+(?:19|20)\d{2}[?.!]*$", re.IGNORECASE
 )
+LEADING_YEAR_QUALIFIER = re.compile(
+    r"^\s*(?:in|for|during)\s+(?:19|20)\d{2}\s*[,;:]\s*", re.IGNORECASE
+)
 YEAR_CONTEXT = re.compile(r"\b(?:in|for|during|from)\s+(?:19|20)\d{2}\b", re.IGNORECASE)
 YEAR_FOLLOW_UP = re.compile(
     r"(?:(?:and|what about|how about)\s+)?(?:(?:in|for|during)\s+)?(?P<year>(?:19|20)\d{2})[?.!]*",
