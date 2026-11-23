@@ -124,7 +124,9 @@ ANOTHER_QUESTION = re.compile(
     r"\band (?:what|when|where|why|who|how|whether)\b", re.IGNORECASE
 )
 PART_REQUEST = re.compile(
-    r"\b(?:what|when|where|who|how|why|which)\b|^\s*(?:report|give|list|identify|extract|provide|explain)\b",
+    r"\b(?:what|when|where|who|how|why|which|whether)\b|"
+    r"^\s*(?:report|give|list|identify|extract|provide|explain|include|state|say|"
+    r"did|does|do|can|could|is|are|has|have)\b",
     re.IGNORECASE,
 )
 LIST_REQUEST = re.compile(
@@ -158,7 +160,7 @@ NUMERIC_PART = re.compile(
 REQUESTED_LABEL = re.compile(r"\b(?:deadline|update)\b", re.IGNORECASE)
 CAP_TERMS = frozenset({"ceiling", "cap", "maximum", "limit"})
 FIELD_JOIN = re.compile(
-    r"(?:[,;]\s+(?:and\s+)?|\s+and\s+)(?=(?:what|when|where|who|how|whether|did|does|were|(?:above|below|over|under) what)\b"
+    r"(?:[,;]\s+(?:and\s+)?|\s+and\s+)(?=(?:(?:say|state|explain)\s+)?(?:what|when|where|who|how|whether|did|does|were|(?:above|below|over|under) what)\b"
     r"|(?:the\s+)?(?:(?:actual|approved|exact|recorded|specific|annual)\s+)?"
     r"(?:dates?|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|salary|stipend|vote (?:count|tally)"
     r"|hours? (?:cap|limit)|reporting (?:cadence|frequency)|review interval)\b)",
@@ -218,6 +220,16 @@ VOTE_DIRECTIONS = ("against|opposed", "abstentions?|abstained", "in favou?r")
 CURRENCY_VALUE = re.compile(
     r"[$£€][ \t\u00a0]*\d[\d,]*(?:\.\d+)?(?:[ \t]*[KMB]\b)?"
     r"|\b\d[\d,.]*\s+(?:dollars|euros|pounds)\b",
+    re.IGNORECASE,
+)
+THRESHOLD_REQUEST = re.compile(
+    r"\b(?:thresholds?|minimum(?: balance| amount)? before|"
+    r"what (?:balance|amount) (?:allows?|triggers?|is required before))\b",
+    re.IGNORECASE,
+)
+THRESHOLD_PROOF = re.compile(
+    r"\b(?:threshold|minimum)\b[^.?\n]{0,85}(?:\$|\b(?:dollars|euros|pounds)\b)|"
+    r"\b(?:once|after|when)\b[^.?\n]{0,75}[$£€][^.?\n]{0,90}\b(?:may|can|eligible|qualif\w*)\b",
     re.IGNORECASE,
 )
 ROLE_ACCEPTANCE = re.compile(
@@ -511,7 +523,7 @@ def requested_fields(part: str) -> list[str]:
         pieces[:2] = [", ".join(pieces[:2])]
     for piece in pieces:
         text = re.sub(
-            r"^(?:give|report|list|compare|and|also)\s+(?=(?:who|what|when|where|how)\b)",
+            r"^(?:give|report|list|compare|and|also|say|state|explain)\s+(?=(?:who|what|when|where|how|whether)\b)",
             "",
             piece.strip().rstrip(" ?,.;"),
             flags=re.IGNORECASE,
@@ -521,6 +533,36 @@ def requested_fields(part: str) -> list[str]:
         else:
             fields.append(text)
     return fields
+
+
+# Recover a single printed monetary threshold, retaining its original condition.
+def threshold_passage(question: str, text: str) -> str:
+    if not THRESHOLD_REQUEST.search(question):
+        return ""
+    topics = (
+        source_terms(question) - STOP - PART_NOISE - {"threshold", "minimum", "balance"}
+    )
+    strongest: dict[Decimal, tuple[int, str]] = {}
+    for sentence in re.split(r"\n+|(?<=[.!?])\s+", text):
+        sentence = sentence.strip()
+        if not THRESHOLD_PROOF.search(sentence) or len(sentence) > 600:
+            continue
+        amounts = {
+            number
+            for match in CURRENCY_VALUE.finditer(sentence)
+            for number in values(match[0])
+        }
+        if len(amounts) != 1:
+            continue
+        amount = next(iter(amounts))
+        score = focus_matches(frozenset(source_terms(sentence)), topics)
+        if amount not in strongest or score > strongest[amount][0]:
+            strongest[amount] = (score, sentence)
+    if not strongest:
+        return ""
+    best = max(score for score, _ in strongest.values())
+    candidates = [line for score, line in strongest.values() if score == best]
+    return candidates[0] if len(candidates) == 1 else ""
 
 
 # Return one literal passage when distinct phrasings give the same value.
@@ -941,6 +983,12 @@ def labeled_passage(question: str, text: str) -> str:
             - {"under", "over", "above", "below"}
             if len(term) >= 3 and not term.isdecimal()
         }
+        anchors = [
+            token
+            for word in WORD.findall(subject)
+            for token in source_terms(word)
+            if token in topics
+        ]
         candidates: dict[str, int] = {}
         for line in text.splitlines():
             if len(line) > 480 or not (
@@ -952,6 +1000,12 @@ def labeled_passage(question: str, text: str) -> str:
             ):
                 continue
             score = focus_matches(frozenset(source_terms(line)), topics)
+            if (
+                anchors
+                and not thresholds
+                and not focus_matches(frozenset(source_terms(line)), {anchors[-1]})
+            ):
+                continue
             if score >= (1 if thresholds else min(2, len(topics))) and topics:
                 candidates[line.strip()] = score
         if candidates:

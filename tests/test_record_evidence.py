@@ -14,6 +14,7 @@ from src.backend.grounding import (
     requested_fields,
     requested_part_score,
     requested_parts,
+    threshold_passage,
     values,
     verified_answer,
 )
@@ -27,6 +28,42 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # A follow-on instruction and a coordinated yes-or-no question remain separate.
+    def test_preserves_following_fact_requests(self) -> None:
+        first, second = requested_parts(
+            "Who approves a service change? Include notice requirements and say whether the panel can cancel it."
+        )
+        self.assertEqual(first, "Who approves a service change?")
+        self.assertEqual(
+            requested_fields(second),
+            ["Include notice requirements", "whether the panel can cancel it"],
+        )
+
+    # Approval evidence must address the requested subject, even beside similar clauses.
+    def test_approval_evidence_requires_the_actual_subject(self) -> None:
+        note = "The work group can recommend schedule changes for approval."
+        rule = "Any change in mandate requires approval by both authorities."
+        q = "Who must approve changing the work group's mandate?"
+        self.assertEqual(labeled_passage(q, f"{note}\n{rule}"), rule)
+        self.assertEqual(labeled_passage(q, note), "")
+
+    # Thresholds remain tied to their triggering condition and distinct from ordinary prices.
+    def test_threshold_keeps_its_condition(self) -> None:
+        condition = (
+            "Once a threshold of $1,250 is reached, the reserve can be drawn down."
+        )
+        question = "What balance allows the reserve to be drawn down?"
+        self.assertEqual(
+            threshold_passage(question, f"The monthly fee is $80.\n{condition}"),
+            condition,
+        )
+        self.assertEqual(
+            threshold_passage(
+                question, condition.replace(" $1,250", " $1,250 or $3,400")
+            ),
+            "",
+        )
+
     # Resolve older day-first headings with a century established by the original.
     def test_reporting_date_supports_legacy_headings_without_guessing_century(
         self,

@@ -444,6 +444,42 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
             ("meeting",),
         )
 
+    # Keep a referred-to original when the latest question also names a different one.
+    async def test_follow_up_combines_referred_and_new_originals(self) -> None:
+        question = "Compare the 2023 report with Station Survey.docx. What did each report conclude?"
+        previous = server.EvidenceContext(
+            question="Compare the first two files.", document_ids=["old", "recent"]
+        )
+        history = [
+            server.ChatMessage(
+                role="assistant",
+                content="I found both reports.",
+                evidence_context=previous,
+            )
+        ]
+        originals = {
+            "old": "Hub Impact Report 2022.docx",
+            "recent": "Hub Impact Report 2023.docx",
+            "new": "Station Survey.docx",
+        }
+        self.assertEqual(
+            server.retained_original_ids(
+                "What did those two reports conclude?", previous, originals.items()
+            ),
+            ("old", "recent"),
+        )
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client, documents=originals)
+            with patch.object(
+                server,
+                "select_records",
+                AsyncMock(return_value=server.RecordSelection(requested=True)),
+            ) as select:
+                await server.respond_to_question(
+                    state, question, server.Question(question=question, history=history)
+                )
+        select.assert_awaited_once_with(state, question, pinned=("recent", "new"))
+
     # Clear a draft warning only after checking the actual requested details.
     async def test_scoped_coverage_preserves_genuine_gaps(self) -> None:
         decisions = "Replace the aging pump and inspect the outlet valve."

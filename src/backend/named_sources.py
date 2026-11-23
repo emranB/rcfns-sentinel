@@ -37,7 +37,7 @@ class TitleMatch:
     document_id: str
     start: int
     end: int
-    score: tuple[int, float, int]
+    score: tuple[int, int, float, int]
 
 
 # Ignore case and punctuation when comparing filenames and question text.
@@ -47,7 +47,7 @@ def title_words(text: str) -> list[str]:
 
 # Rank contiguous title phrases and use nearby words to distinguish dated versions.
 def named_document_ids(
-    question: str, documents: Iterable[tuple[str, str]]
+    question: str, documents: Iterable[tuple[str, str]], *, require_folder: bool = False
 ) -> list[str]:
     words = title_words(question)
     question_terms = set(words) - TITLE_STOP_WORDS
@@ -55,13 +55,29 @@ def named_document_ids(
         return []
 
     matcher = SequenceMatcher(None, [], words, autojunk=False)
+    phrase_text = f" {' '.join(words)} "
+    folder_scores: dict[str, int] = {}
     matches: list[TitleMatch] = []
     for document_id, path in documents:
-        filename = PurePosixPath(path.replace("\\", "/")).stem
-        title = title_words(filename)
+        original = PurePosixPath(path.replace("\\", "/"))
+        title = title_words(original.stem)
         terms = set(title) - TITLE_STOP_WORDS
         shared = len(terms & question_terms)
         if shared < MINIMUM_TITLE_TERMS or shared * 2 < len(terms):
+            continue
+
+        folder = 0
+        for name in original.parts[-4:-1]:
+            if name not in folder_scores:
+                names = title_words(name)
+                folder_scores[name] = (
+                    len(names)
+                    if len(set(names) - TITLE_STOP_WORDS) >= MINIMUM_TITLE_TERMS
+                    and f" {' '.join(names)} " in phrase_text
+                    else 0
+                )
+            folder = max(folder, folder_scores[name])
+        if require_folder and not folder:
             continue
 
         matcher.set_seq1(title)
@@ -73,7 +89,7 @@ def named_document_ids(
             context = set(
                 words[max(0, start - TITLE_CONTEXT_WORDS) : end + TITLE_CONTEXT_WORDS]
             )
-            score = len(phrase), len(terms & context) / len(terms), length
+            score = len(phrase), folder, len(terms & context) / len(terms), length
             matches.append(TitleMatch(document_id, start, end, score))
 
     # An ambiguous mention should fall back to content search instead of a guessed version.

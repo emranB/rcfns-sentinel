@@ -41,6 +41,7 @@ from src.backend.evidence import format_excerpt
 from src.backend.grounding import (
     APPROVAL_AUTHORITY,
     INCOMPLETE_TEXT,
+    THRESHOLD_REQUEST,
     ClaimAnswer,
     CoverageReview,
     EvidenceText,
@@ -55,6 +56,7 @@ from src.backend.grounding import (
     requested_part_score,
     requested_parts,
     single_focus,
+    threshold_passage,
     timeline_passages,
     verified_answer,
 )
@@ -342,12 +344,27 @@ SAME_RECORD = re.compile(
     r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
     re.IGNORECASE,
 )
+RECORD_FAMILIES = r"(?:agreements?|documents?|files?|minutes|polic(?:y|ies)|records?|reports?|statements?|terms|versions?)"
+PRIOR_RECORDS = re.compile(
+    rf"\b(?:(?:these|those)(?:\s+two)?|both|the same)\s+{RECORD_FAMILIES}\b",
+    re.IGNORECASE,
+)
+PRIOR_RECORD_YEAR = re.compile(
+    rf"\b(?:the|that)\s+(?P<year>(?:19|20)\d{{2}})\s+{RECORD_FAMILIES}"
+    r"(?=$|[.,;?!]|\s+(?:and|with|against|versus|to)\b)",
+    re.IGNORECASE,
+)
 REFERENCE_END = re.compile(
     r"[,;:?!]|\s+(?:and|what|when|where|who|how|which|does|did|can|should|must)\b",
     re.IGNORECASE,
 )
 COMPARISON_PART = re.compile(
     r"\b(?:compare|changed?|versus|difference)\b", re.IGNORECASE
+)
+EACH_RECORD = re.compile(
+    rf"\b(?:each|both|all)\s+(?:(?:of\s+)?(?:the|these|those)\s+)?"
+    rf"(?:{RECORD_FAMILIES}|funds?|thresholds?|rates?|values?|amounts?)\b",
+    re.IGNORECASE,
 )
 MEETING_INTERSECTION = re.compile(r"\bwhich\b.{0,100}\broll call\b", re.IGNORECASE)
 COLUMN_YEAR = re.compile(r"\b((?:19|20)\d{2})\s+column\b", re.IGNORECASE)
@@ -1402,6 +1419,26 @@ def referenced_originals(
     ranked.sort(reverse=True)
     if len(ranked) == 1 or (ranked[0][0] > ranked[1][0] and ranked[0][0][0]):
         return (ranked[0][1],)
+    return ()
+
+
+# Bind a reference to earlier cited originals without absorbing a newly named source.
+def retained_original_ids(
+    question: str, prior: EvidenceContext | None, originals: Iterable[tuple[str, str]]
+) -> tuple[str, ...]:
+    if prior is None:
+        return ()
+    paths = dict(originals)
+    previous = tuple(key for key in prior.document_ids if key in paths)
+    if len(previous) > 1 and PRIOR_RECORDS.search(question):
+        return previous
+    if reference := PRIOR_RECORD_YEAR.search(question):
+        requested = reference["year"]
+        matches = tuple(
+            key for key in previous if requested in YEAR.findall(Path(paths[key]).stem)
+        )
+        if len(matches) == 1:
+            return matches
     return ()
 
 
@@ -2540,9 +2577,12 @@ async def select_records(
     filenames = [] if pinned else explicit_ids(scoped, originals, filenames_only=True)
     named = list(pinned) or filenames or explicit_ids(scoped, originals)
     dated = [] if pinned else dated_references(scoped, originals)
+    anchored = not named and not dated
+    if anchored:
+        named = named_document_ids(scoped, originals, require_folder=True)
     if not named and not dated:
         return RecordSelection()
-    if named and not dated and not pinned and not filenames:
+    if named and not dated and not pinned and not filenames and not anchored:
         named = list(dict.fromkeys([*named, *named_document_ids(scoped, originals)]))
 
     # A date in the heading distinguishes undated filenames from their neighbors.
@@ -3134,7 +3174,12 @@ async def answer_parts(
     for part in parts:
         fields = requested_fields(part)
         owners = {source_clause(field) for field in fields}
-        routed_parts.extend(fields if "" not in owners and len(owners) > 1 else [part])
+        uses_each = len(originals) > 1 and any(
+            EACH_RECORD.search(field) for field in fields
+        )
+        routed_parts.extend(
+            fields if uses_each or ("" not in owners and len(owners) > 1) else [part]
+        )
     plan: list[tuple[tuple[str, ...], str]] = []
     opening = re.split(r"(?<=[.?!])\s+", scoped.strip(), maxsplit=1)[0]
     comparison_ids = (
@@ -3144,6 +3189,11 @@ async def answer_parts(
     )
     for part in routed_parts:
         if paired and comparison_focus(part):
+            continue
+        if len(by_source) > 1 and (
+            EACH_RECORD.search(part) or PRIOR_RECORDS.search(part)
+        ):
+            plan.append((tuple(by_source), part))
             continue
         direct = explicit_ids(part, originals)
         if direct:
@@ -3257,6 +3307,40 @@ async def answer_parts(
 
         # Validate each requested value against its own supporting passage.
         async def find_field(part: str) -> RecordAnswer:
+            if (
+                len(urls) == 1
+                and original_text
+                and (threshold := threshold_passage(part, original_text))
+            ):
+                return RecordAnswer(
+                    f"> {threshold} [{original_reference(threshold) + 1}]"
+                )
+            if len(urls) > 1 and THRESHOLD_REQUEST.search(part):
+                # Check each original separately so a value cannot be borrowed from its neighbor.
+                async def read_threshold(group: list[int]) -> tuple[int, str]:
+                    index = group[0]
+                    raw = ""
+                    if Path(sources[index].name).suffix.casefold() == ".docx":
+                        with suppress(httpx.HTTPError, OSError, TimeoutError):
+                            async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                                document = await word_archive(
+                                    state, evidence[index].chunk.document_id
+                                )
+                                raw = await asyncio.to_thread(word_body, document)
+                    return index, threshold_passage(
+                        part, raw or "\n".join(excerpts[item].content for item in group)
+                    )
+
+                thresholds = await asyncio.gather(
+                    *(read_threshold(by_source[url]) for url in urls)
+                )
+                if all(passage for _, passage in thresholds):
+                    return RecordAnswer(
+                        "\n\n".join(
+                            f"**{sources[index].name}**\n\n> {passage} [{index + 1}]"
+                            for index, passage in thresholds
+                        )
+                    )
             if len(urls) > 1 and COMPARISON_PART.search(part):
                 matching: dict[str, list[tuple[int, str]]] = {}
                 for url in urls:
@@ -3766,11 +3850,28 @@ async def answer_question(
             sources=[],
             mode_used="standard",
         )
+    prior = next(
+        (
+            message.evidence_context
+            for message in reversed(payload.history)
+            if message.role == "assistant" and message.evidence_context is not None
+        ),
+        None,
+    )
     record_question = question
     async with asyncio.timeout(25):
         record_scope = question
         pinned: tuple[str, ...] = ()
-        if payload.history and SAME_RECORD.search(question):
+        if prior is not None and (
+            PRIOR_RECORDS.search(question) or PRIOR_RECORD_YEAR.search(question)
+        ):
+            originals = list(indexed_originals(state))
+            if retained := retained_original_ids(question, prior, originals):
+                named = explicit_ids(question, originals)
+                pinned = tuple(dict.fromkeys((*retained, *named)))[
+                    :MAX_EXPLICIT_ORIGINALS
+                ]
+        if not pinned and payload.history and SAME_RECORD.search(question):
             originals = list(indexed_originals(state))
             if (
                 not explicit_ids(question, originals, filenames_only=True)
@@ -3827,14 +3928,6 @@ async def answer_question(
     membership = documented_membership(state, question, recent_hits, payload.mode)
     if membership is not None:
         return membership
-    prior = next(
-        (
-            message.evidence_context
-            for message in reversed(payload.history)
-            if message.role == "assistant" and message.evidence_context is not None
-        ),
-        None,
-    )
     plan = await semantic_plan(state, scoped, payload.history, prior)
     if (
         not check_years

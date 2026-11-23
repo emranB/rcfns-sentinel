@@ -6,6 +6,35 @@ from src.backend.named_sources import named_document_ids
 
 
 class NamedSourceTests(unittest.TestCase):
+    # A named directory resolves identical titles and excludes a different manual.
+    def test_folder_reference_resolves_duplicate_titles(self) -> None:
+        documents = [
+            (
+                "first",
+                "Reference/Metro Maintenance Procedures/Service Scheduling Guidelines.docx",
+            ),
+            (
+                "second",
+                "Operations/Harbor Maintenance Procedures/Service Scheduling Guidelines.docx",
+            ),
+            (
+                "draft",
+                "Operations/Harbor Maintenance Procedures/Harbor Maintenance Draft.docx",
+            ),
+        ]
+        question = "In Harbor Maintenance Procedures, what do the Service Scheduling Guidelines require?"
+        self.assertEqual(
+            named_document_ids(question, documents, require_folder=True), ["second"]
+        )
+        self.assertEqual(
+            named_document_ids(
+                "What do the Service Scheduling Guidelines require?",
+                documents,
+                require_folder=True,
+            ),
+            [],
+        )
+
     # Match distinct original titles and select the stated date despite reordered words.
     def test_matches_titles_from_multiple_folders(self) -> None:
         documents = [
