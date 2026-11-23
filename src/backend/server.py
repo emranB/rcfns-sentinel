@@ -400,6 +400,11 @@ class RollCallScope(BaseModel):
     directory: bool = False
 
 
+class EvidenceContext(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    document_ids: list[str] = Field(max_length=MAX_EXPLICIT_ORIGINALS)
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Citation]
@@ -446,11 +451,6 @@ class Question(BaseModel):
 class FollowUpPlan(BaseModel):
     question: str = Field(min_length=1)
     queries: list[str] = Field(max_length=3)
-
-
-class EvidenceContext(BaseModel):
-    question: str = Field(min_length=1, max_length=4000)
-    document_ids: list[str] = Field(max_length=MAX_EXPLICIT_ORIGINALS)
 
 
 class SearchPlan(BaseModel):
@@ -1712,7 +1712,17 @@ async def resolve_file(
                     heading = "\n".join(
                         line for line in text.splitlines() if line.strip()
                     )[:1300]
-                    day = document_period(Path(source.name).stem, heading)
+                    year_hint = next(
+                        (
+                            int(year_labels[0])
+                            for part in reversed(Path(source.path).parts[:-1])
+                            if len(year_labels := YEAR.findall(part)) == 1
+                        ),
+                        None,
+                    )
+                    day = document_period(
+                        Path(source.name).stem, heading, year_hint=year_hint
+                    )
                     if day is None:
                         if requested.month is None and year in YEAR.findall(
                             source.name

@@ -17,11 +17,29 @@ from src.backend.grounding import (
     values,
     verified_answer,
 )
-from src.backend.record_lookup import dated_references, explicit_ids, has_record_date
+from src.backend.record_lookup import (
+    dated_references,
+    document_period,
+    explicit_ids,
+    has_record_date,
+)
 from src.backend.tabular import count_named_rows, requested_table, table_person_names
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Resolve older day-first headings with a century established by the original.
+    def test_reporting_date_supports_legacy_headings_without_guessing_century(
+        self,
+    ) -> None:
+        self.assertEqual(
+            document_period("Audit2012Report", "30 Nov 12\nInventory"),
+            date(2012, 11, 30),
+        )
+        self.assertEqual(
+            document_period("Inspection report", "As of 1 March 1988"), date(1988, 3, 1)
+        )
+        self.assertIsNone(document_period("Undated report", "30 Nov 12\nInventory"))
+
     # Compare tied facts only within the requested event, subject, and value type.
     def test_approved_amount_and_form_count_require_their_own_evidence(self) -> None:
         proposal = (

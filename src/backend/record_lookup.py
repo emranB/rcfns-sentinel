@@ -31,6 +31,12 @@ DATE = re.compile(
     r"(?:[,\s]+(?P<year>(?:19|20)\d{2}))?\b",
     re.IGNORECASE,
 )
+DAY_FIRST_DATE = re.compile(
+    r"(?P<day>\d{1,2})\s+(?P<month>"
+    + "|".join(sorted(MONTH_NUMBER, key=len, reverse=True))
+    + r")\.?[,\s]+(?P<year>(?:19|20)\d{2}|\d{2})\b",
+    re.IGNORECASE,
+)
 RECORD_TYPE = re.compile(
     r"\b(?:balance sheets?|financial statements?|meeting minutes|minutes|"
     r"annual reports?|reports?|policies|policy|registers?|rosters?|ledgers?|budgets?|"
@@ -114,12 +120,40 @@ def referenced_file(question: str) -> FileAvailability | None:
 
 
 # Prefer the reporting date in the original over a generated or printed date.
-def document_period(title: str, heading: str) -> date | None:
+def document_period(
+    title: str, heading: str, *, year_hint: int | None = None
+) -> date | None:
+    title_years = [int(token) for token in title_tokens(title) if YEAR.fullmatch(token)]
+    reference = title_years[0] if len(title_years) == 1 else year_hint
+
+    # Interpret a short year only when the original's title or folder supplies the century.
+    def day_first(match: re.Match[str]) -> date | None:
+        year = int(match["year"])
+        if len(match["year"]) == 2:
+            if reference is None:
+                return None
+            year += reference // 100 * 100
+        try:
+            return date(
+                year, MONTH_NUMBER[match["month"].casefold()], int(match["day"])
+            )
+        except ValueError:
+            return None
+
     for label in REPORT_PERIOD_LABEL.finditer(heading):
         if match := DATE.match(heading, label.end()):
             dated = mentioned_dates(match[0])
             if dated:
                 return dated[0][0]
+        if (legacy := DAY_FIRST_DATE.match(heading, label.end())) and (
+            day := day_first(legacy)
+        ):
+            return day
+    for line in heading.splitlines()[:6]:
+        if (legacy := DAY_FIRST_DATE.fullmatch(line.strip())) and (
+            day := day_first(legacy)
+        ):
+            return day
     dates = mentioned_dates(title)
     return dates[0][0] if dates else filename_date(title)
 
