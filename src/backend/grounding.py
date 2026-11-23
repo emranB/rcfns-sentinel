@@ -155,6 +155,7 @@ PART_NOISE = frozenset(
 )
 SUPPLEMENT_FIELD = re.compile(
     r"^(?:include\s+\w+(?:\s+\w+){0,5}|what (?:is|are) the (?:exception|exceptions|conditions?)"
+    r"|what is (?:its|the) base"
     r"|(?:when|where|how) (?:does|did) (?:it|that)\s+\w+(?:\s+\w+){0,3})$",
     re.IGNORECASE,
 )
@@ -181,6 +182,11 @@ EVENT_DATE_FIELD = re.compile(
     r"^(?:(?:what|which|give|report)(?:['\u2019]s|\s+is)?\s+)?(?:the\s+)?"
     r"(?:(?:exact|calendar|actual|specific|scheduled|recorded)\s+)?"
     r"(?P<event>(?:[\w-]+\s+){0,3}?)(?:dates?|calendar day)\b",
+    re.IGNORECASE,
+)
+PLANNED_EVENT_DATE = re.compile(
+    r"\bwhat\s+(?:date|day)\s+(?:is|are|was|were)\s+(?P<subject>.+?)\s+"
+    r"(?:intended|scheduled|expected|planned|required)\s+to\s+(?:be\s+)?(?P<action>[^?.]+)",
     re.IGNORECASE,
 )
 PERIOD_FIELD = re.compile(
@@ -343,11 +349,14 @@ MONEY_BOUND = re.compile(
 )
 PRINTED_BOUND = {
     "maximum": re.compile(
-        r"\b(?:maximum|cap(?:ped)?|ceiling|up to|no more than|must not exceed)\b",
+        r"\b(?:maximum|cap(?:ped)?|ceiling|up to|no more than|must not exceed)\b|"
+        r"\b(?:under|below|less than)\s+[$£€]",
         re.IGNORECASE,
     ),
     "minimum": re.compile(
-        r"\b(?:minimum|floor|at least|no less than)\b", re.IGNORECASE
+        r"\b(?:minimum|floor|at least|no less than)\b|"
+        r"\b(?:over|above|more than|greater than)\s+[$£€]",
+        re.IGNORECASE,
     ),
 }
 NO_BOUND = {
@@ -357,7 +366,7 @@ NO_BOUND = {
     "minimum": re.compile(r"\bno (?:stated )?(?:minimum|floor)\b", re.IGNORECASE),
 }
 DEADLINE_FIELD = re.compile(
-    r"\b(?:what (?:is|was) (?:the )?|(?:specify|give|list)\s+(?:(?:an?|the)\s+)?)"
+    r"\b(?:what (?:is|was) (?:the )?|(?:specify|give|list|say|state|provide)\s+(?:(?:an?|the)\s+)?)"
     r"(?:(?P<before>[\w-]+(?:\s+[\w-]+){0,4}?)\s+)?deadline"
     r"(?:\s+for\s+(?P<after>[^?,.]+))?\b",
     re.IGNORECASE,
@@ -423,8 +432,22 @@ RECIPIENT_QUESTION = re.compile(
 )
 CADENCE_SUBJECT = re.compile(
     r"^how often\s+(?:are\s+)?(?:(?P<subject>.+?)\s+(?:are\s+)?(?:prepared|issued|sent|published|produced)\b"
-    r"|.+?\s+(?:gives?|issues?|sends?|publishes|produces|provides?)\s+(?P<object>[^?;(]+))",
+    r"|.+?\s+(?:gives?|issues?|sends?|publishes|produces|provides?)\s+(?P<object>[^?;(]+)"
+    r"|(?:should|must|does|do)\s+.+?\s+(?:prepare|issue|send|publish|produce|provide)\s+(?P<prepared>[^?;(]+))",
     re.IGNORECASE,
+)
+FEE_RATE_REQUEST = re.compile(
+    r"\b(?P<topic>[\w-]+)\s+fees?\s+(?:percentages?|rates?)\b",
+    re.IGNORECASE,
+)
+RATE_COVERAGE_REQUEST = re.compile(
+    r"^(?:include|list)\s+(?:each|all|every)\s+(?:stated\s+)?rates?\b", re.IGNORECASE
+)
+RATE_BASE_REQUEST = re.compile(
+    r"^what\s+(?:each|the)\s+rate applies to\b", re.IGNORECASE
+)
+DECLARED_RATE = re.compile(
+    r"\b(?:is|are|shall be|set at)\s+\d+(?:\.\d+)?\s*%", re.IGNORECASE
 )
 RECIPIENT_PROOF = re.compile(
     r"\b(?:for [\w ]{1,45} review|to (?:the |both )?\w+|reviewed by \w+)\b",
@@ -574,6 +597,12 @@ def requested_parts(question: str) -> list[str]:
     for line in re.split(r"(?<=[.?!])\s+", question.strip()):
         if not line.endswith("?") and not PART_REQUEST.search(line):
             continue
+        if (
+            parts
+            and FEE_RATE_REQUEST.search(parts[-1])
+            and RATE_COVERAGE_REQUEST.match(line)
+        ):
+            continue
         if parts and RECIPIENT_QUESTION.fullmatch(line.strip()):
             fields = requested_fields(parts[-1])
             if len(fields) > 1 and all(
@@ -597,6 +626,12 @@ def requested_parts(question: str) -> list[str]:
 def requested_fields(part: str) -> list[str]:
     fields: list[str] = []
     pieces = FIELD_JOIN.split(FIELD_SCOPE.sub("", part.strip()))
+    if (
+        len(pieces) > 1
+        and FEE_RATE_REQUEST.search(pieces[0])
+        and RATE_BASE_REQUEST.search(pieces[1])
+    ):
+        pieces[:2] = [" and ".join(pieces[:2])]
     if len(pieces) > 1 and not PART_REQUEST.search(pieces[0]):
         pieces[:2] = [", ".join(pieces[:2])]
     for piece in pieces:
@@ -704,6 +739,21 @@ def start_passage(detail: str, text: str, context: str) -> str:
     return next(iter(passages)) if len(passages) == 1 else ""
 
 
+# Keep each rate with the clause identifying the base to which it applies.
+def rate_passages(question: str, text: str) -> str:
+    if not (request := FEE_RATE_REQUEST.search(question)):
+        return ""
+    subject = {request["topic"].casefold()}
+    return "\n".join(
+        dict.fromkeys(
+            clause.strip()
+            for clause in re.split(r"\n+|(?<=[.!?])\s+", text)
+            if DECLARED_RATE.search(clause)
+            and focus_matches(frozenset(source_terms(clause)), subject)
+        )
+    )
+
+
 # Recover a single printed monetary threshold, retaining its original condition.
 def threshold_passage(question: str, text: str) -> str:
     if not THRESHOLD_REQUEST.search(question):
@@ -753,6 +803,21 @@ def matching_measure(
 # Match the event and value together before exposing a date, amount, or count to generation.
 def field_evidence(question: str, text: str) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if planned := PLANNED_EVENT_DATE.search(question):
+        planned_terms = (
+            source_terms(f"{planned['subject']} {planned['action']}")
+            - STOP
+            - FIELD_TERMS
+        )
+        return "\n".join(
+            dict.fromkeys(
+                line
+                for line in lines
+                if mentioned_dates(line)
+                and focus_matches(frozenset(source_terms(line)), planned_terms)
+                == len(planned_terms)
+            )
+        )
     if timestamp := WHEN_EVENT.search(question):
         phase = timestamp["phase"].casefold()
         time_label = re.compile(rf"\b{phase}\w*\s+(?:time|date)\s*:", re.IGNORECASE)
@@ -900,7 +965,9 @@ def field_evidence(question: str, text: str) -> str | None:
         return "\n".join(ranged)
     if scheduled := CADENCE_SUBJECT.search(question):
         topics = (
-            source_terms(scheduled["subject"] or scheduled["object"])
+            source_terms(
+                scheduled["subject"] or scheduled["object"] or scheduled["prepared"]
+            )
             - STOP
             - FIELD_TERMS
         )

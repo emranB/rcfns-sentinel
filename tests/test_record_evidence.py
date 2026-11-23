@@ -13,6 +13,7 @@ from src.backend.grounding import (
     labeled_passage,
     primary_passages,
     quantitative_passage,
+    rate_passages,
     requested_fields,
     requested_part_score,
     requested_parts,
@@ -31,6 +32,43 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Quote each fee and its own base, even when other rates appear nearby.
+    def test_fee_rates_keep_their_separate_bases(self) -> None:
+        question = "Compare the booking fee percentages and what each rate applies to."
+        first = "The booking fee is 4% of on-site ticket receipts."
+        second = "The booking fee is 8% of online sales."
+        record = f"{first} A separate tax is 10%.\n{second}"
+        self.assertEqual(rate_passages(question, record).splitlines(), [first, second])
+        parts = requested_parts(question + " Include every rate.")
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(len(requested_fields(parts[0])), 1)
+
+    # A planned finish and a preparation cadence must match their explicit topics.
+    def test_planned_date_and_active_voice_cadence(self) -> None:
+        date = "The building is to be fully inspected by August 4, 2018."
+        report = "Prepare a monthly incident log for supervisor review."
+        evidence = "The hiring process started July 4, 2018.\n" + date + "\n" + report
+        self.assertEqual(
+            field_evidence(
+                "What date is the building intended to be fully inspected", evidence
+            ),
+            date,
+        )
+        self.assertEqual(
+            field_evidence(
+                "How often should they prepare an incident log for supervisor review",
+                evidence,
+            ),
+            report,
+        )
+        amount = "Receipts apply to contributions over $35.00."
+        self.assertEqual(
+            field_evidence(
+                "What minimum contribution amount applies to a receipt?", amount
+            ),
+            amount,
+        )
+
     # A follow-on instruction and a coordinated yes-or-no question remain separate.
     def test_preserves_following_fact_requests(self) -> None:
         first, second = requested_parts(

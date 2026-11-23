@@ -40,6 +40,7 @@ from src.backend.current_sources import (
 from src.backend.evidence import format_excerpt
 from src.backend.grounding import (
     APPROVAL_AUTHORITY,
+    FEE_RATE_REQUEST,
     INCOMPLETE_TEXT,
     PERMISSION_REQUEST,
     THRESHOLD_REQUEST,
@@ -56,6 +57,7 @@ from src.backend.grounding import (
     part_quantity,
     primary_passages,
     quantitative_passage,
+    rate_passages,
     requested_fields,
     requested_part_score,
     requested_parts,
@@ -1741,7 +1743,7 @@ def historical_original_ids(
             question_terms = source_terms(context.question)
             live = [key for key in context.document_ids if key in originals]
             ranked = {
-                key: len(terms & source_terms(originals[key].replace("-", " ")))
+                key: len(terms & source_terms(" ".join(title_tokens(originals[key]))))
                 for key in live
             }
             score = max(ranked.values(), default=0)
@@ -3968,6 +3970,41 @@ async def answer_parts(
 
         # Validate each requested value against its own supporting passage.
         async def find_field(part: str) -> RecordAnswer:
+            context = field_context(scoped, part)
+            rate_question = (
+                context
+                if re.fullmatch(r"what is (?:its|the) base", part, re.IGNORECASE)
+                else part
+            )
+            if original_text and (rates := rate_passages(rate_question, original_text)):
+                quote = "\n".join(f"> {line}" for line in rates.splitlines())
+                return RecordAnswer(f"{quote} [{original_reference(rates) + 1}]")
+            if len(urls) > 1 and FEE_RATE_REQUEST.search(rate_question):
+                # Read each agreement independently before combining its published rates.
+                async def read_rates(url: str) -> tuple[int, str]:
+                    index = by_source[url][0]
+                    key = evidence[index].chunk.document_id
+                    match = await retained_file(state, key)
+                    text = (
+                        match.text
+                        if match
+                        else "\n".join(excerpts[i].content for i in by_source[url])
+                    )
+                    return index, rate_passages(rate_question, text)
+
+                rates_by_source = await asyncio.gather(
+                    *(read_rates(url) for url in urls)
+                )
+                if all(proof for _, proof in rates_by_source):
+                    return RecordAnswer(
+                        "\n\n".join(
+                            f"**{sources[index].name}**\n\n"
+                            + "\n\n".join(
+                                f"> {line} [{index + 1}]" for line in proof.splitlines()
+                            )
+                            for index, proof in rates_by_source
+                        )
+                    )
             if original_text and FILE_DATE_COMPARISON.search(part):
                 title = Path(sources[first].name).stem
                 filename = mentioned_dates(title)
@@ -4111,7 +4148,6 @@ async def answer_parts(
                 return RecordAnswer(
                     "\n\n".join(value for value in (quantity, field) if value)
                 )
-            context = field_context(scoped, part)
             if original_text and (start := start_passage(part, original_text, context)):
                 return RecordAnswer(f"> {start} [{original_reference(start) + 1}]")
             prompt = (
