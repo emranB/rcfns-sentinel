@@ -33,6 +33,12 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Identical multi-source sections can answer two fields without repeating the citations.
+    def test_record_answer_eliminates_duplicate_sections(self) -> None:
+        text = "**First original**\n\n> The amount is $40. [1]\n\n**Second original**\n\n> The amount is $80. [2]"
+        first = server.RecordAnswer(text)
+        self.assertEqual(first.combined_with(server.RecordAnswer(text)).text, text)
+
     # Recover a source through semantic expansion when the raw question retrieves nothing.
     async def test_both_modes_retrieve_planned_terms_for_an_unfamiliar_subject(
         self,

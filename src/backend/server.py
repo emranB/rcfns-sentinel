@@ -48,9 +48,11 @@ from src.backend.grounding import (
     MetricPassage,
     comparison_focus,
     comparison_passages,
+    field_context,
     field_evidence,
     labeled_passage,
     part_quantity,
+    primary_passages,
     quantitative_passage,
     requested_fields,
     requested_part_score,
@@ -577,7 +579,7 @@ class RecordAnswer:
     def combined_with(self, *answers: RecordAnswer) -> RecordAnswer:
         parts = (self, *answers)
         return RecordAnswer(
-            "\n\n".join(part.text for part in parts if part.text),
+            "\n\n".join(dict.fromkeys(part.text for part in parts if part.text)),
             tuple(detail for part in parts for detail in part.missing),
             any(part.unspecified_gap for part in parts),
         )
@@ -3047,6 +3049,7 @@ async def read_claims(
         limit=limit,
         instructions=(
             "Answer only the requested details. Keep the original labels for dates and events. "
+            "Use one concise claim when the question asks for a single fact or rule. "
             "Respect headings and paragraph groups. A question or suggestion does not "
             "establish a decision. Keep each record's facts tied to its own subject, "
             "including when comparing unrelated records."
@@ -3335,6 +3338,16 @@ async def answer_parts(
                     *(read_threshold(by_source[url]) for url in urls)
                 )
                 if all(passage for _, passage in thresholds):
+                    if (
+                        len({normalized_evidence(passage) for _, passage in thresholds})
+                        == 1
+                    ):
+                        citations = " ".join(
+                            f"[{index + 1}]" for index, _ in thresholds
+                        )
+                        return RecordAnswer(
+                            f"The originals state the same threshold.\n\n> {thresholds[0][1]} {citations}"
+                        )
                     return RecordAnswer(
                         "\n\n".join(
                             f"**{sources[index].name}**\n\n> {passage} [{index + 1}]"
@@ -3422,9 +3435,24 @@ async def answer_parts(
                 return RecordAnswer(
                     "\n\n".join(value for value in (quantity, field) if value)
                 )
+            context = field_context(scoped, part)
+            prompt = (
+                f"{part}\nSubject from the preceding request: {context}"
+                if context
+                else part
+            )
+            primary_text = primary_passages(part, original_text, context)
+            if primary_text:
+                primary = excerpts.copy()
+                primary[first] = EvidenceText(excerpts[first].label, primary_text)
+                answer = await read_claims(
+                    state, prompt, primary, [first], limit=600, coverage="partial"
+                )
+                if answer.text or answer.missing:
+                    return answer
             answer = await read_claims(
                 state,
-                part,
+                prompt,
                 excerpts,
                 indices,
                 limit=1000,

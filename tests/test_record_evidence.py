@@ -8,8 +8,10 @@ from zipfile import ZipFile
 from src.backend.grounding import (
     ClaimAnswer,
     EvidenceText,
+    field_context,
     field_evidence,
     labeled_passage,
+    primary_passages,
     quantitative_passage,
     requested_fields,
     requested_part_score,
@@ -37,6 +39,15 @@ class RecordEvidenceTests(unittest.TestCase):
         self.assertEqual(
             requested_fields(second),
             ["Include notice requirements", "whether the panel can cancel it"],
+        )
+        question = "Who can end the arrangement? Include notice requirements and say whether an extension is allowed."
+        parent = field_context(question, "Include notice requirements")
+        self.assertEqual(parent, "Who can end the arrangement")
+        evidence = "The meeting notice is shared with observers.\nTermination takes effect on written notice to the custodian."
+        self.assertTrue(
+            primary_passages(
+                "Include notice requirements", evidence, parent
+            ).startswith("Termination takes effect")
         )
 
     # Approval evidence must address the requested subject, even beside similar clauses.

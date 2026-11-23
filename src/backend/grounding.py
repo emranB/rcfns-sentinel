@@ -153,6 +153,11 @@ PART_NOISE = frozenset(
         "list",
     ]
 )
+SUPPLEMENT_FIELD = re.compile(
+    r"^(?:include\s+\w+(?:\s+\w+){0,5}|what (?:is|are) the (?:exception|exceptions|conditions?)"
+    r"|(?:when|where|how) (?:does|did) (?:it|that)\s+\w+(?:\s+\w+){0,3})$",
+    re.IGNORECASE,
+)
 NUMERIC_PART = re.compile(
     r"\b(?:amount|count|total|ceiling|cap|maximum|range|limits?|disbursement|quantity|number)\b",
     re.IGNORECASE,
@@ -533,6 +538,60 @@ def requested_fields(part: str) -> list[str]:
         else:
             fields.append(text)
     return fields
+
+
+# Restore the subject of a short dependent detail from the preceding field.
+def field_context(question: str, detail: str) -> str:
+    if not SUPPLEMENT_FIELD.fullmatch(detail.strip()):
+        return ""
+    position = question.casefold().find(detail.casefold())
+    earlier = requested_parts(question[:position]) if position > 0 else []
+    return requested_fields(earlier[-1])[-1] if earlier else ""
+
+
+# Keep the most relevant original paragraphs for a narrow question or follow-on detail.
+def primary_passages(detail: str, text: str, context: str = "") -> str:
+    noise = (
+        STOP
+        | PART_NOISE
+        | FIELD_TERMS
+        | {
+            "requirement",
+            "exception",
+            "detail",
+            "initial",
+            "amount",
+            "expected",
+            "say",
+            "can",
+            "end",
+            "it",
+            "is",
+            "are",
+            "was",
+            "were",
+            "do",
+            "does",
+            "will",
+        }
+    )
+    subjects = source_terms(detail) - noise
+    related = source_terms(context) - noise
+    if "end" in source_terms(f"{detail} {context}"):
+        related.update({"termination", "dissolution", "cancel"})
+    if not subjects and not related:
+        return ""
+    ranked: list[tuple[int, int, str]] = []
+    for line in dict.fromkeys(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        terms = frozenset(source_terms(line))
+        direct = focus_matches(terms, subjects)
+        supporting = focus_matches(terms, related)
+        if direct or supporting:
+            ranked.append((3 * direct + 2 * supporting, -len(line), line))
+    return "\n".join(line for _, _, line in sorted(ranked, reverse=True)[:7])[:4600]
 
 
 # Recover a single printed monetary threshold, retaining its original condition.
