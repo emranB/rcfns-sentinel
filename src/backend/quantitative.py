@@ -13,6 +13,7 @@ from src.backend.tabular import Worksheet, worksheet_tables
 CALCULATION_REQUEST = re.compile(
     r"\b(?:calculat\w*|comput\w*|subtract\w*|divid\w*|multiply|ratio|working capital|"
     r"variance|percentage (?:change|of|increase|decrease)|percent change|difference|"
+    r"what (?:share|proportion|fraction) of|"
     r"how much [^?!.]{0,45}\b(?:higher|lower|more|less|change[ds]?|increas\w*|decreas\w*)|"
     r"add(?:s|ed)? up|tie(?:s)? out|reconcil(?:e|es|ed|ing))\b",
     re.IGNORECASE,
@@ -137,6 +138,9 @@ def measure_rows(
     for index, amount, label, heading in parsed:
         headings = source_terms(heading)
         qualifier = column_terms
+        role = requested & {"actual", "budget"}
+        if len(role) == 1:
+            qualifier = (qualifier - {"actual", "budget"}) | role
         if (
             qualifier == {"actual"}
             and not {"actual", "budget"} & dimensions[amount.source]
@@ -161,8 +165,13 @@ def measure_rows(
             and named_axis <= queries
             and not heading.startswith("total ")
         )
+        axes = {part.strip() for part in heading.split("/")}
+        axis = " ".join(sorted(qualifier))
+        exact_column = (
+            2 if column and column == heading else int(bool(axis) and axis in axes)
+        )
         score = (
-            int(bool(column) and column == heading),
+            exact_column,
             int(wanted == terms),
             int(exact_context),
             int(heading == "total"),

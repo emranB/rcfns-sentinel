@@ -1995,6 +1995,8 @@ async def quantify(
             "Their difference is working capital; their quotient is current ratio. "
             "For each requested calculation include an equation using one-based indices into measures, with default precision 2. "
             "Difference is exactly [target, baseline]. Remainder is a reconciliation with three or more distinct terms. "
+            "To subtract two or more distinct terms from a starting amount, use remainder with every term in the equation. "
+            "Do not introduce intermediate calculations or additional metrics the request does not require. "
             "Ratio is a quotient. Share is a quotient shown as a percent. Percent_change is (new minus old) divided by old, "
             "so 'how far above budget as a percentage of budget' uses percent_change with [actual, budget]. "
             "The same measures can appear in several equations. Do not assume alternate inputs when the requested ones are unavailable.",
@@ -2007,10 +2009,16 @@ async def quantify(
     except (httpx.HTTPError, ValueError, TimeoutError):
         return None
 
+    compound_subtraction = len(plan.measures) > 2 and bool(
+        re.search(r"\b(?:minus|less)\b[^?!.]{1,90}\band\b", question, re.IGNORECASE)
+    )
     if any(
         len(set(equation.inputs)) != len(equation.inputs)
         or not all(1 <= row <= len(plan.measures) for row in equation.inputs)
         for equation in plan.equations
+    ) or (
+        compound_subtraction
+        and not any(equation.operation == "remainder" for equation in plan.equations)
     ):
         with suppress(httpx.HTTPError, ValueError, TimeoutError):
             available = "\n".join(
@@ -2021,6 +2029,7 @@ async def quantify(
                 state,
                 "Choose the requested equations over the numbered inputs. Use distinct existing IDs. "
                 "Difference is target minus baseline. Percent change is (new minus old) divided by old. "
+                "For a starting amount minus two or more terms, use a single remainder with all terms in order. "
                 "Use two decimal places unless the user requests another precision.",
                 f"Question: {plan.question}\nInputs:\n{available}",
                 output_format=Equations.model_json_schema(),
@@ -2047,19 +2056,32 @@ async def quantify(
 
     explicit = explicit_ids(question, originals.items(), filenames_only=True)
     named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit)
+    explicit_dates = {day for day, _, _ in mentioned_dates(question)}
     if (
         not named
         and previous
         and (plan.reuse_sources or CALCULATION_REFERENCE.search(question))
     ):
-        dates = {day for day, _, _ in mentioned_dates(question)}
         previous_dates = {day for day, _, _ in mentioned_dates(previous.question)}
-        if dates <= previous_dates and set(YEAR.findall(question)) <= set(
+        if explicit_dates <= previous_dates and set(YEAR.findall(question)) <= set(
             YEAR.findall(previous.question)
         ):
             named.update(
                 dict.fromkeys(key for key in previous.document_ids if key in originals)
             )
+
+    dates = {
+        reference.day: reference.kind
+        for reference in dated_references(question, originals.items())
+    }
+    if not named and len(dates) == 1 and len(plan.sources) <= 1:
+        day, kind = next(iter(dates.items()))
+        if " " in kind:
+            _, named_original = await resolve_file(
+                state, FileAvailability(kind, day.year, day.month, day.day)
+            )
+            if named_original is not None:
+                named[named_original.document_id] = named_original
 
     record_ids: dict[int, str] = {}
     if len(named) == 1:
@@ -2116,7 +2138,30 @@ async def quantify(
         return_exceptions=True,
     )
     found = [item for item in gathered if isinstance(item, tuple)]
+    if dates and not explicit:
+        found = [
+            (key, source, layout)
+            for key, source, layout in found
+            if (
+                (match := named[key]) is not None
+                and match.day in dates
+                or match is None
+                and (
+                    document_period(Path(source.name).stem, layout[:1300]) in dates
+                    or statement_period(layout.splitlines()[:6])[1] in dates
+                )
+            )
+        ]
     if not found:
+        if dates:
+            periods = ", ".join(
+                f"{kind} dated {day:%Y-%m-%d}" for day, kind in dates.items()
+            )
+            return ChatResponse(
+                answer=f"I could not verify the original for {periods}.",
+                sources=[],
+                mode_used=payload.mode,
+            )
         return None
     source_ids = {key: index for index, (key, _, _) in enumerate(found, 1)}
     sources = [source for _, source, _ in found]
@@ -2180,6 +2225,10 @@ async def quantify(
             for index in equation.inputs
             if 1 <= index <= len(chosen) and (row := chosen[index - 1]) is not None
         ]
+        if equation.operation == "ratio" and re.search(
+            r"\b(?:percentage|percent|share|proportion) of\b", question, re.IGNORECASE
+        ):
+            equation = equation.model_copy(update={"operation": "share"})
         if len(bound) == len(equation.inputs) and (
             result := calculate(equation.model_copy(update={"inputs": bound}), amounts)
         ):
