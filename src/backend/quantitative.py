@@ -46,10 +46,10 @@ class OperandSource(BaseModel):
     query: str = Field(min_length=1, max_length=350)
 
 
-class QuantityPlan(BaseModel):
-    question: str = Field(min_length=1, max_length=4000)
-    reuse_sources: bool
-    sources: list[OperandSource] = Field(min_length=1, max_length=5)
+class Measure(BaseModel):
+    row: str = Field(min_length=1, max_length=120)
+    column: str = Field(max_length=120)
+    record: int | None = Field(ge=1, le=5)
 
 
 class Equation(BaseModel):
@@ -61,10 +61,16 @@ class Equation(BaseModel):
     precision: int = Field(ge=0, le=4)
 
 
-class QuantityAnswer(BaseModel):
-    inputs: list[int] = Field(max_length=12)
+class QuantityPlan(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    reuse_sources: bool
+    sources: list[OperandSource] = Field(max_length=5)
+    measures: list[Measure] = Field(min_length=1, max_length=12)
     equations: list[Equation] = Field(max_length=5)
-    missing: list[str] = Field(max_length=6)
+
+
+class RowChoices(BaseModel):
+    rows: list[int | None] = Field(max_length=12)
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,58 @@ class CitedAmount:
         if self.unit == "%":
             return f"{sign}{digits}%"
         return f"{sign}{self.unit}{digits}"
+
+
+# Use the measure's distinctive terms to reject nearby fields and subtotal columns.
+def measure_rows(
+    measure: Measure, rows: list[CitedAmount], source: int | None, titles: list[str]
+) -> list[int]:
+    ignored = {
+        "total",
+        "for",
+        "the",
+        "of",
+        "current-period",
+        "amount",
+        "figure",
+        "quarterly",
+        "monthly",
+        "ytd",
+    }
+    column = " ".join(measure.column.casefold().split())
+    column_terms = source_terms(column)
+    wanted = source_terms(measure.row) - ignored - column_terms
+    if not wanted:
+        return []
+    candidates: list[tuple[tuple[int, int, int, int], int]] = []
+    for index, amount in enumerate(rows, 1):
+        if source is not None and source != amount.source:
+            continue
+        fields = [value.strip() for value in amount.line.strip("|").split("|")]
+        label = fields[0]
+        heading = fields[1].casefold() if len(fields) > 2 else ""
+        terms = source_terms(label) - ignored
+        if not wanted <= terms:
+            continue
+        headings = source_terms(heading)
+        if (
+            column_terms
+            and not column_terms <= headings
+            and not (
+                heading == "total"
+                and column_terms <= source_terms(titles[amount.source - 1])
+            )
+        ):
+            continue
+        score = (
+            int(column == heading),
+            int(wanted == terms),
+            -len(terms - wanted),
+            int(label.casefold().startswith("total ")),
+        )
+        candidates.append((score, index))
+    highest = max((score for score, _ in candidates), default=None)
+    return [index for score, index in candidates if score == highest][:6]
 
 
 # Read a single printed numeric token without changing its sign or unit.

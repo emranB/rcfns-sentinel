@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from src.backend.quantitative import (
     Equation,
+    Measure,
     calculate,
+    measure_rows,
     numeric_layout,
     numeric_workbook,
     quantity_rows,
@@ -15,6 +17,37 @@ from src.backend.tabular import Worksheet
 
 
 class QuantityTests(unittest.TestCase):
+    # Select the exact field and column; an unrelated amount cannot fill a missing operand.
+    def test_measure_identity(self) -> None:
+        rows = quantity_rows(
+            "Total Transportation | Total for East | $215.00\n"
+            "Total Transportation | East | $160.00\n"
+            "Total Transportation | West | $335.00\n"
+            "Transportation Permits | East | $45.00\n"
+            "Cash Balance | East | $650.00",
+            1,
+        )
+        field = Measure(row="Transportation", column="East", record=1)
+        self.assertEqual(measure_rows(field, rows, 1, ["Transit Summary"]), [2])
+        self.assertEqual(
+            measure_rows(
+                field.model_copy(update={"column": "Total for East"}),
+                rows,
+                1,
+                ["Transit Summary"],
+            ),
+            [1],
+        )
+        self.assertEqual(
+            measure_rows(
+                Measure(row="Cash Payments", column="East", record=1),
+                rows,
+                1,
+                ["Transit Summary"],
+            ),
+            [],
+        )
+
     # Preserve merged worksheet headers and distinguish cached zero from a blank.
     def test_workbook_uses_group_and_row_labels(self) -> None:
         sheet = Worksheet(
