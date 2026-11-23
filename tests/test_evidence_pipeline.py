@@ -1,4 +1,4 @@
-"""Check the shared evidence pipeline when follow-up search helps or fails."""
+'''Check the shared evidence pipeline when follow-up search helps or fails.'''
 
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -26,6 +26,99 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Verify that comparison facts survive an extra Agentic evidence pass.
+    async def test_preserves_original_and_new_milestones_in_both_modes(self) -> None:
+        question = (
+            "Compare the two operations plans. What did the revised plan add "
+            "to the forklift inspection goals?"
+        )
+        baseline = "| Inspection | Inspect 40 forklift engines before June. | Notes |"
+        updated = "| Inspection | Inspect 40 forklift engines before June. Inspect 60 by October. | Notes |"
+        selection = server.RecordSelection(
+            evidence=[
+                server.Excerpt(
+                    server.RetrievedChunk(document_id=doc, content=text), text
+                )
+                for doc, text in (("previous", baseline), ("revised", updated))
+            ],
+            requested=True,
+        )
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client,
+                dataset_id="library",
+                documents={
+                    "previous": "Original plan.docx",
+                    "revised": "Revised plan.docx",
+                },
+            )
+            with (
+                patch.object(
+                    server,
+                    "investigate",
+                    AsyncMock(return_value=server.Investigation(question, [])),
+                ),
+                patch.object(server, "read_claims", AsyncMock()) as generate,
+            ):
+                for mode in ("standard", "agentic"):
+                    payload = server.Question.model_validate(
+                        {"question": question, "mode": mode}
+                    )
+                    result = await server.answer_records(
+                        state, question, payload, selection
+                    )
+                    self.assertEqual(result.mode_used, mode)
+                    self.assertIn("40 forklift engines before June", result.answer)
+                    self.assertIn("60 by October", result.answer)
+                    self.assertEqual(
+                        [s.url for s in result.sources],
+                        ["/sources/previous", "/sources/revised"],
+                    )
+                generate.assert_not_awaited()
+
+    # Recover missing comparison facts even when the model already cited their originals.
+    async def test_multisource_answer_checks_claim_coverage_separately(self) -> None:
+        question = (
+            "Compare the two operations plans. What did the revised plan add to the forklift "
+            "inspection goals? How long does the onboarding seminar last?"
+        )
+        input_text = [
+            "Inspect 40 forklift engines before June.",
+            "Inspect 40 forklift engines before June. Inspect 60 by October.",
+            "The onboarding seminar lasts 16 hours.",
+        ]
+        evidence = [
+            server.Excerpt(
+                server.RetrievedChunk(document_id=str(index), content=text), text
+            )
+            for index, text in enumerate(input_text)
+        ]
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client,
+                dataset_id="library",
+                documents={
+                    "0": "Original plan.txt",
+                    "1": "Revised plan.txt",
+                    "2": "Seminar.txt",
+                },
+            )
+            sources = [server.citation(state, item.chunk) for item in evidence]
+            stub = (
+                "The revised forklift inspection goal is 60 by October. [1] [2]\n"
+                "The onboarding seminar lasts 16 hours. [3]"
+            )
+            with patch.object(
+                server, "read_claims", AsyncMock(return_value=stub)
+            ) as model:
+                answer = await server.record_claims(
+                    state, question, evidence, sources, {}
+                )
+                model.assert_awaited_once()
+            self.assertIn("40 forklift engines before June", answer)
+            self.assertIn("60 by October", answer)
+            self.assertIn("16 hours. [3]", answer)
+
     # A scoped comparison keeps the record opening when search ranks later text first.
     async def test_period_search_preserves_openings_and_ranked_chunks(self) -> None:
         opening = server.RetrievedChunk(

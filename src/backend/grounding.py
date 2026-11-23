@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import combinations, pairwise
 from unicodedata import normalize
 
 from pydantic import BaseModel, Field
@@ -113,6 +114,47 @@ FOCUS_CLAUSE = re.compile(
 FOCUS_NOISE = frozenset(
     {"goal", "plan", "change", "part", "section", "target", "document"}
 )
+CHANGE_FOCUS = re.compile(r"\bhow did ([^?!.\n]{3,100}?) change\b", re.IGNORECASE)
+COMPARISON = re.compile(
+    r"\b(?:compare|comparison|versus|vs|between|change)\b", re.IGNORECASE
+)
+ANOTHER_QUESTION = re.compile(
+    r"\band (?:what|when|where|why|who|how|whether)\b", re.IGNORECASE
+)
+PART_REQUEST = re.compile(
+    r"\b(?:what|when|where|who|how|why|which)\b|^\s*(?:report|give|list|identify|extract|provide)\b",
+    re.IGNORECASE,
+)
+LIST_REQUEST = re.compile(
+    r"^\s*(?:report|give|list|identify|extract|provide)\s+", re.IGNORECASE
+)
+PART_NOISE = frozenset(
+    [
+        "what",
+        "when",
+        "where",
+        "who",
+        "how",
+        "why",
+        "which",
+        "use",
+        "report",
+        "give",
+        "source",
+        "cite",
+        "each",
+        "original",
+        "according",
+        "include",
+        "list",
+    ]
+)
+NUMERIC_PART = re.compile(
+    r"\b(?:amount|count|total|ceiling|cap|maximum|range|limit|disbursement|quantity|number)\b",
+    re.IGNORECASE,
+)
+REQUESTED_LABEL = re.compile(r"\b(?:deadline|update)\b", re.IGNORECASE)
+CAP_TERMS = frozenset({"ceiling", "cap", "maximum", "limit"})
 
 INSTRUCTIONS = (
     "Answer with brief factual claims that address the question. Use one claim per finding "
@@ -148,6 +190,189 @@ class ClaimAnswer(BaseModel):
 class EvidenceText:
     label: str
     content: str
+
+
+@dataclass(frozen=True)
+class MetricPassage:
+    index: int
+    text: str
+    terms: frozenset[str]
+
+
+# Identify the requested topic without borrowing labels from the source documents.
+def comparison_focus(question: str) -> set[str]:
+    match = FOCUS_CLAUSE.search(question) or CHANGE_FOCUS.search(question)
+    return source_terms(match[1]) - STOP - FOCUS_NOISE if match else set()
+
+
+# Limit a topic filter to a single question so independent parts retain their evidence.
+def single_focus(question: str) -> set[str]:
+    if question.count("?") > 1 or ANOTHER_QUESTION.search(question):
+        return set()
+    return comparison_focus(question)
+
+
+# Match related inflections such as an action and its noun form.
+def focus_matches(terms: frozenset[str], focus: set[str]) -> int:
+    return sum(
+        topic in terms
+        or any(
+            min(len(term), len(topic)) >= 5
+            and abs(len(term) - len(topic)) <= 4
+            and (term[:5] == topic[:5])
+            for term in terms
+        )
+        for topic in focus
+    )
+
+
+# Keep independent questions separate while retaining related fields within one clause.
+def requested_parts(question: str) -> list[str]:
+    parts: list[str] = []
+    for line in re.split(r"(?<=[.?!])\s+", question.strip()):
+        if not PART_REQUEST.search(line):
+            continue
+        if command := LIST_REQUEST.match(line):
+            parts.extend(
+                f"{command[0]}{item}"
+                for item in re.split(
+                    r",\s+(?!(?:19|20)\d{2}\b)(?:and\s+)?", line[command.end() :]
+                )
+            )
+        else:
+            parts.append(line)
+    return parts[:8]
+
+
+# Score a request against a literal passage and its source label.
+def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, int]:
+    topics = source_terms(question) - STOP - PART_NOISE
+    label = source_terms(item.label)
+    question_text = normalized(question)
+    heading = passage = 0
+    for line in item.content.splitlines():
+        terms = frozenset(source_terms(line))
+        passage = max(passage, focus_matches(terms, topics))
+        if (
+            2 <= len(terms) <= 7
+            and len(line) <= 64
+            and terms <= topics
+            and normalized(line) in question_text
+        ):
+            heading = max(heading, len(terms))
+    return (
+        focus_matches(frozenset(label), topics),
+        passage,
+        heading,
+    )
+
+
+# Preserve short heading-value passages and literal updates in named records.
+def labeled_passage(question: str, text: str) -> str:
+    if not (match := REQUESTED_LABEL.search(question)):
+        return ""
+    label = match[0].casefold()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if label == "deadline":
+        requested = source_terms(question)
+        fields = sorted(
+            (len(source_terms(heading) & requested), heading, value)
+            for heading, value in pairwise(lines)
+            if len(heading) < 36
+            and label in source_terms(heading)
+            and mentioned_dates(value)
+        )
+        if fields and (len(fields) == 1 or fields[-1][0] > fields[-2][0]):
+            _, heading, value = fields[-1]
+            return f"{heading} {value}"
+    else:
+        terms = source_terms(question) - STOP - PART_NOISE - {label, "report"}
+        for line in lines:
+            heading, separator, _ = line.partition("\u2013")
+            if not separator:
+                heading, separator, _ = line.partition(":")
+            heading_terms = source_terms(heading)
+            if separator and label in heading_terms and heading_terms & terms:
+                return line
+    return ""
+
+
+# Select a scoped numeric passage that preserves multiple values on the same line.
+def part_quantity(question: str, text: str) -> tuple[int, str] | None:
+    if not NUMERIC_PART.search(question):
+        return None
+    topics = source_terms(question) - STOP - PART_NOISE
+    topics = (topics - CAP_TERMS) | ({"limit"} if topics & CAP_TERMS else set())
+    best = None
+    for line in text.splitlines():
+        for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
+            if not 12 <= len(sentence) <= 480 or not has_quantity(sentence):
+                continue
+            terms = source_terms(sentence)
+            terms = (terms - CAP_TERMS) | ({"limit"} if terms & CAP_TERMS else set())
+            matched = focus_matches(frozenset(terms), topics)
+            if matched >= 2 and (best is None or matched > best[0]):
+                best = (matched, sentence)
+    return best
+
+
+# Distinguish values from calendar years when looking for a quantified passage.
+def has_quantity(text: str) -> bool:
+    return any(
+        match[1] or not 1900 <= Decimal(match[2].replace(",", "")) <= 2099
+        for match in NUMBER.finditer(text)
+    )
+
+
+# Pair literal quantities only when the passages describe a shared measure.
+def comparison_passages(
+    question: str, evidence: list[EvidenceText]
+) -> list[MetricPassage]:
+    focus = comparison_focus(question)
+    if not focus or not COMPARISON.search(question):
+        return []
+    grouped: dict[str, dict[str, MetricPassage]] = {}
+    for index, item in enumerate(evidence):
+        for line in item.content.splitlines():
+            # A self-contained table cell can preserve an updated target without adjacent notes.
+            candidates = (
+                line.strip().split("|")[1:-1]
+                if line.strip().startswith("|")
+                else [line]
+            )
+            for cell in candidates:
+                passage = " ".join(cell.split())
+                if not 15 <= len(passage) <= 420 or not has_quantity(passage):
+                    continue
+                terms = frozenset(source_terms(passage) - STOP - FOCUS_NOISE)
+                if focus_matches(terms, focus) >= min(2, len(focus)):
+                    grouped.setdefault(item.label, {}).setdefault(
+                        normalized(passage), MetricPassage(index, passage, terms)
+                    )
+
+    # Keep a bounded set of promising passages from each original.
+    batches = [
+        sorted(
+            rows.values(), key=lambda row: focus_matches(row.terms, focus), reverse=True
+        )[:5]
+        for rows in grouped.values()
+    ]
+    best: tuple[tuple[int, bool, float], MetricPassage, MetricPassage] | None = None
+    for left, right in combinations(batches, 2):
+        for one in left:
+            for two in right:
+                common = one.terms & two.terms
+                overlap = len(common) / max(len(one.terms), len(two.terms))
+                if len(common) < 4 or overlap < 0.65:
+                    continue
+                score = (
+                    focus_matches(common, focus),
+                    values(one.text) != values(two.text),
+                    overlap,
+                )
+                if best is None or score > best[0]:
+                    best = (score, one, two)
+    return sorted(best[1:], key=lambda row: row.index) if best else []
 
 
 # Normalize only punctuation and whitespace that can vary during extraction.
@@ -270,8 +495,7 @@ def verified_answer(
 ) -> str:
     accepted = []
     incomplete = draft.incomplete
-    match = FOCUS_CLAUSE.search(question)
-    focus = source_terms(match[1]) - STOP - FOCUS_NOISE if match else set()
+    focus = single_focus(question)
     for claim in draft.claims:
         if focus and not (source_terms(claim.text) & focus):
             continue

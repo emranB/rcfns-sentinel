@@ -9,14 +9,53 @@ from src.backend.grounding import (
     ClaimAnswer,
     EvidenceText,
     quantitative_passage,
+    requested_part_score,
+    requested_parts,
     values,
     verified_answer,
 )
 from src.backend.record_lookup import dated_references, explicit_ids, has_record_date
-from src.backend.tabular import count_named_rows, requested_table
+from src.backend.tabular import count_named_rows, requested_table, table_person_names
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Keep related fields together and preserve commas in dates and amounts.
+    def test_independent_requests_preserve_related_facts(self) -> None:
+        parts = requested_parts(
+            "Use the three originals. Report the sales total for March 3, 2024, "
+            "the booking count and fee, and the two inventory amounts. "
+            "Who approves spending over $2,001?"
+        )
+        self.assertEqual(len(parts), 4)
+        self.assertIn("March 3, 2024", parts[0])
+        self.assertIn("booking count and fee", parts[1])
+        self.assertIn("$2,001", parts[3])
+
+    # Join explicit first and last name columns and preserve only the names requested.
+    def test_name_columns_exclude_unrequested_contacts(self) -> None:
+        table = (
+            "| Candidate First Name | Candidate Last Name | Extension |\n"
+            "| Kelly | Reed | 123 |\n"
+            "| Marc | Rivers | 456 |\n"
+        )
+        self.assertEqual(
+            table_person_names("Give the names listed.", table),
+            ["Kelly Reed", "Marc Rivers"],
+        )
+        self.assertEqual(table_person_names("Give the extensions.", table), [])
+
+    # Prefer a literal section heading over scattered matches in another record.
+    def test_requested_heading_distinguishes_sources_with_equal_topic_overlap(
+        self,
+    ) -> None:
+        question = "Give the decisions listed on the Field Readiness slide."
+        slide = EvidenceText("Briefing.pptx", "FIELD READINESS\nFit safety rails.")
+        memo = EvidenceText(
+            "Notes.docx", "Field inspections assess equipment readiness."
+        )
+        self.assertEqual(requested_part_score(question, slide), (0, 2, 2))
+        self.assertEqual(requested_part_score(question, memo), (0, 2, 0))
+
     # Keep a version comparison focused on the requested part of the revision.
     def test_discards_supported_but_unrelated_changes(self) -> None:
         training = "The medical training goal increased to 100%."

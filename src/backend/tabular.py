@@ -26,12 +26,55 @@ COUNT_NAMES = re.compile(
 NAME_HEADERS = frozenset(
     {"name", "full name", "first name", "last name", "given name", "surname"}
 )
+NAME_LIST = re.compile(
+    r"\b(?:give|list|identify|report)\b[^?!.\n]{0,60}\bnames\b", re.IGNORECASE
+)
+PERSON_FIELD = re.compile(r"[^\W\d_]+(?:[ .'\u2019-][^\W\d_]+)*\.?")
 
 
 @dataclass(frozen=True)
 class TableRow:
     name: str
     values: tuple[Decimal, ...]
+
+
+# Join explicit given-name and family-name columns without copying adjacent details.
+def table_person_names(question: str, text: str) -> list[str]:
+    if not NAME_LIST.search(question):
+        return []
+    given = family = -1
+    names: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("|") or not line.endswith("|"):
+            if names:
+                break
+            given = family = -1
+            continue
+        cells = [part.strip() for part in line[1:-1].split("|")]
+        if given < 0 or family < 0:
+            fields = [set(re.findall(r"[^\W_]+", value.casefold())) for value in cells]
+            given = next(
+                (
+                    index
+                    for index, words in enumerate(fields)
+                    if "name" in words and words & {"given", "first", "forename"}
+                ),
+                -1,
+            )
+            family = next(
+                (
+                    index
+                    for index, words in enumerate(fields)
+                    if "surname" in words
+                    or ("name" in words and words & {"family", "last"})
+                ),
+                -1,
+            )
+        elif max(given, family) < len(cells) and all(
+            PERSON_FIELD.fullmatch(cells[index]) for index in (given, family)
+        ):
+            names.append(f"{cells[given]} {cells[family]}")
+    return list(dict.fromkeys(names))
 
 
 # Restore a split label and numeric continuation without changing column order.

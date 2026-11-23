@@ -1,4 +1,4 @@
-"""Serve the browser chat and coordinate document startup and retrieval."""
+'''Serve the browser chat and coordinate document startup and retrieval.'''
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from itertools import chain, islice, zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -33,18 +34,33 @@ from src.backend.current_sources import (
     filename_date,
     latest_document_ids,
     requested_years,
+    source_terms,
 )
 from src.backend.evidence import format_excerpt
 from src.backend.grounding import (
     INCOMPLETE_TEXT,
     ClaimAnswer,
     EvidenceText,
+    MetricPassage,
+    comparison_focus,
+    comparison_passages,
+    labeled_passage,
+    part_quantity,
     quantitative_passage,
+    requested_part_score,
+    requested_parts,
+    single_focus,
     timeline_passages,
     verified_answer,
 )
 from src.backend.grounding import (
     INSTRUCTIONS as GROUNDING_INSTRUCTIONS,
+)
+from src.backend.grounding import (
+    normalized as normalized_evidence,
+)
+from src.backend.grounding import (
+    values as evidence_values,
 )
 from src.backend.index_cache import IndexCache, prepare_index_cache
 from src.backend.library_overview import CollectionOverview, build_overview
@@ -97,7 +113,12 @@ from src.backend.source_recovery import (
     render_eps,
 )
 from src.backend.sources import SourceCollection, resolve_sources
-from src.backend.tabular import count_named_rows, name_count_sheet, requested_table
+from src.backend.tabular import (
+    count_named_rows,
+    name_count_sheet,
+    requested_table,
+    table_person_names,
+)
 from src.backend.vision_recovery import (
     RASTER_EXTENSIONS,
     VisionRecoveryError,
@@ -1565,6 +1586,16 @@ def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
                 break
             retained.append(Excerpt(item.chunk, text))
             available -= len(text)
+    # Preserve a matched comparison even when the surrounding chunk exceeded its quota.
+    proof = [EvidenceText(item.chunk.document_id, item.text) for item in evidence]
+    for passage in comparison_passages(scoped, proof):
+        chunk = evidence[passage.index].chunk
+        if not any(
+            item.chunk.document_id == chunk.document_id
+            and normalized_evidence(passage.text) in normalized_evidence(item.text)
+            for item in retained
+        ):
+            retained.append(Excerpt(chunk, passage.text))
     return retained
 
 
@@ -1623,6 +1654,138 @@ async def read_claims(
     )
 
 
+# Render both comparable passages or describe an explicitly appended target.
+def measured_comparison(passages: list[MetricPassage], sources: list[Citation]) -> str:
+    first, second = sorted(passages, key=lambda item: len(item.text))
+    if second.text.casefold().startswith(first.text.casefold()):
+        addition = second.text[len(first.text) :].strip(" .;:-")
+        if evidence_values(addition):
+            new_source = sources[second.index]
+            return (
+                f'Both originals give the milestone "{first.text}" '
+                f"[{first.index + 1}] [{second.index + 1}].\n\n"
+                f'**{new_source.name}** adds "{addition}" [{second.index + 1}].'
+            )
+    return "\n".join(
+        f"- **{sources[item.index].name}** {item.text} [{item.index + 1}]"
+        for item in passages
+    )
+
+
+# Check the stated measurements for each original instead of counting citation marks.
+def covers_comparison(
+    answer: str, passages: list[MetricPassage], sources: list[Citation]
+) -> bool:
+    stated: dict[str, set[Decimal]] = {}
+    metrics = {sources[item.index].url: item.terms for item in passages}
+    for line in answer.splitlines():
+        numbers = evidence_values(CITATION_MARKER.sub("", line))
+        terms = source_terms(line)
+        for reference in CITATION_MARKER.findall(line):
+            url = sources[int(reference) - 1].url
+            if url in metrics and len(terms & metrics[url]) >= 2:
+                stated.setdefault(url, set()).update(numbers)
+    return all(
+        evidence_values(item.text) <= stated.get(sources[item.index].url, set())
+        for item in passages
+    )
+
+
+# Resolve independent questions against the relevant originals before composing a reply.
+async def answer_parts(
+    state: RagflowSession,
+    scoped: str,
+    text: list[EvidenceText],
+    sources: list[Citation],
+    paired: list[MetricPassage],
+) -> str:
+    parts = requested_parts(scoped)
+    by_source: dict[str, list[int]] = {}
+    for index, source in enumerate(sources):
+        by_source.setdefault(source.url, []).append(index)
+    if len(parts) < 2 or len(by_source) < 3:
+        return ""
+
+    plan: dict[str, list[str]] = {}
+    for part in parts:
+        if paired and comparison_focus(part):
+            continue
+        name_tables = [
+            url
+            for url, indices in by_source.items()
+            if any(table_person_names(part, text[index].content) for index in indices)
+        ]
+        if len(name_tables) == 1:
+            plan.setdefault(name_tables[0], []).append(part)
+            continue
+        candidates = []
+        for url, indices in by_source.items():
+            label, passage, heading = max(
+                (requested_part_score(part, text[index]) for index in indices),
+                key=lambda score: (score[0] + score[1], score[2], score[1]),
+            )
+            candidates.append(((label + passage, heading, passage), url))
+        candidates.sort(reverse=True)
+        best, url = candidates[0]
+        if best[0] < 2 or best == candidates[1][0]:
+            return ""
+        plan.setdefault(url, []).append(part)
+    if not plan or (len(plan) < 2 and not paired):
+        return ""
+
+    # Use only the assigned record, including complete table rows for a name list.
+    async def find(url: str, questions: list[str]) -> str:
+        indices = by_source[url]
+        scoped_parts = "\n".join(questions)
+        field = None
+        if len(questions) == 1:
+            for index in indices:
+                if names := table_person_names(scoped_parts, text[index].content):
+                    return f"{', '.join(names)} [{index + 1}]."
+                if caption := labeled_passage(scoped_parts, text[index].content):
+                    field = f"> {caption} [{index + 1}]"
+        quantities = (
+            [
+                (match[0], index, match[1])
+                for index in indices
+                if (match := part_quantity(scoped_parts, text[index].content))
+            ]
+            if len(questions) == 1
+            else []
+        )
+        quantity = ""
+        if quantities:
+            _, index, line = max(quantities, key=lambda item: item[0])
+            quantity = f"> {line} [{index + 1}]"
+        if field:
+            return "\n\n".join(value for value in (quantity, field) if value)
+        answer = await read_claims(
+            state,
+            f"{scoped_parts}\nAnswer only the requested details. Keep the original labels "
+            "for dates and events. Mark incomplete only if a requested detail is missing.",
+            text,
+            indices,
+            limit=1000,
+        )
+        return (
+            quantity
+            if quantity and (not answer or answer.endswith(INCOMPLETE_TEXT))
+            else answer
+        )
+
+    answers = await asyncio.gather(
+        *(find(url, questions) for url, questions in plan.items())
+    )
+    reply = "\n\n".join(
+        answer.removesuffix(f"\n\n{INCOMPLETE_TEXT}") for answer in answers if answer
+    )
+    if reply and any(
+        not answer or answer.endswith(INCOMPLETE_TEXT) for answer in answers
+    ):
+        reply += f"\n\n{INCOMPLETE_TEXT}"
+    return reply
+
+
 # Look for specific facts in originals that the first answer omitted.
 async def record_claims(
     state: RagflowSession,
@@ -1640,7 +1803,28 @@ async def record_claims(
         )
         for source, item in zip(sources, evidence, strict=True)
     ]
-    answer = await read_claims(state, scoped, text, range(len(text)))
+    paired = comparison_passages(scoped, text)
+    distinct = len({source.url for source in sources})
+    if (
+        paired
+        and distinct == 2
+        and single_focus(scoped)
+        and normalized_evidence(paired[0].text) != normalized_evidence(paired[1].text)
+    ):
+        return measured_comparison(paired, sources)
+
+    answer = await answer_parts(state, scoped, text, sources, paired)
+    if not answer:
+        answer = await read_claims(state, scoped, text, range(len(text)))
+    if paired and not covers_comparison(answer, paired, sources):
+        answer = "\n\n".join(
+            part
+            for part in (
+                answer.removesuffix(f"\n\n{INCOMPLETE_TEXT}"),
+                measured_comparison(paired, sources),
+            )
+            if part
+        )
     covered = {sources[int(i) - 1].url for i in CITATION_MARKER.findall(answer)}
     missing: dict[str, list[int]] = {}
     for index, source in enumerate(sources):
