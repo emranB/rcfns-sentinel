@@ -76,6 +76,7 @@ from src.backend.office_text_recovery import (
     restore_word_outline,
     slide_items,
     word_body,
+    word_tables,
 )
 from src.backend.pdf_recovery import normalize_pdf, pdf_text
 from src.backend.ragflow import (
@@ -105,11 +106,13 @@ from src.backend.record_lookup import (
 )
 from src.backend.roll_call import (
     DIRECTORY_TITLE,
+    TENURE_TITLE,
     RollCall,
     attendance_names,
     attendance_sections,
     contact_directory,
     dated_count_scope,
+    dated_tenure_names,
     named_attendance_section,
     parse_roll_call,
     roster_aliases,
@@ -464,6 +467,7 @@ class MembershipDirectory:
     heading: str
     source: Citation
     names: tuple[str, ...]
+    complete: bool = True
 
 
 @dataclass
@@ -1521,22 +1525,39 @@ async def dated_roll_call(
     return None
 
 
-# Verify that an original is a membership directory for the requested group and year.
+# Rank dated directories ahead of historical registers for the requested group.
+def membership_directory_rank(path: str, group: str, year: int) -> int | None:
+    original = Path(path)
+    if not set(group.split()) <= source_terms(" ".join(original.parts[-4:])):
+        return None
+    if DIRECTORY_TITLE.search(original.name) and str(year) in YEAR.findall(path):
+        return int(str(year) not in YEAR.findall(original.name))
+    if original.suffix.casefold() == ".docx" and TENURE_TITLE.search(original.name):
+        return 2
+    return None
+
+
+# Verify a dated directory or interpret explicit service intervals from a register.
 async def load_membership_directory(
     state: RagflowSession, scope: RollCallScope
 ) -> MembershipDirectory | None:
     if (opening := await record_opening(state, scope.document_id)) is None:
         return None
     source = citation(state, opening)
-    if not DIRECTORY_TITLE.search(source.name) or str(scope.year) not in YEAR.findall(
-        source.path
-    ):
+    rank = membership_directory_rank(source.path, scope.group, scope.year)
+    if rank is None:
         return None
-    if not set(scope.group.split()) <= source_terms(source.name):
-        return None
-    if result := contact_directory(await membership_text(state, opening, source)):
-        heading, names = result
-        return MembershipDirectory(scope, heading, source, names)
+    if rank < 2:
+        if result := contact_directory(await membership_text(state, opening, source)):
+            heading, names = result
+            return MembershipDirectory(scope, heading, source, names)
+    else:
+        archive = await word_archive(state, scope.document_id)
+        tables = await asyncio.to_thread(word_tables, archive)
+        if members := dated_tenure_names(tables, scope.year):
+            return MembershipDirectory(
+                scope, Path(source.name).stem, source, members, complete=False
+            )
     return None
 
 
@@ -1547,11 +1568,9 @@ async def dated_membership_record(
     if record := await dated_roll_call(state, group, year):
         return record
     candidates = sorted(
-        (str(year) not in YEAR.findall(Path(path).name), path, key)
+        (rank, path, key)
         for key, path in indexed_originals(state)
-        if DIRECTORY_TITLE.search(Path(path).name)
-        and set(group.split()) <= source_terms(Path(path).name)
-        and str(year) in YEAR.findall(path)
+        if (rank := membership_directory_rank(path, group, year)) is not None
     )
     with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
         async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
@@ -1616,11 +1635,17 @@ def membership_reply(
     if isinstance(record, RollCallRecord):
         return roll_call_reply(record, mode, view)
     output = "count" if view.output == "count" else "names"
-    head = f'The directory titled **{record.heading}** lists **{len(record.names)} members** [1].'
+    head = (
+        f"The directory titled **{record.heading}** lists **{len(record.names)} members** [1]."
+        if record.complete
+        else f"The historical register documents **{len(record.names)} members with dated service in {record.scope.year}** [1]."
+    )
     if view.members in ("present", "absent"):
         head += "\n\n**Could not verify**\n\n- Attendance for this group"
     elif output == "names":
         head += "\n\n" + "\n".join(f"- {name}" for name in record.names)
+    if not record.complete and view.members in ("all", "inherit"):
+        head += f"\n\n**Could not verify**\n\n- A complete {record.scope.group} roster for {record.scope.year}"
     return ChatResponse(
         answer=head,
         sources=[record.source],

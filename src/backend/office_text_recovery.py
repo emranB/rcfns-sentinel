@@ -224,6 +224,30 @@ def word_body(payload: bytes) -> str:
     )
 
 
+# Preserve row and cell boundaries when an original Word table records structured facts.
+def word_tables(payload: bytes) -> list[list[list[str]]]:
+    try:
+        with ZipFile(BytesIO(payload)) as archive:
+            (root,) = read_parts(archive, [WORD_BODY], limit=MAX_WORD_OUTLINE_XML_BYTES)
+    except (BadZipFile, KeyError, OSError, ParseError, RuntimeError, ValueError):
+        return []
+    return [
+        [
+            [
+                " ".join(
+                    paragraph_text(node) for node in cell if tag_name(node) == "p"
+                ).strip()
+                for cell in row
+                if tag_name(cell) == "tc"
+            ]
+            for row in table
+            if tag_name(row) == "tr"
+        ]
+        for table in root.iter()
+        if tag_name(table) == "tbl"
+    ]
+
+
 # Keep a uniquely named slide intact so adjacent slides cannot supply its details.
 def named_slide(payload: bytes, question: str) -> str:
     references = re.split(r"[\s\"'\u2018\u2019\u201c\u201d]+", question.casefold())

@@ -6,6 +6,7 @@ from src.backend.roll_call import (
     RollCallCount,
     contact_directory,
     dated_count_scope,
+    dated_tenure_names,
     named_attendance_section,
     parse_roll_call,
     roll_call_count,
@@ -25,6 +26,19 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Open-ended, overlapping and employment rows cannot imply membership in later years.
+    def test_historical_register_requires_dated_service(self) -> None:
+        rows = [
+            ["Member name", "Date appointed", "Year retired"],
+            ["Mei Tan", "2010", "2014 (April)"],
+            ["Noor Khan", "2014", "Current"],
+            ["Ari King", "2011", "Current"],
+            ["Jordan Gray", "Hired - 2014", "2018"],
+            ["Sam Green", "2014", "2013"],
+        ]
+        self.assertEqual(dated_tenure_names([rows], 2014), ("Mei Tan", "Noor Khan"))
+        self.assertEqual(dated_tenure_names([rows], 2018), ())
+
     # Extract membership from a declared directory without returning support contacts.
     def test_contact_directory_keeps_members_and_stops_at_support(self) -> None:
         result = contact_directory(

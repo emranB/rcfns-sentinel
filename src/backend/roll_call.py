@@ -7,6 +7,8 @@ from difflib import SequenceMatcher, get_close_matches
 from typing import Literal
 from unicodedata import normalize
 
+from src.backend.current_sources import YEAR
+
 WORD = r"[^\W\d_]+"
 GROUP = rf"{WORD}(?:[ -]{WORD}){{0,3}}?"
 QUESTION = re.compile(
@@ -102,6 +104,26 @@ DIRECTORY_TITLE = re.compile(
     r"\b(?:contact (?:list|directory)|roster|(?:membership|member) (?:list|directory|register))\b",
     re.IGNORECASE,
 )
+TENURE_TITLE = re.compile(
+    r"\b(?:past|histor(?:y|ical))\b.*\b(?:list|roster|directory)\b|\b(?:tenure|register)\b",
+    re.IGNORECASE,
+)
+TENURE_NAME = {"name", "full name", "member name", "director name", "trustee name"}
+TENURE_START = {
+    "year joined",
+    "date joined",
+    "year appointed",
+    "date appointed",
+    "start year",
+}
+TENURE_END = {
+    "year retired",
+    "date retired",
+    "year left",
+    "date left",
+    "year resigned",
+    "date resigned",
+}
 DIRECTORY_BOUNDARY = re.compile(
     r"^(?:(?:board|committee|council|administrative) )?(?:resources?|support|staff|guests?|advisors?|observers?)\s*:?$",
     re.IGNORECASE,
@@ -376,6 +398,45 @@ def contact_directory(text: str) -> tuple[str, tuple[str, ...]] | None:
         if names := listed_names(name):
             members.update(names)
     return (heading, tuple(members.values())) if len(members) > 1 else None
+
+
+# Keep dated periods and joining years without extending undated tenures forward.
+def dated_tenure_names(tables: list[list[list[str]]], year: int) -> tuple[str, ...]:
+    members: dict[str, str] = {}
+    for rows in tables:
+        if not rows:
+            continue
+        name, joined, retired = (
+            next(
+                (
+                    i
+                    for i, cell in enumerate(rows[0])
+                    if " ".join(cell.casefold().split()) in labels
+                ),
+                -1,
+            )
+            for labels in (TENURE_NAME, TENURE_START, TENURE_END)
+        )
+        if min(name, joined, retired) < 0:
+            continue
+        for row in rows[1:]:
+            if len(row) <= max(name, joined, retired):
+                continue
+            start = YEAR.match(row[joined])
+            start_years = YEAR.findall(row[joined])
+            end_years = YEAR.findall(row[retired])
+            if start is None or len(start_years) != 1 or len(end_years) > 1:
+                continue
+            joined_year = int(start[0])
+            retired_year = int(end_years[0]) if end_years else joined_year
+            if not joined_year <= year <= retired_year:
+                continue
+            names = listed_names(
+                re.sub(r"\s*\(?deceased\)?$", "", row[name], flags=re.IGNORECASE)
+            )
+            if names:
+                members.update(names)
+    return tuple(members.values())
 
 
 # Keep names from member sections or names with an explicit membership role.
