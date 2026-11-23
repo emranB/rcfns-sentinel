@@ -10,6 +10,7 @@ import subprocess
 from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 from itertools import chain, islice, zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +35,16 @@ from src.backend.current_sources import (
     requested_years,
 )
 from src.backend.evidence import format_excerpt
+from src.backend.grounding import (
+    INCOMPLETE_TEXT,
+    ClaimAnswer,
+    EvidenceText,
+    timeline_passages,
+    verified_answer,
+)
+from src.backend.grounding import (
+    INSTRUCTIONS as GROUNDING_INSTRUCTIONS,
+)
 from src.backend.index_cache import IndexCache, prepare_index_cache
 from src.backend.library_overview import CollectionOverview, build_overview
 from src.backend.named_sources import named_document_ids
@@ -56,7 +67,15 @@ from src.backend.ragflow import (
     prepare_models,
     request,
 )
+from src.backend.record_lookup import (
+    dated_references,
+    explicit_ids,
+    has_record_date,
+    mentioned_dates,
+    title_tokens,
+)
 from src.backend.roll_call import (
+    attendance_names,
     roll_call_count,
     roster_aliases,
     roster_group,
@@ -72,6 +91,7 @@ from src.backend.source_recovery import (
     render_eps,
 )
 from src.backend.sources import SourceCollection, resolve_sources
+from src.backend.tabular import count_named_rows, name_count_sheet, requested_table
 from src.backend.vision_recovery import (
     RASTER_EXTENSIONS,
     VisionRecoveryError,
@@ -223,6 +243,14 @@ SUMMARY_ACTIONS = frozenset(
 WORD_LIMIT = re.compile(r"\b\d+[\s-]*(?=(?:lines?|sentences?|words?)\b)")
 ONE_LINE = re.compile(r"\b(?:1|one)[\s-]+(?:lines?|sentences?)\b", re.IGNORECASE)
 CITATION_MARKER = re.compile(r"\[(\d{1,3})\]")
+GROUPED_CITATION = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})+)\]")
+REFERENTIAL_QUESTION = re.compile(
+    r"\b(?:the (?:earlier|prior|previous|same) (?:figure|total|value|amount|date)|"
+    r"how much did (?:it|that|this) change|what about (?:it|that|the previous))\b",
+    re.IGNORECASE,
+)
+MEETING_INTERSECTION = re.compile(r"\bwhich\b.{0,100}\broll call\b", re.IGNORECASE)
+COLUMN_YEAR = re.compile(r"\b((?:19|20)\d{2})\s+column\b", re.IGNORECASE)
 
 
 class StatusView(BaseModel):
@@ -332,6 +360,14 @@ class Excerpt:
     chunk: RetrievedChunk
     text: str
     period: int | None = None
+
+
+@dataclass
+class RecordSelection:
+    evidence: list[Excerpt] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    dates: dict[str, date] = field(default_factory=dict)
+    requested: bool = False
 
 
 # Link a retrieved chunk to the exact indexed original.
@@ -803,21 +839,24 @@ async def retrieve_recent(state: RagflowSession, question: str) -> list[Retrieve
 
 
 # Read a small local copy without loading a large archive into memory.
-def read_word_archive(path: Path) -> bytes:
+def read_archive(path: Path, limit: int) -> bytes:
     with path.open("rb") as original:
-        return original.read(WORD_OUTLINE_LIMIT + 1)
+        return original.read(limit + 1)
 
 
-# Read the exact small DOCX used by a citation, including recovered local originals.
-async def word_archive(state: RagflowSession, document_id: str) -> bytes:
+# Read a bounded original from the local source or RAGFlow's stored bytes.
+async def original_archive(
+    state: RagflowSession, document_id: str, *, suffix: str, limit: int
+) -> bytes:
     original = state.locate_document(document_id)
     if original is None:
         return b""
     dataset_id, name = original
-    if Path(state.source_paths.get(name, name)).suffix.casefold() != ".docx":
+    if Path(state.source_paths.get(name, name)).suffix.casefold() != suffix:
         return b""
     if local := state.original_files.get(name):
-        return await asyncio.to_thread(read_word_archive, local)
+        data = await asyncio.to_thread(read_archive, local, limit)
+        return data if len(data) <= limit else b""
 
     path = f"/datasets/{dataset_id}/documents/{quote(document_id, safe='')}"
     response = await authenticated_response(state, "GET", path, stream=True)
@@ -825,12 +864,19 @@ async def word_archive(state: RagflowSession, document_id: str) -> bytes:
         response.raise_for_status()
         archive = bytearray()
         async for block in response.aiter_bytes(65536):
-            if len(archive) + len(block) > WORD_OUTLINE_LIMIT:
+            if len(archive) + len(block) > limit:
                 return b""
             archive.extend(block)
         return bytes(archive)
     finally:
         await response.aclose()
+
+
+# Read the exact small DOCX used by a citation.
+async def word_archive(state: RagflowSession, document_id: str) -> bytes:
+    return await original_archive(
+        state, document_id, suffix=".docx", limit=WORD_OUTLINE_LIMIT
+    )
 
 
 # Search each named original separately so a strong hit cannot hide another source.
@@ -907,7 +953,7 @@ async def generate(
     prompt: str,
     *,
     output_format: dict[str, object] | None = None,
-    answer_tokens: int = 768,
+    answer_tokens: int | None = None,
 ) -> str:
     response = await state.client.post(
         f"{OLLAMA_URL}/api/chat",
@@ -920,7 +966,7 @@ async def generate(
                 "temperature": 0,
                 "presence_penalty": 0,
                 "num_ctx": 8192,
-                "num_predict": 384 if output_format else answer_tokens,
+                "num_predict": answer_tokens or (384 if output_format else 768),
                 **({"num_thread": OLLAMA_THREADS} if OLLAMA_THREADS else {}),
             },
             "messages": [
@@ -967,6 +1013,12 @@ def year_follow_up(year: str, history: list[ChatMessage]) -> str | None:
 def scoped_question(question: str, history: list[ChatMessage]) -> str | None:
     if period := YEAR_FOLLOW_UP.fullmatch(question.strip()):
         return year_follow_up(period["year"], history)
+    if REFERENTIAL_QUESTION.search(question):
+        for message in reversed(history):
+            if message.role == "user" and not REFERENTIAL_QUESTION.search(
+                message.content
+            ):
+                return f"{question}\nEarlier subject: {message.content[:1000]}"
     words = question_words(question)
     if not words & SUMMARY_WORDS or words - UNSCOPED_WORDS:
         return question
@@ -984,16 +1036,37 @@ def scoped_question(question: str, history: list[ChatMessage]) -> str | None:
 # Keep only the sources used in the answer and align their visible citation numbers.
 def cited_answer(answer: str, sources: list[Citation]) -> tuple[str, list[Citation]]:
     numbers: dict[int, int] = {}
+    positions: dict[str, list[int]] = {}
+    used: list[Citation] = []
 
     # Give each referenced excerpt a contiguous number in order of mention.
     def number(match: re.Match[str]) -> str:
         index = int(match[1]) - 1
         if not 0 <= index < len(sources):
-            return match[0]
-        return f"[{numbers.setdefault(index, len(numbers) + 1)}]"
+            return ""
+        source = sources[index]
+        if index not in numbers:
+            candidates = positions.setdefault(source.url, [])
+            position = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if used[candidate].regions == source.regions
+                ),
+                len(used),
+            )
+            if position == len(used):
+                candidates.append(position)
+                used.append(source)
+            numbers[index] = position + 1
+        return f"[{numbers[index]}]"
 
-    answer = CITATION_MARKER.sub(number, answer)
-    return answer, [sources[index] for index in numbers]
+    expanded = GROUPED_CITATION.sub(
+        lambda match: " ".join(f"[{item.strip()}]" for item in match[1].split(",")),
+        answer,
+    )
+    replaced = CITATION_MARKER.sub(number, expanded)
+    return re.sub(r"(\[\d+\])(?: +\1)+", r"\1", replaced), used
 
 
 # Ask the model which retrieval gaps to investigate and search only the active dataset.
@@ -1004,6 +1077,7 @@ async def investigate(
     excerpts: list[Excerpt],
     *,
     periods: dict[int, list[str]] | None = None,
+    document_ids: list[str] | None = None,
 ) -> Investigation:
     sample = "\n".join(
         f"{citation(state, item.chunk).name}: {item.text[:PLANNING_SAMPLE_SIZE]}"
@@ -1030,6 +1104,8 @@ async def investigate(
 
     # Keep year-specific follow-ups inside the applicable record set when available.
     async def search(query: str) -> list[RetrievedChunk]:
+        if document_ids:
+            return await retrieve(state, query, 5, document_ids=document_ids)
         query_years = {int(match[0]) for match in YEAR.finditer(query)}
         scopes = periods or {}
         if scopes and query_years and not query_years.intersection(scopes):
@@ -1105,28 +1181,448 @@ def select_evidence(
     return selected
 
 
-# Read a record's first indexed chunk to keep its heading and opening context.
-async def record_opening(
-    state: RagflowSession, document_id: str
-) -> RetrievedChunk | None:
+# Read available chunks in their original order and keep their source locations.
+async def record_chunks(
+    state: RagflowSession, document_id: str, limit: int
+) -> list[RetrievedChunk]:
     if (original := state.locate_document(document_id)) is None:
-        return None
+        return []
     dataset, _ = original
     response = await request(
         state,
         "GET",
         f"/datasets/{dataset}/documents/{quote(document_id, safe='')}/chunks",
-        params={"page_size": 1},
+        params={"page_size": limit},
     )
     chunks = RetrievalResult.model_validate(response).chunks or []
-    return next(
-        (
-            chunk
-            for chunk in chunks
-            if chunk.available and chunk.document_id == document_id
-        ),
-        None,
+    return [
+        chunk
+        for chunk in chunks
+        if chunk.available and chunk.document_id == document_id
+    ]
+
+
+# Read the first indexed chunk to keep the heading and opening context.
+async def record_opening(
+    state: RagflowSession, document_id: str
+) -> RetrievedChunk | None:
+    return next(iter(await record_chunks(state, document_id, 1)), None)
+
+
+# Resolve file inventory entries before searching similarly named documents.
+def inventory_answer(question: str, library: Library | None) -> str:
+    if library is None:
+        return ""
+    entries = [(entry.path, entry.path) for entry in library.inventory.entries]
+    found = set(explicit_ids(question, entries))
+    messages = []
+    for entry in library.inventory.entries:
+        if entry.path not in found:
+            continue
+        name = Path(entry.path).name
+        if entry.kind == "locked":
+            messages.append(
+                f"**{name}** is listed as locked. Its contents and row counts are unavailable for search."
+            )
+        else:
+            messages.append(
+                f"**{name}** is in the file inventory as {entry.kind}. Its contents are unavailable for search."
+            )
+    return "\n\n".join(messages)
+
+
+# Fetch bounded primary evidence for each explicit title and each requested date.
+async def select_records(state: RagflowSession, scoped: str) -> RecordSelection:
+    originals = list(indexed_originals(state))
+    named = explicit_ids(scoped, originals)
+    dated = dated_references(scoped, originals)
+    if not named and not dated:
+        return RecordSelection()
+    if named and not dated:
+        named = list(dict.fromkeys([*named, *named_document_ids(scoped, originals)]))
+
+    # A date in the heading distinguishes undated filenames from their neighbors.
+    async def identify(day: date, candidates: tuple[str, ...]) -> str:
+        if not candidates:
+            return ""
+        available = await asyncio.gather(
+            *(record_chunks(state, document_id, 3) for document_id in candidates),
+            return_exceptions=True,
+        )
+        for document_id, chunks in zip(candidates, available, strict=True):
+            if isinstance(chunks, list) and any(
+                has_record_date(format_excerpt(chunk.content), day) for chunk in chunks
+            ):
+                return document_id
+        return ""
+
+    resolved = await asyncio.gather(
+        *(
+            identify(reference.day, reference.inspect)
+            if not reference.exact
+            else asyncio.sleep(0, result=reference.exact[0])
+            for reference in dated
+        )
     )
+    missing = [
+        f"{reference.day:%B} {reference.day.day}, {reference.day.year} {reference.kind}"
+        for reference, document_id in zip(dated, resolved, strict=True)
+        if not document_id
+    ]
+    selected = list(dict.fromkeys([*(value for value in resolved if value), *named]))
+    batches = await asyncio.gather(
+        *(record_chunks(state, document_id, 30) for document_id in selected),
+        return_exceptions=True,
+    )
+    evidence: list[Excerpt] = []
+    for document_id, chunks in zip(selected, batches, strict=True):
+        if not isinstance(chunks, list) or not chunks:
+            missing.append(
+                citation(
+                    state, RetrievedChunk(document_id=document_id, content="")
+                ).name
+            )
+            continue
+        # Keep each original intact until a shared context budget must be applied.
+        evidence.extend(
+            Excerpt(chunk, text)
+            for chunk in chunks
+            if (text := format_excerpt(chunk.content))
+        )
+    dates = {
+        document_id: reference.day
+        for reference, document_id in zip(dated, resolved, strict=True)
+        if document_id
+    }
+    return RecordSelection(evidence, missing, dates, True)
+
+
+# Use one supported worksheet and never infer a count from sliced search results.
+async def sheet_answer(
+    state: RagflowSession, scoped: str, selection: RecordSelection
+) -> tuple[str, list[Citation]] | None:
+    sheet = name_count_sheet(scoped)
+    if not sheet:
+        return None
+    originals = {
+        item.chunk.document_id: item
+        for item in selection.evidence
+        if citation(state, item.chunk).path.casefold().endswith(".xlsx")
+    }
+    if len(originals) != 1:
+        return None
+    document_id, item = next(iter(originals.items()))
+    source = citation(state, item.chunk)
+    payload = await original_archive(
+        state, document_id, suffix=".xlsx", limit=8 * 1024 * 1024
+    )
+    count = await asyncio.to_thread(count_named_rows, payload, sheet)
+    if count is None:
+        return (
+            f"I could not verify the complete **{sheet}** worksheet in that workbook.",
+            [],
+        )
+    return f"The **{sheet}** worksheet contains **{count} named entries** [1].", [
+        source
+    ]
+
+
+# Intersect names in a comparison source and a separately identified meeting.
+def meeting_intersection(
+    state: RagflowSession, scoped: str, evidence: list[Excerpt]
+) -> tuple[str, list[Citation]] | None:
+    if not MEETING_INTERSECTION.search(scoped):
+        return None
+    for meeting in evidence:
+        if not (names := attendance_names(meeting.text)):
+            continue
+        others = [
+            item
+            for item in evidence
+            if item.chunk.document_id != meeting.chunk.document_id
+            and not attendance_names(item.text)
+        ]
+        matches = []
+        supporting = []
+        for item in others:
+            content = " " + " ".join(title_tokens(item.text.replace("|", " "))) + " "
+            common = [
+                name for name in names if f" {' '.join(title_tokens(name))} " in content
+            ]
+            if common:
+                matches.extend(common)
+                supporting.append(citation(state, item.chunk))
+        if matches:
+            listed = ", ".join(dict.fromkeys(matches))
+            sources = [citation(state, meeting.chunk), *supporting]
+            references = " ".join(f"[{index}]" for index in range(1, len(sources) + 1))
+            return cited_answer(
+                f"The names appearing in both records are **{listed}** {references}. "
+                "The roll call documents their membership at the meeting.",
+                sources,
+            )
+    return None
+
+
+# Compute requested table comparisons from aligned numeric rows and date headings.
+def aligned_table_answer(
+    state: RagflowSession, scoped: str, evidence: list[Excerpt]
+) -> tuple[str, list[Citation]] | None:
+    if len({item.chunk.document_id for item in evidence}) != 1:
+        return None
+    for item in evidence:
+        table = requested_table(scoped, [item.text])
+        if table is None:
+            continue
+        headings, rows = table
+        unit = "$" if "$" in item.text else ""
+        lines = []
+        if (
+            REFERENTIAL_QUESTION.search(scoped)
+            and len(rows) == 1
+            and len(headings) == 2
+        ):
+            order = sorted(
+                range(2), key=lambda index: mentioned_dates(headings[index])[0][0]
+            )
+            earlier, current = (rows[0].values[index] for index in order)
+            change = current - earlier
+            verb = "decreased" if change < 0 else "increased"
+            delta = (
+                f"{verb} by {unit}{abs(change):,.2f}" if change else "did not change"
+            )
+            text = (
+                f"**{rows[0].name}** was {unit}{earlier:,.2f} ({headings[order[0]]}) "
+                f"and {unit}{current:,.2f} ({headings[order[1]]}). It {delta} [1]."
+            )
+            return text, [citation(state, item.chunk)]
+        for index, heading in enumerate(headings):
+            if (year := COLUMN_YEAR.search(scoped)) and year[1] not in heading:
+                continue
+            formatted = ", ".join(
+                f"{row.name} {unit}{row.values[index]:,.2f}" for row in rows
+            )
+            lines.append(f"- **{heading}** {formatted} [1]")
+        if len(rows) == 2 and rows[0].values == rows[1].values:
+            lines.append("\nThe two rows match in each date column.")
+        if lines:
+            return "\n".join(lines), [citation(state, item.chunk)]
+    return None
+
+
+# Show only recorded statements about the traced subjects at each known date.
+def record_timeline(
+    state: RagflowSession, scoped: str, selection: RecordSelection
+) -> tuple[str, list[Citation]] | None:
+    if len(selection.dates) < 2:
+        return None
+    events: dict[date, dict[str, Citation]] = {}
+    for item in selection.evidence:
+        if day := selection.dates.get(item.chunk.document_id):
+            for passage in timeline_passages(scoped, item.text):
+                events.setdefault(day, {})[passage] = citation(state, item.chunk)
+    if not events:
+        return None
+    answer = []
+    sources = []
+    for day, passages in sorted(events.items()):
+        answer.append(f"**{day:%B} {day.day}, {day.year}**")
+        for passage, source in passages.items():
+            sources.append(source)
+            answer.append(f"- {passage} [{len(sources)}]")
+        answer.append("")
+    answer.append(
+        "These dates identify the meeting records. The quoted passages provide no separate effective date for the changes."
+        if not any(
+            mentioned_dates(passage)
+            for passages in events.values()
+            for passage in passages
+        )
+        else "The dates above identify the records reporting the changes."
+    )
+    return cited_answer("\n".join(answer), sources)
+
+
+# Share the evidence budget across originals before preserving relevant passages.
+def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
+    documents: dict[str, list[Excerpt]] = {}
+    for item in evidence:
+        documents.setdefault(item.chunk.document_id, []).append(item)
+    if not documents:
+        return []
+    budget = PERIOD_EVIDENCE_BUDGET // len(documents)
+    terms = set(title_tokens(scoped)) - UNSCOPED_WORDS
+    numeric = {word for word in terms if word.isdecimal() and len(word) < 4}
+    retained = []
+    for items in documents.values():
+        # Put reconstructed data rows in context together with their column labels.
+        prepared = []
+        for item in items:
+            text = item.text
+            if table := requested_table(scoped, [text]):
+                headings, rows = table
+                lines = [
+                    f"{heading}: {row.name} {'$' if '$' in text else ''}{row.values[index]:,.2f}"
+                    for index, heading in enumerate(headings)
+                    for row in rows
+                ]
+                text = "\n".join(lines) + "\n\n" + text
+            prepared.append(Excerpt(item.chunk, text))
+        items = prepared
+        chosen = items
+        if sum(len(item.text) for item in items) > budget:
+            # Exact numeric anchors help match related records using different vocabulary.
+            def relevance(item: Excerpt) -> int:
+                words = set(title_tokens(item.text))
+                return len(terms & words) + 8 * len(numeric & words)
+
+            chosen = sorted(
+                items,
+                key=relevance,
+                reverse=True,
+            )
+        available = budget
+        for item in chosen:
+            text = item.text[:available]
+            if not text:
+                break
+            retained.append(Excerpt(item.chunk, text))
+            available -= len(text)
+    return retained
+
+
+# Generate claims on the selected evidence and discard claims without matching proof.
+async def read_claims(
+    state: RagflowSession,
+    question: str,
+    excerpts: list[EvidenceText],
+    indices: Iterable[int],
+    *,
+    limit: int = 1400,
+) -> str:
+    selected = tuple(indices)
+    text = "\n\n".join(
+        f"[{index + 1}] {excerpts[index].label}\n{excerpts[index].content}"
+        for index in selected
+    )
+    result = await generate(
+        state,
+        GROUNDING_INSTRUCTIONS,
+        f"Question: {question}\n\n{text}",
+        output_format=ClaimAnswer.model_json_schema(),
+        answer_tokens=limit,
+    )
+    try:
+        draft = ClaimAnswer.model_validate_json(result)
+    except ValueError:
+        LOGGER.info("The answer model did not return complete claim data")
+        return ""
+    allowed = {index + 1 for index in selected}
+    draft.claims = [
+        claim
+        for claim in draft.claims
+        if all(proof.source in allowed for proof in claim.proofs)
+    ]
+    return verified_answer(draft, excerpts)
+
+
+# Look for specific facts in originals that the first answer omitted.
+async def record_claims(
+    state: RagflowSession,
+    scoped: str,
+    evidence: list[Excerpt],
+    sources: list[Citation],
+    dates: dict[str, date],
+) -> str:
+    text = [
+        EvidenceText(
+            f"{source.path} | Record date {day:%B} {day.day}, {day.year}"
+            if (day := dates.get(item.chunk.document_id))
+            else source.path,
+            item.text,
+        )
+        for source, item in zip(sources, evidence, strict=True)
+    ]
+    answer = await read_claims(state, scoped, text, range(len(text)))
+    if len({source.url for source in sources}) == 1:
+        return answer
+    covered = {sources[int(i) - 1].url for i in CITATION_MARKER.findall(answer)}
+    missing: dict[str, list[int]] = {}
+    for index, source in enumerate(sources):
+        if source.url not in covered:
+            missing.setdefault(source.url, []).append(index)
+    if not missing:
+        return answer
+
+    # Keep each recovery request constrained to the omitted original.
+    async def fill(indices: list[int]) -> str:
+        return await read_claims(
+            state,
+            f"{scoped}\n\nGive one or two findings for the part addressed by "
+            f"{sources[indices[0]].name}. Quote a short exact passage.",
+            text,
+            indices,
+            limit=950,
+        )
+
+    patches = await asyncio.gather(*(fill(indices) for indices in missing.values()))
+    if not any(patches):
+        return answer
+    body = "\n\n".join(
+        updated
+        for part in [answer, *patches]
+        if (updated := part.removesuffix(f"\n\n{INCOMPLETE_TEXT}").strip())
+    )
+    return f"{body}\n\n{INCOMPLETE_TEXT}" if not all(patches) else body
+
+
+# Answer explicit source requests with verified claims or a bounded direct calculation.
+async def answer_records(
+    state: RagflowSession, scoped: str, payload: Question, selection: RecordSelection
+) -> ChatResponse:
+    direct = await sheet_answer(state, scoped, selection)
+    if direct is None:
+        direct = aligned_table_answer(state, scoped, selection.evidence)
+    if direct is None:
+        direct = meeting_intersection(state, scoped, selection.evidence)
+    if direct is None:
+        direct = record_timeline(state, scoped, selection)
+    mode: Literal["standard", "agentic"] = "standard"
+    if direct is not None:
+        answer, sources = direct
+    else:
+        evidence = precise_evidence(scoped, selection.evidence)
+        if evidence and payload.mode == "agentic":
+            try:
+                async with asyncio.timeout(AGENTIC_TIMEOUT_SECONDS):
+                    ids = list(
+                        dict.fromkeys(item.chunk.document_id for item in evidence)
+                    )
+                    supplement = await investigate(
+                        state, scoped, "", evidence, document_ids=ids
+                    )
+                    evidence.extend(select_evidence(supplement.chunks, 2400, evidence))
+                    mode = "agentic"
+            except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+                LOGGER.warning(
+                    "Scoped follow-up failed; using resolved records", exc_info=True
+                )
+        sources = [citation(state, item.chunk) for item in evidence]
+        answer = (
+            await record_claims(state, scoped, evidence, sources, selection.dates)
+            if evidence
+            else ""
+        )
+        answer, sources = cited_answer(answer, sources)
+    if not answer:
+        answer = "I could not verify an answer in the requested records."
+    if selection.missing:
+        answer += (
+            "\n\nI could not verify these requested originals: "
+            + ", ".join(selection.missing)
+            + "."
+        )
+    return ChatResponse(answer=answer, sources=sources, mode_used=mode)
 
 
 # Search each year independently with space for introductions and semantic hits.
@@ -1273,16 +1769,33 @@ async def respond_to_question(
             sources=[],
             mode_used="standard",
         )
+    inventory = inventory_answer(scoped, library)
+    if inventory:
+        return ChatResponse(answer=inventory, sources=[], mode_used="standard")
+    years = requested_years(scoped)
+    if (
+        years
+        and min(years) > datetime.now(UTC).year
+        and (
+            roster_group(scoped)
+            or re.search(r"\bonly evidence\b", scoped, re.IGNORECASE)
+        )
+    ):
+        return ChatResponse(
+            answer="I found no confirmed records for the requested period.",
+            sources=[],
+            mode_used="standard",
+        )
+    async with asyncio.timeout(25):
+        records = await select_records(state, scoped)
+    if records.requested:
+        return await answer_records(state, scoped, payload, records)
     recent_hits = await retrieve_recent(state, scoped)
     membership = documented_membership(state, question, recent_hits)
     if membership is not None:
         return membership
     baseline = select_evidence(recent_hits, RECENT_EVIDENCE_BUDGET)
-    periods = (
-        dated_document_ids(scoped, indexed_originals(state))
-        if requested_years(scoped)
-        else {}
-    )
+    periods = dated_document_ids(scoped, indexed_originals(state)) if years else {}
     if periods:
         named_hits, dated_evidence = await asyncio.gather(
             retrieve_named(state, scoped),

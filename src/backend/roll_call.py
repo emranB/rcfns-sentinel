@@ -68,6 +68,11 @@ ROSTER_QUESTION = re.compile(
     r"(?: (?:vs\.?|versus|and) (?:19|20)\d{2})?[?.]?",
     re.IGNORECASE,
 )
+ROSTER_PARAPHRASE = re.compile(
+    rf"who (?:served|was|were|sat) (?:on|in) (?:the |our )?(?P<group>{GROUP}) "
+    r"(?:in|for|during) (?:19|20)\d{2}[?.]?",
+    re.IGNORECASE,
+)
 ATTENDANCE_SECTION = re.compile(
     r"^(present|attendees|regrets(?:/absent)?|absent|apologies|staff|guests?|observers|visitors)"
     r"(?:\s*:\s*(.*))?$",
@@ -185,11 +190,16 @@ def roll_call_count(
 
 # Find dated membership list requests, tolerating minor spelling errors in the role.
 def roster_group(question: str) -> str:
-    match = ROSTER_QUESTION.fullmatch(" ".join(question.split()))
+    request = re.split(r"[?!]\s+", " ".join(question.split()), maxsplit=1)[0]
+    match = ROSTER_QUESTION.fullmatch(request) or ROSTER_PARAPHRASE.fullmatch(request)
     if match is None:
         return ""
-    role = match["role"].casefold()
-    if role not in ROLES and not get_close_matches(role, ROLES, n=1, cutoff=0.85):
+    role = match.groupdict().get("role")
+    if (
+        role
+        and role.casefold() not in ROLES
+        and not get_close_matches(role.casefold(), ROLES, n=1, cutoff=0.85)
+    ):
         return ""
     words = re.findall(WORD, match["group"].casefold())
     return "" if GROUP_EXCLUSIONS.intersection(words) else " ".join(words)
@@ -227,6 +237,11 @@ def roster_names(excerpt: str, group: str, source: str) -> list[str]:
     source_words = " ".join(re.findall(WORD, source.casefold()))
     if f" {group} " not in f" {source_words} ":
         return []
+    return attendance_names(excerpt)
+
+
+# Extract names from an attendance block that belongs to an identified meeting.
+def attendance_names(excerpt: str) -> list[str]:
     sections = attendance_sections(excerpt)
     has_explicit_sections = (
         PRESENT in sections

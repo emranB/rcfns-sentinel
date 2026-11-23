@@ -36,6 +36,7 @@ YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 YEAR_QUALIFIER = re.compile(
     r"\s+(?:in|for|during)\s+(?:19|20)\d{2}[?.!]*$", re.IGNORECASE
 )
+YEAR_CONTEXT = re.compile(r"\b(?:in|for|during|from)\s+(?:19|20)\d{2}\b", re.IGNORECASE)
 YEAR_FOLLOW_UP = re.compile(
     r"(?:(?:and|what about|how about)\s+)?(?:(?:in|for|during)\s+)?(?P<year>(?:19|20)\d{2})[?.!]*",
     re.IGNORECASE,
@@ -200,7 +201,7 @@ def latest_document_ids(
 # Identify explicit year scopes without interpreting incidental dates in file titles.
 def requested_years(question: str) -> tuple[int, ...]:
     years = tuple(dict.fromkeys(int(match[0]) for match in YEAR.finditer(question)))
-    if len(years) == 1 and YEAR_QUALIFIER.search(question.rstrip()):
+    if len(years) == 1 and YEAR_CONTEXT.search(question):
         return years
     return years if 2 <= len(years) <= MAX_COMPARISON_YEARS else ()
 

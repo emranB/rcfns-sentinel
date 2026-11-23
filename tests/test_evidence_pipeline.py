@@ -7,6 +7,7 @@ import httpx
 
 from src.backend import server
 from src.backend.evidence import format_excerpt
+from src.backend.grounding import ClaimAnswer
 from src.backend.library_overview import build_overview
 from src.backend.ragflow import IndexProgress, RagflowSession
 
@@ -146,20 +147,30 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         plan = server.RetrievedChunk(
             document_id="plan", content="Radio renewal is due in May."
         )
-        other = server.RetrievedChunk(
-            document_id="other", content="Submit expenses in July."
-        )
 
-        # Give general retrieval an unrelated result and scope exact requests by ID.
+        # Resolve the actual originals without a library-wide retrieval.
         async def search(
             _state: RagflowSession,
-            _question: str,
-            _limit: int = 8,
-            *,
-            document_ids: list[str] | None = None,
+            document_id: str,
+            _limit: int,
         ) -> list[server.RetrievedChunk]:
-            by_document = {"lease": lease, "plan": plan}
-            return [by_document[document_ids[0]]] if document_ids else [other]
+            return [{"lease": lease, "plan": plan}[document_id]]
+
+        draft = ClaimAnswer.model_validate(
+            {
+                "claims": [
+                    {
+                        "text": lease.content,
+                        "proofs": [{"source": 1, "quote": lease.content}],
+                    },
+                    {
+                        "text": plan.content,
+                        "proofs": [{"source": 2, "quote": plan.content}],
+                    },
+                ],
+                "incomplete": False,
+            }
+        )
 
         async with httpx.AsyncClient() as client:
             state = RagflowSession(
@@ -172,14 +183,14 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             with (
-                patch.object(server, "retrieve", side_effect=search),
+                patch.object(server, "record_chunks", side_effect=search),
                 patch.object(
                     server,
                     "investigate",
                     AsyncMock(return_value=server.Investigation(question, [])),
                 ),
                 patch.object(
-                    server, "generate", AsyncMock(return_value="March [1] and May [2].")
+                    server, "generate", AsyncMock(return_value=draft.model_dump_json())
                 ) as generate,
             ):
                 for mode in ("standard", "agentic"):
@@ -477,12 +488,8 @@ class EvidenceRankingTests(unittest.TestCase):
             server.Citation(name=name, path=name, url=f"/sources/{index}")
             for index, name in enumerate(("Policy.txt", "Uncited.txt", "Notice.txt"), 1)
         ]
-        answer, used = server.cited_answer(
-            "See [3], then [1], then [3] again. [9] is not a valid source.", sources
-        )
-        self.assertEqual(
-            answer, "See [1], then [2], then [1] again. [9] is not a valid source."
-        )
+        answer, used = server.cited_answer("See [3, 1], then [3] again.[9]", sources)
+        self.assertEqual(answer, "See [1] [2], then [1] again.")
         self.assertEqual(used, [sources[2], sources[0]])
         self.assertEqual(server.cited_answer("No supported finding.", sources)[1], [])
 
