@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher, get_close_matches
+from typing import Literal
 from unicodedata import normalize
 
 WORD = r"[^\W\d_]+"
@@ -72,6 +73,14 @@ ABSENT = frozenset({"absent", "apologies", "regrets"})
 ROLES = frozenset({"directors", "members", "trustees"})
 NONMEMBERS = frozenset({"staff", "guest", "guests", "observers", "visitors"})
 NO_ABSENCES = frozenset({"none", "nil", "no absences", "no apologies", "no regrets"})
+LABEL_NEGATION = re.compile(
+    r"\b(?:not|except|excluding|without)\b|n['\u2019]t\b", re.IGNORECASE
+)
+PRESENT_LABEL = re.compile(
+    r"\b(?:was|were|is|are|as|under)\s+(?:the\s+)?present\b"
+    r"|\bpresent\s+(?:members|directors|trustees|section)\b",
+    re.IGNORECASE,
+)
 ROSTER_QUESTION = re.compile(
     rf"(?:please )?(?:name(?: and list)?|list) (?:all |every )?(?:the )?(?P<group>{GROUP}) "
     rf"(?P<role>{WORD}) (?:in |for |during )?(?:19|20)\d{{2}}"
@@ -135,6 +144,15 @@ def dated_count_scope(question: str) -> tuple[str, int] | None:
     if not group or GROUP_EXCLUSIONS.intersection(re.findall(WORD, group)):
         return None
     return group, int(match["year"])
+
+
+# Apply an explicitly named attendance section using the same labels as the reader.
+def named_attendance_section(question: str) -> Literal["present", "absent"] | None:
+    labels = set(re.findall(WORD, question.casefold()))
+    present, absent = bool(PRESENT_LABEL.search(question)), bool(ABSENT & labels)
+    if present == absent or LABEL_NEGATION.search(question):
+        return None
+    return "present" if present else "absent"
 
 
 # Accept only a simple membership count whose group appears in the source path.

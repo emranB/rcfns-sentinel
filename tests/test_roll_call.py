@@ -5,6 +5,7 @@ import unittest
 from src.backend.roll_call import (
     RollCallCount,
     dated_count_scope,
+    named_attendance_section,
     parse_roll_call,
     roll_call_count,
     roster_aliases,
@@ -23,6 +24,18 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Document section labels apply only when a single unnegated status is named.
+    def test_named_attendance_sections_are_unambiguous(self) -> None:
+        self.assertEqual(named_attendance_section("Who sent apologies?"), "absent")
+        self.assertEqual(
+            named_attendance_section("Names listed as present?"), "present"
+        )
+        self.assertIsNone(named_attendance_section("Who wasn't absent?"))
+        self.assertIsNone(named_attendance_section("Present the full roster."))
+        self.assertIsNone(
+            named_attendance_section("Who was present and who sent regrets?")
+        )
+
     # Keep original spelling and attendance status for subsequent roster requests.
     def test_count_and_roster_share_the_same_entries(self) -> None:
         call = parse_roll_call(QUESTION, ROLL_CALL, source=SOURCE)

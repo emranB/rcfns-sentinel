@@ -107,6 +107,7 @@ from src.backend.roll_call import (
     attendance_names,
     attendance_sections,
     dated_count_scope,
+    named_attendance_section,
     parse_roll_call,
     roster_aliases,
     roster_group,
@@ -1586,6 +1587,8 @@ async def roll_call_follow_up(
             state, question, Question(question=question, mode=mode), selection
         )
         return answer.model_copy(update={"roll_call": record.scope})
+    if members := named_attendance_section(question):
+        view = view.model_copy(update={"members": members})
     return roll_call_reply(record, mode, view)
 
 
