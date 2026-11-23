@@ -9,6 +9,7 @@ from src.backend.grounding import (
     ClaimAnswer,
     EvidenceText,
     field_evidence,
+    labeled_passage,
     quantitative_passage,
     requested_fields,
     requested_part_score,
@@ -81,6 +82,17 @@ class RecordEvidenceTests(unittest.TestCase):
                 "What percentage was set for the end of 2026?", "70% by end of 2026."
             ),
             "70% by end of 2026.",
+        )
+
+    # Use the literal acceptance record even when nomination and offer lines are nearby.
+    def test_role_acceptance_requires_the_requested_role(self) -> None:
+        question = requested_fields(
+            "Give who accepted the safety lead role at the meeting."
+        )[0]
+        line = "Rin Patel accepted the safety lead offer."
+        self.assertEqual(
+            labeled_passage(question, f"Ren Lee accepts the logistics role.\n{line}"),
+            line,
         )
 
     # Keep related fields together and preserve commas in dates and amounts.

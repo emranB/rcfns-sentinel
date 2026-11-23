@@ -189,6 +189,11 @@ VOTE_DIRECTIONS = ("against|opposed", "abstentions?|abstained", "in favou?r")
 CURRENCY_VALUE = re.compile(
     r"[$£€]\s*\d|\b\d[\d,.]*\s+(?:dollars|euros|pounds)\b", re.IGNORECASE
 )
+ROLE_ACCEPTANCE = re.compile(
+    r"\bwho accepted\s+(.+?)(?=\s+(?:at|in|on|during|according to)\b|$)",
+    re.IGNORECASE,
+)
+ACCEPTED_ROLE = re.compile(r"\baccept(?:ed|s)\b", re.IGNORECASE)
 
 INSTRUCTIONS = (
     "Answer with brief factual claims that address the question. Use one claim per finding "
@@ -287,7 +292,15 @@ def requested_parts(question: str) -> list[str]:
 
 # Keep an explicitly coordinated factual request separate from its neighbor.
 def requested_fields(part: str) -> list[str]:
-    return [piece.strip().rstrip(" ?,.;") for piece in FIELD_JOIN.split(part)]
+    return [
+        re.sub(
+            r"^(?:give|report|list)\s+(?=(?:who|what|when|where|how)\b)",
+            "",
+            piece.strip().rstrip(" ?,.;"),
+            flags=re.IGNORECASE,
+        )
+        for piece in FIELD_JOIN.split(part)
+    ]
 
 
 # Match the event and value together before exposing a date, amount, or count to generation.
@@ -400,6 +413,21 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
+    if acceptance := ROLE_ACCEPTANCE.search(question):
+        role = (
+            source_terms(acceptance[1])
+            - STOP
+            - {"a", "an", "the", "of", "as", "role", "offer", "office", "position"}
+        )
+        matches = {
+            line.strip()
+            for line in text.splitlines()
+            if len(line) <= 480
+            and ACCEPTED_ROLE.search(line)
+            and focus_matches(frozenset(source_terms(line)), role) == len(role)
+        }
+        if role and len(matches) == 1:
+            return next(iter(matches))
     if not (match := REQUESTED_LABEL.search(question)):
         return ""
     label = match[0].casefold()
