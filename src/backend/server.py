@@ -48,7 +48,11 @@ from src.backend.grounding import (
 from src.backend.index_cache import IndexCache, prepare_index_cache
 from src.backend.library_overview import CollectionOverview, build_overview
 from src.backend.named_sources import named_document_ids
-from src.backend.office_text_recovery import recover_office_text, restore_word_outline
+from src.backend.office_text_recovery import (
+    recover_office_text,
+    restore_word_outline,
+    word_body,
+)
 from src.backend.pdf_recovery import normalize_pdf
 from src.backend.ragflow import (
     CHAT_MODEL,
@@ -76,6 +80,7 @@ from src.backend.record_lookup import (
 )
 from src.backend.roll_call import (
     attendance_names,
+    attendance_sections,
     roll_call_count,
     roster_aliases,
     roster_group,
@@ -251,6 +256,13 @@ REFERENTIAL_QUESTION = re.compile(
 )
 MEETING_INTERSECTION = re.compile(r"\bwhich\b.{0,100}\broll call\b", re.IGNORECASE)
 COLUMN_YEAR = re.compile(r"\b((?:19|20)\d{2})\s+column\b", re.IGNORECASE)
+REPLACEMENT_TERMS = r"(?:supersed\w*|replac\w*|overrid\w*|rescind\w*|revok\w*)"
+REPLACEMENT_STATEMENT = re.compile(rf"\b{REPLACEMENT_TERMS}\b", re.IGNORECASE)
+REPLACEMENT_QUESTION = re.compile(
+    rf"\b(?:does|do) (?:the )?(?P<subject>[^?.!]+?) (?:say|state|specify) "
+    rf"(?:that )?(?:it )?{REPLACEMENT_TERMS}\b",
+    re.IGNORECASE,
+)
 
 
 class StatusView(BaseModel):
@@ -1364,6 +1376,70 @@ def meeting_intersection(
     return None
 
 
+# Report an explicitly queried person's recorded attendance status.
+def named_attendance(
+    state: RagflowSession, scoped: str, evidence: list[Excerpt]
+) -> tuple[str, list[Citation]] | None:
+    if (
+        "roll call" not in scoped.casefold()
+        or len({e.chunk.document_id for e in evidence}) != 1
+    ):
+        return None
+    query = " " + " ".join(title_tokens(scoped)) + " "
+    for item in evidence:
+        matching = [
+            person
+            for person in attendance_names(item.text)
+            if f" {' '.join(title_tokens(person))} " in query
+        ]
+        if len(matching) != 1:
+            continue
+        person = matching[0]
+        name = f" {' '.join(title_tokens(person))} "
+        for status, listed in attendance_sections(item.text).items():
+            if status in {
+                "present",
+                "regrets",
+                "absent",
+                "apologies",
+                "regrets/absent",
+            } and (name in (" " + " ".join(title_tokens(listed)) + " ")):
+                return (
+                    (
+                        f"The roll call lists **{person}** under **{status.title()}** [1]. "
+                        "That entry records attendance for the meeting."
+                    ),
+                    [citation(state, item.chunk)],
+                )
+    return None
+
+
+# Check a claimed policy replacement against the complete named Word original.
+async def replacement_check(
+    state: RagflowSession, scoped: str, evidence: list[Excerpt]
+) -> tuple[str, Citation] | None:
+    if not (match := REPLACEMENT_QUESTION.search(scoped)):
+        return None
+    words = set(title_tokens(match["subject"]))
+    by_id = {item.chunk.document_id: citation(state, item.chunk) for item in evidence}
+    candidates = [
+        (document_id, source)
+        for document_id, source in by_id.items()
+        if words <= set(title_tokens(source.name))
+    ]
+    if len(candidates) != 1:
+        return None
+    document_id, source = candidates[0]
+    payload = await word_archive(state, document_id)
+    body = await asyncio.to_thread(word_body, payload)
+    if body and not REPLACEMENT_STATEMENT.search(body):
+        return (
+            f"I found no explicit replacement statement in **{source.name}**.",
+            source,
+        )
+    return None
+
+
 # Compute requested table comparisons from aligned numeric rows and date headings.
 def aligned_table_answer(
     state: RagflowSession, scoped: str, evidence: list[Excerpt]
@@ -1491,7 +1567,37 @@ def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
     return retained
 
 
-# Generate claims on the selected evidence and discard claims without matching proof.
+# Ask the model for literal proof before rendering any generated claim.
+async def checked_claims(
+    state: RagflowSession,
+    prompt: str,
+    excerpts: list[EvidenceText],
+    allowed: set[int],
+    *,
+    limit: int = 1400,
+    instructions: str = "",
+) -> str:
+    result = await generate(
+        state,
+        f"{GROUNDING_INSTRUCTIONS} {instructions}".strip(),
+        prompt,
+        output_format=ClaimAnswer.model_json_schema(),
+        answer_tokens=limit,
+    )
+    try:
+        draft = ClaimAnswer.model_validate_json(result)
+    except ValueError:
+        LOGGER.info("The answer model did not return complete claim data")
+        return ""
+    draft.claims = [
+        claim
+        for claim in draft.claims
+        if all(proof.source in allowed for proof in claim.proofs)
+    ]
+    return verified_answer(draft, excerpts)
+
+
+# Generate claims using only the supplied source numbers.
 async def read_claims(
     state: RagflowSession,
     question: str,
@@ -1505,25 +1611,13 @@ async def read_claims(
         f"[{index + 1}] {excerpts[index].label}\n{excerpts[index].content}"
         for index in selected
     )
-    result = await generate(
+    return await checked_claims(
         state,
-        GROUNDING_INSTRUCTIONS,
         f"Question: {question}\n\n{text}",
-        output_format=ClaimAnswer.model_json_schema(),
-        answer_tokens=limit,
+        excerpts,
+        {index + 1 for index in selected},
+        limit=limit,
     )
-    try:
-        draft = ClaimAnswer.model_validate_json(result)
-    except ValueError:
-        LOGGER.info("The answer model did not return complete claim data")
-        return ""
-    allowed = {index + 1 for index in selected}
-    draft.claims = [
-        claim
-        for claim in draft.claims
-        if all(proof.source in allowed for proof in claim.proofs)
-    ]
-    return verified_answer(draft, excerpts)
 
 
 # Look for specific facts in originals that the first answer omitted.
@@ -1586,6 +1680,8 @@ async def answer_records(
     if direct is None:
         direct = meeting_intersection(state, scoped, selection.evidence)
     if direct is None:
+        direct = named_attendance(state, scoped, selection.evidence)
+    if direct is None:
         direct = record_timeline(state, scoped, selection)
     mode: Literal["standard", "agentic"] = "standard"
     if direct is not None:
@@ -1613,6 +1709,11 @@ async def answer_records(
             if evidence
             else ""
         )
+        if checked := await replacement_check(state, scoped, evidence):
+            statement, source = checked
+            sources.append(source)
+            answer = answer.removesuffix(f"\n\n{INCOMPLETE_TEXT}")
+            answer += f"\n\n{statement} [{len(sources)}]"
         answer, sources = cited_answer(answer, sources)
     if not answer:
         answer = "I could not verify an answer in the requested records."
@@ -1855,6 +1956,11 @@ async def respond_to_question(
     answer = "I could not find that in the searchable files."
     sources = [citation(state, item.chunk) for item in evidence]
     if sources:
+        proof_text = [
+            EvidenceText(source.path, item.text)
+            for source, item in zip(sources, evidence, strict=True)
+        ]
+        proof_indices = set(range(1, len(proof_text) + 1))
         roster = (
             documented_roster(scoped, evidence, sources, periods) if periods else ""
         )
@@ -1867,12 +1973,13 @@ async def respond_to_question(
                     zip(evidence, sources, strict=True), 1
                 )
             )
-            generated = await generate(
+            generated = await checked_claims(
                 state,
-                f"{ANSWER_INSTRUCTIONS} {PERIOD_ANSWER_INSTRUCTIONS}",
                 f"Question: {scoped}{follow_up_context}\n\nDocument excerpts:\n{excerpts}\n\n"
                 f"Question: {scoped}",
-                answer_tokens=1600,
+                proof_text,
+                proof_indices,
+                instructions=PERIOD_ANSWER_INSTRUCTIONS,
             )
         else:
             paths = "\n".join(
@@ -1881,11 +1988,13 @@ async def respond_to_question(
             excerpts = "\n\n".join(
                 f"[{index}]\n{item.text}" for index, item in enumerate(evidence, 1)
             )
-            generated = await generate(
+            generated = await checked_claims(
                 state,
-                ANSWER_INSTRUCTIONS,
                 f"Recent conversation:\n{dialogue}{follow_up_context}\n\nSource paths:\n{paths}\n\n"
                 f"Document text:\n{excerpts}\n\nQuestion:\n{scoped}",
+                proof_text,
+                proof_indices,
+                instructions=ANSWER_INSTRUCTIONS,
             )
         answer, sources = cited_answer(generated.strip() or answer, sources)
     return ChatResponse(answer=answer, sources=sources, mode_used=mode)

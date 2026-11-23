@@ -12,6 +12,19 @@ from src.backend.library_overview import build_overview
 from src.backend.ragflow import IndexProgress, RagflowSession
 
 
+# Build a deterministic model reply from exact supporting test passages.
+def literal_claims(*passages: str) -> str:
+    return ClaimAnswer.model_validate(
+        {
+            "claims": [
+                {"text": text, "proofs": [{"source": index, "quote": text}]}
+                for index, text in enumerate(passages, 1)
+            ],
+            "incomplete": False,
+        }
+    ).model_dump_json()
+
+
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
     # A scoped comparison keeps the record opening when search ranks later text first.
     async def test_period_search_preserves_openings_and_ranked_chunks(self) -> None:
@@ -120,7 +133,9 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(server, "request", side_effect=search),
                 patch.object(
-                    server, "generate", AsyncMock(return_value="Six volunteers [1].")
+                    server,
+                    "generate",
+                    AsyncMock(return_value=literal_claims(current.content)),
                 ) as generate,
             ):
                 result = await server.respond_to_question(
@@ -318,7 +333,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(
                     server,
                     "generate",
-                    AsyncMock(return_value="Awards totaled $100 [1]."),
+                    AsyncMock(return_value=literal_claims(award.content)),
                 ) as generate,
             ):
                 for payload in (
@@ -397,7 +412,13 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
                 patch.object(
-                    server, "generate", AsyncMock(return_value="See [1] and [2].")
+                    server,
+                    "generate",
+                    AsyncMock(
+                        return_value=literal_claims(
+                            baseline.content, additional.content
+                        )
+                    ),
                 ) as generate,
             ):
                 question = "What do I need to bring, and when can I go?"
@@ -447,7 +468,9 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     server, "investigate", AsyncMock(side_effect=TimeoutError)
                 ),
                 patch.object(
-                    server, "generate", AsyncMock(return_value="Request it online [1].")
+                    server,
+                    "generate",
+                    AsyncMock(return_value=literal_claims(chunk.content)),
                 ) as generate,
                 self.assertLogs(server.LOGGER, level="WARNING"),
             ):

@@ -5,12 +5,36 @@ from datetime import date
 from io import BytesIO
 from zipfile import ZipFile
 
-from src.backend.grounding import ClaimAnswer, EvidenceText, verified_answer
+from src.backend.grounding import ClaimAnswer, EvidenceText, values, verified_answer
 from src.backend.record_lookup import dated_references, explicit_ids, has_record_date
 from src.backend.tabular import count_named_rows, requested_table
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # A real quotation from one file cannot be attributed to another type of source.
+    def test_rejects_proof_credited_to_a_different_document_type(self) -> None:
+        line = "The new field kit weighs 8 kilograms."
+        draft = ClaimAnswer.model_validate(
+            {
+                "claims": [
+                    {
+                        "text": "The presentation describes a field kit weighing 8 kilograms.",
+                        "proofs": [{"source": 1, "quote": line}],
+                    }
+                ],
+                "incomplete": False,
+            }
+        )
+        self.assertEqual(
+            verified_answer(draft, [EvidenceText("Field minutes.docx", line)]), ""
+        )
+        self.assertIn("[1]", verified_answer(draft, [EvidenceText("Field.pptx", line)]))
+
+    # A shortened currency amount and its expanded value refer to the same quantity.
+    def test_verifies_scaled_currency_without_converting_ordinary_units(self) -> None:
+        self.assertEqual(values("about $18.2K"), values("$18,200.00"))
+        self.assertNotEqual(values("18.2m of rope"), values("18,200,000 metres"))
+
     # Scope each explicit date to the right type and ignore a similar agenda.
     def test_dated_minutes_keep_each_requested_meeting(self) -> None:
         originals = [

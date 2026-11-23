@@ -15,6 +15,9 @@ QUESTION = re.compile(
     r"(?: currently| today| right now)?[?.]?",
     re.IGNORECASE,
 )
+ATTENDANCE_COUNT = re.compile(
+    rf"\bhow many (?P<group>{GROUP}) (?:members|directors|trustees)\b", re.IGNORECASE
+)
 NAME_WORD = rf"{WORD}(?:['’\u2010\u2011-]{WORD})*\.?"
 NAME = re.compile(rf"{NAME_WORD}(?: {NAME_WORD}){{1,5}}")
 NAME_PARTICLES = frozenset(
@@ -69,7 +72,8 @@ ROSTER_QUESTION = re.compile(
     re.IGNORECASE,
 )
 ROSTER_PARAPHRASE = re.compile(
-    rf"who (?:served|was|were|sat) (?:on|in) (?:the |our )?(?P<group>{GROUP}) "
+    rf"(?:who|which (?:people|members|individuals|directors|trustees)) "
+    rf"(?:served|was|were|sat) (?:on|in) (?:the |our )?(?P<group>{GROUP}) "
     r"(?:in|for|during) (?:19|20)\d{2}[?.]?",
     re.IGNORECASE,
 )
@@ -103,13 +107,22 @@ class RollCallCount:
 
 # Accept only a simple membership count whose group appears in the source path.
 def membership_group(question: str, source: str) -> set[str]:
-    match = QUESTION.fullmatch(" ".join(question.casefold().split()))
-    if match is None:
+    normalized = " ".join(question.casefold().split())
+    match = QUESTION.fullmatch(normalized)
+    if match is not None:
+        group, where = match.group("group", "where")
+    elif (
+        "present" in normalized
+        and any(word in normalized for word in ABSENT)
+        and "total" in normalized
+        and (attendance := ATTENDANCE_COUNT.search(normalized))
+    ):
+        group, where = attendance["group"], None
+    else:
         return set()
-    group, where = match.group("group", "where")
     if not (group or where) or (group and where):
         return set()
-    words = re.findall(WORD, group or where)
+    words = re.findall(WORD, group or where or "")
     source_words = " ".join(re.findall(WORD, source.casefold()))
     if (
         GROUP_EXCLUSIONS.intersection(words)

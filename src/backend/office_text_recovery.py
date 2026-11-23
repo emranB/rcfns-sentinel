@@ -202,6 +202,22 @@ def recover_word(archive: ZipFile, names: set[str], media: bool) -> OfficeTextRe
     return OfficeTextRecovery(no_content_reason="Blank Word document")
 
 
+# Read a bounded Word body for a question about the text of a specific original.
+def word_body(payload: bytes) -> str:
+    try:
+        with ZipFile(BytesIO(payload)) as archive:
+            (root,) = read_parts(archive, [WORD_BODY], limit=MAX_WORD_OUTLINE_XML_BYTES)
+    except (BadZipFile, KeyError, OSError, ParseError, RuntimeError, ValueError):
+        return ""
+    if tag_name(root) != "document":
+        return ""
+    return "\n".join(
+        text
+        for element in root.iter()
+        if tag_name(element) == "p" and (text := paragraph_text(element))
+    )
+
+
 # Require real worksheets and rule out formulas, values, comments, and visual content.
 def classify_workbook(
     archive: ZipFile, names: set[str], media: bool
