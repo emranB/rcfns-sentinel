@@ -1986,6 +1986,13 @@ async def quantify(
     earlier_requests = "\n".join(
         message.content[-600:] for message in payload.history if message.role == "user"
     )
+    context = (
+        f"Earlier user requests:\n{earlier_requests}\n"
+        "Reusing an original carries forward only the document. When the latest question names a different measure, "
+        "use that measure. Use earlier requests for a measure only when the latest question refers to it.\n"
+        if earlier_requests
+        else "Conversation:\n\n"
+    )
     try:
         raw = await generate(
             state,
@@ -1994,8 +2001,6 @@ async def quantify(
             "period monthly only for a single-month report, cumulative for YTD, any for snapshots such as balance sheets. "
             "For an unidentified report leave its title empty. Query is a short natural-language search phrase. "
             "Set reuse_sources only when the user wants the same originals. Do not reuse when they change a date or source. "
-            "Reusing an original carries forward only the document. A different measure in the current question replaces "
-            "the previous measure. Use the previous request only to resolve a reference with no measure of its own. "
             "List a measure for each input, with row as the metric's likely printed label without dates or column qualifiers. "
             "Fill column only for a class, group, or column stated by the user. Otherwise it must be an empty string. "
             "Combine explicit dimensions when needed. Record is the one-based index in sources, or null. "
@@ -2008,7 +2013,7 @@ async def quantify(
             "Ratio is a quotient. Share is a quotient shown as a percent. Percent_change is (new minus old) divided by old, "
             "so 'how far above budget as a percentage of budget' uses percent_change with [actual, budget]. "
             "The same measures can appear in several equations. Do not assume alternate inputs when the requested ones are unavailable.",
-            f"Earlier user requests:\n{earlier_requests}\nPrevious originals: {', '.join(references)}\n"
+            f"{context}Previous originals: {', '.join(references)}\n"
             f"Question: {question}"
             + (f"\nRequested operation: {operation}." if operation else ""),
             output_format=QuantityPlan.model_json_schema(),
