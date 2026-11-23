@@ -13,14 +13,14 @@ from src.backend.tabular import Worksheet, worksheet_tables
 
 CALCULATION_REQUEST = re.compile(
     r"\b(?:calculat\w*|comput\w*|subtract\w*|divid\w*|multiply|ratio|working capital|"
-    r"variance|percent(?:age)? (?:change|of|increase|decrease)|difference|"
+    r"variance|percent(?:age)? (?:change|of|increase|decrease|for the same|for that same)|difference|"
     r"(?:what|as a) (?:share|proportion|fraction) of|"
     r"how much [^?!.]{0,45}\b(?:higher|lower|more|less|change[ds]?|increas\w*|decreas\w*)|"
     r"add(?:s|ed)? up|tie(?:s)? out|reconcil(?:e|es|ed|ing))\b",
     re.IGNORECASE,
 )
 CALCULATION_REFERENCE = re.compile(
-    r"\b(?:same|that|this|those)\s+(?:\w+\s+){0,2}(?:reports?|sheets?|workbooks?|files?|documents?)\b",
+    r"\b(?:same|that|this|those)\s+(?:\w+\s+){0,2}(?:reports?|sheets?|workbooks?|files?|documents?|dates?)\b",
     re.IGNORECASE,
 )
 PRIOR_CALCULATION_PERIOD = re.compile(
@@ -33,6 +33,12 @@ PERIOD_CHANGE = re.compile(
     r"(?:increas\w*|decreas\w*|chang\w*))\b",
     re.IGNORECASE,
 )
+SNAPSHOT_METRIC = re.compile(r"\b(?:working capital|current ratio)\b", re.IGNORECASE)
+FROM_FIRST_TO_LAST = re.compile(
+    r"\b(?:from|between) (?:the )?(?:first|earliest|oldest)\b[^?.]{0,60}"
+    r"\b(?:last|latest|most recent)\b",
+    re.IGNORECASE,
+)
 RECONCILE_SUM = re.compile(
     r"\b(?:do|does)\s+(?P<terms>[^?]+?\s+plus\s+[^?]+?)\s+"
     r"(?:reconcile to|equal|match)\s+(?P<total>[^?.]+?)(?=\s+(?:on|for|in)\s+(?:both|each|all)\b|[?.]|$)",
@@ -43,6 +49,18 @@ NUMBER = re.compile(
 )
 CELL = re.compile(r"\S.*?(?= {2,}|$)")
 CELL_REFERENCE = re.compile(r"([A-Z]{1,3})([1-9]\d*)")
+NET_RESULT = frozenset(
+    {
+        "profit",
+        "net profit",
+        "net income",
+        "net loss",
+        "net income loss",
+        "profit or loss",
+        "net profit or loss",
+        "net profit loss",
+    }
+)
 OPERATORS = {
     "sum": "+",
     "difference": "-",
@@ -101,7 +119,15 @@ class Measure(BaseModel):
 class Equation(BaseModel):
     label: str = Field(min_length=1, max_length=120)
     operation: Literal[
-        "sum", "difference", "remainder", "product", "ratio", "share", "percent_change"
+        "sum",
+        "difference",
+        "remainder",
+        "product",
+        "ratio",
+        "share",
+        "percent_change",
+        "minimum",
+        "maximum",
     ]
     inputs: list[int] = Field(min_length=2, max_length=8)
     precision: int = Field(ge=0, le=4)
@@ -123,10 +149,62 @@ class Equations(BaseModel):
     equations: list[Equation] = Field(max_length=5)
 
 
+# Apply a requested snapshot formula to every verified date before comparing results.
+def snapshot_calculation(
+    question: str, days: list[date]
+) -> tuple[list[Measure], list[Equation]] | None:
+    matches = {match[0].casefold() for match in SNAPSHOT_METRIC.finditer(question)}
+    if len(matches) != 1 or not 2 <= len(days) <= 5 or len(set(days)) != len(days):
+        return None
+    metric = matches.pop()
+    operation: Literal["difference", "ratio"] = (
+        "ratio" if metric == "current ratio" else "difference"
+    )
+    measures = [
+        Measure(row=field, column="", record=record)
+        for record in range(1, len(days) + 1)
+        for field in ("Total Current Assets", "Total Current Liabilities")
+    ]
+    equations = [
+        Equation(
+            label=f"{metric.title()} on {day:%Y-%m-%d}",
+            operation=operation,
+            inputs=[index * 2 + 1, index * 2 + 2],
+            precision=2,
+        )
+        for index, day in enumerate(days)
+    ]
+    for direction, wording in (
+        ("minimum", r"lowest|smallest|minim(?:um|al)"),
+        ("maximum", r"highest|largest|maxim(?:um|al)"),
+    ):
+        if re.search(rf"\b(?:{wording})\b", question, re.IGNORECASE):
+            equations.append(
+                Equation(
+                    label=f"{'Lowest' if direction == 'minimum' else 'Highest'} {metric}",
+                    operation="minimum" if direction == "minimum" else "maximum",
+                    inputs=[-index for index in range(1, len(days) + 1)],
+                    precision=2,
+                )
+            )
+    if FROM_FIRST_TO_LAST.search(question):
+        equations.append(
+            Equation(
+                label=f"Change in {metric} from {days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d}",
+                operation="difference",
+                inputs=[-len(days), -1],
+                precision=2,
+            )
+        )
+    return measures, equations
+
+
 # Build each dated comparison from the same metric in each verified original.
 def period_calculation(
     question: str, days: list[date], plan: QuantityPlan
 ) -> tuple[list[Measure], list[Equation]] | None:
+    if snapshot := snapshot_calculation(question, days):
+        return snapshot
     if len(days) != 2 or days[0] == days[1]:
         return None
     if reconciliation := RECONCILE_SUM.search(question):
@@ -303,6 +381,14 @@ class CitedAmount:
         return f"{sign}{self.unit}{digits}"
 
 
+@dataclass(frozen=True)
+class Calculation:
+    amount: CitedAmount
+    sources: tuple[int, ...]
+    display: str
+    text: str
+
+
 # Bind requested metric and dimension words to their own cells before ranking.
 def measure_rows(
     measure: Measure,
@@ -318,6 +404,7 @@ def measure_rows(
         "of",
         "amount",
         "figure",
+        "reported",
         "quarterly",
         "monthly",
         "ytd",
@@ -331,6 +418,10 @@ def measure_rows(
     )
     if not requested:
         return []
+    net_result = (
+        metric_phrase(re.sub(r"\breported\b", "", metric, flags=re.IGNORECASE))
+        in NET_RESULT
+    )
     queries = source_terms(question)
     request_words = f" {metric_phrase(question)} "
     dimensions: dict[int, set[str]] = {}
@@ -368,6 +459,8 @@ def measure_rows(
             qualifier = set()
         wanted = requested - headings
         terms = source_terms(label) - ignored
+        if net_result and metric_phrase(label) in NET_RESULT:
+            terms = wanted
         compatible_total = (
             "expense" in wanted
             and bool(terms)
@@ -580,26 +673,42 @@ def quantity_rows(text: str, source: int) -> list[CitedAmount]:
     return rows
 
 
-# Evaluate only the declared operation on vetted inputs with compatible units.
-def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
-    if not all(1 <= index <= len(amounts) for index in equation.inputs):
-        return ""
-    known = [amounts[index - 1] for index in equation.inputs]
-    if len(set(equation.inputs)) != len(known):
-        return ""
+# Evaluate a formula over verified original rows and earlier calculated results.
+def evaluate_equation(
+    equation: Equation,
+    amounts: list[CitedAmount],
+    earlier: dict[int, Calculation],
+) -> Calculation | None:
+    inputs = equation.inputs
+    if len(set(inputs)) != len(inputs) or not all(
+        1 <= key <= len(amounts) if key > 0 else -key in earlier for key in inputs
+    ):
+        return None
+    known = [amounts[key - 1] if key > 0 else earlier[-key].amount for key in inputs]
+    sources = tuple(
+        dict.fromkeys(
+            source
+            for key in inputs
+            for source in (
+                (amounts[key - 1].source,) if key > 0 else earlier[-key].sources
+            )
+        )
+    )
     operation = equation.operation
     units = {item.unit for item in known if item.unit}
     if len(units) > 1 or (
-        operation not in {"sum", "product", "remainder"} and len(known) != 2
+        operation not in {"sum", "product", "remainder", "minimum", "maximum"}
+        and len(known) != 2
     ):
-        return ""
+        return None
     values = [item.number for item in known]
     unit = next(iter(units), "")
+    formula = ""
     with localcontext() as context:
         context.prec = 80
         first, second = values[:2]
         if operation in {"ratio", "share", "percent_change"} and not second:
-            return ""
+            return None
         if operation in {"difference", "remainder"}:
             result = first - sum(values[1:], Decimal(0))
         elif operation == "sum":
@@ -610,15 +719,24 @@ def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
                 result *= value
         elif operation == "percent_change":
             result = (first - second) / second * 100
+        elif operation in {"minimum", "maximum"}:
+            result = min(values) if operation == "minimum" else max(values)
+            formula = ", ".join(
+                amount.line for amount in known if amount.number == result
+            )
         else:
             result = first / second * (100 if operation == "share" else 1)
         if result.adjusted() > 36:
-            return ""
-        result = result.quantize(
+            return None
+        displayed = result.quantize(
             Decimal(1).scaleb(-equation.precision), rounding=ROUND_HALF_UP
         )
-    rendered = [item.display() for item in known]
-    formula = f" {OPERATORS[operation]} ".join(rendered)
+    rendered = [
+        amounts[key - 1].display() if key > 0 else earlier[-key].display
+        for key in inputs
+    ]
+    if not formula and operation in OPERATORS:
+        formula = f" {OPERATORS[operation]} ".join(rendered)
     if operation in {"share", "percent_change"}:
         formula = (
             f"({formula}) x 100"
@@ -628,9 +746,19 @@ def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
         unit = "%"
     elif operation == "ratio":
         unit = ""
-    answer = CitedAmount(result, unit, 0, "").display()
-    references = " ".join(
-        f"[{ref}]" for ref in dict.fromkeys(item.source for item in known)
-    )
     label = re.sub(r"\[\d+\]|[\r\n]", "", equation.label).strip()
-    return f"**{label}** = **{answer}** ({formula}) {references}"
+    answer = CitedAmount(displayed, unit, 0, label).display()
+    references = " ".join(f"[{ref}]" for ref in sources)
+    explanation = f" ({formula})" if formula else ""
+    return Calculation(
+        CitedAmount(result, unit, 0, label),
+        sources,
+        answer,
+        f"**{label}** = **{answer}**{explanation} {references}",
+    )
+
+
+# Render arithmetic on original rows without intermediate calculations.
+def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
+    result = evaluate_equation(equation, amounts, {})
+    return result.text if result else ""

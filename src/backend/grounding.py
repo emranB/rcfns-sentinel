@@ -271,7 +271,9 @@ COORDINATED_UNITS = re.compile(
 )
 UNIT_SUBJECT = re.compile(r"\bfor\s+([^?]+)$", re.IGNORECASE)
 TIME_COMMITMENT = re.compile(
-    r"^how much (?:annual |weekly |monthly )?time\b", re.IGNORECASE
+    r"^(?:how much |(?:give|list|report|what is)\s+(?:the\s+)?(?:expected\s+)?)"
+    r"(?:annual |weekly |monthly )?time\b",
+    re.IGNORECASE,
 )
 PERMISSION_REQUEST = re.compile(
     r"\b(?:can|could|may|authorized to|allowed to)\b[^?]{0,85}?"
@@ -572,7 +574,7 @@ def requested_parts(question: str) -> list[str]:
             ):
                 parts[-1:] = [f"{field} ({line})" for field in fields]
                 continue
-        if command := LIST_REQUEST.match(line):
+        if (command := LIST_REQUEST.match(line)) and not TIME_COMMITMENT.search(line):
             parts.extend(
                 f"{command[0]}{item}"
                 for item in re.split(

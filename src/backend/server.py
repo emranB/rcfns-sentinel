@@ -90,11 +90,13 @@ from src.backend.quantitative import (
     CALCULATION_REFERENCE,
     CALCULATION_REQUEST,
     PRIOR_CALCULATION_PERIOD,
+    Calculation,
     Equations,
+    Measure,
     OperandSource,
     QuantityPlan,
     RowChoices,
-    calculate,
+    evaluate_equation,
     measure_rows,
     numeric_layout,
     numeric_workbook,
@@ -339,7 +341,7 @@ REFERENTIAL_QUESTION = re.compile(
 )
 SOURCE_PRONOUN = re.compile(
     r"\b(?:its|(?:does|did|can|could|will|would) it|"
-    r"(?:this|that) (?:file|document|record|report))\b",
+    r"(?:this|that) (?:file|document|record|report|balance sheet|statement))\b",
     re.IGNORECASE,
 )
 PRIOR_SUBJECT = re.compile(
@@ -367,6 +369,59 @@ PRIOR_RECORDS = re.compile(
 PRIOR_RECORD_YEAR = re.compile(
     rf"\b(?:the|that)\s+(?P<year>(?:19|20)\d{{2}})\s+{RECORD_FAMILIES}"
     r"(?=$|[.,;?!]|\s+(?:and|with|against|versus|to)\b)",
+    re.IGNORECASE,
+)
+HISTORICAL_RECORD = re.compile(
+    r"\b(?:back to|return to|we (?:used|opened|looked at) earlier|we started with|"
+    r"at the start|(?:earliest|latest|first|last) of (?:those|the))\b",
+    re.IGNORECASE,
+)
+RECORD_RECALL_NOISE = frozenset(
+    {
+        "back",
+        "return",
+        "using",
+        "compare",
+        "use",
+        "from",
+        "that",
+        "these",
+        "those",
+        "earlier",
+        "started",
+        "opened",
+        "used",
+        "looked",
+        "start",
+        "earliest",
+        "latest",
+        "first",
+        "last",
+        "two",
+        "three",
+        "four",
+        "five",
+        "we",
+        "at",
+        "the",
+        "a",
+        "of",
+        "with",
+        "document",
+        "file",
+        "record",
+        "source",
+        "and",
+    }
+)
+FILE_DATE_COMPARISON = re.compile(
+    r"\b(?:file\s*name|title)\b.*\b(?:printed|heading|reporting|as of)\b", re.IGNORECASE
+)
+REPORTED_PROFIT_COMPARISON = re.compile(
+    r"\bprofit for the year\b.*\bmatch\b.*\b(?:profit|loss)\b", re.IGNORECASE
+)
+RECORD_RECALL_END = re.compile(
+    r"[,;:?!]|\s+(?:we (?:started|used|opened|looked)|what|who|how|give|calculat\w*|compare)\b",
     re.IGNORECASE,
 )
 REFERENCE_END = re.compile(
@@ -504,6 +559,7 @@ class Question(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     mode: Literal["standard", "agentic"] = "standard"
     history: list[ChatMessage] = Field(default_factory=list, max_length=6)
+    earlier_sources: list[EvidenceContext] = Field(default_factory=list, max_length=16)
 
 
 class FollowUpPlan(BaseModel):
@@ -1634,6 +1690,63 @@ def retained_original_ids(
     return ()
 
 
+# Resolve explicit callbacks against previously cited records, with no generated source IDs.
+def historical_original_ids(
+    question: str, contexts: Iterable[EvidenceContext], originals: dict[str, str]
+) -> tuple[str, ...]:
+    if not HISTORICAL_RECORD.search(question):
+        return ()
+    clause = re.sub(
+        r"^.*?\b(?:back to|return to|earliest of|latest of|first of|last of)\s+",
+        "",
+        question,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    clause = RECORD_RECALL_END.split(clause.strip(), maxsplit=1)[0]
+    clauses = []
+    for part in re.split(r"\s+(?:and|match|equals?)\s+", clause, flags=re.IGNORECASE):
+        part = re.sub(r"\bp\s*[/&]\s*l\b", "profit loss", part, flags=re.IGNORECASE)
+        terms = source_terms(part) - RECORD_RECALL_NOISE
+        if "cumulative" in terms:
+            terms.add("ytd")
+        if terms:
+            clauses.append(terms)
+    earlier = list(contexts)
+    selected: dict[str, None] = {}
+    for terms in clauses:
+        scored: list[tuple[tuple[int, int, int], tuple[str, ...]]] = []
+        for context in earlier:
+            question_terms = source_terms(context.question)
+            live = [key for key in context.document_ids if key in originals]
+            ranked = {
+                key: len(terms & source_terms(originals[key].replace("-", " ")))
+                for key in live
+            }
+            score = max(ranked.values(), default=0)
+            scope = len(terms & question_terms)
+            if not (score or scope):
+                continue
+            keys = tuple(key for key, value in ranked.items() if value == score)
+            scored.append(((score, scope, len(keys)), keys))
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+            selected.update(dict.fromkeys(scored[0][1]))
+    return tuple(selected)[:MAX_EXPLICIT_ORIGINALS]
+
+
+# Keep older references compact while preserving the full recent exchanges.
+def source_history(payload: Question) -> list[EvidenceContext]:
+    return [
+        *payload.earlier_sources,
+        *(
+            message.evidence_context
+            for message in payload.history
+            if message.evidence_context is not None
+        ),
+    ]
+
+
 # Merge repeated stand-alone quotes and carry all their proof references forward.
 def merge_quoted_passages(answer: str) -> str:
     blocks = answer.split("\n\n")
@@ -2236,30 +2349,53 @@ def retained_operand(
 def verified_profit_reply(
     question: str, match: VerifiedFile, mode: Literal["standard", "agentic"]
 ) -> ChatResponse | None:
-    if not CHECK_REQUEST.search(question) or "profit" not in question.casefold():
+    terms_asked = source_terms(question)
+    report_comparison = bool(
+        re.search(r"\bmatch(?:es)? (?:the )?reported profit\b", question, re.IGNORECASE)
+    )
+    if (
+        not (CHECK_REQUEST.search(question) or report_comparison)
+        or "profit" not in terms_asked
+        or not {"income", "expense"} <= terms_asked
+    ):
         return None
     statement = parse_statement(match.text)
     if (
         statement is None
         or REQUIRED_TOTALS - statement.rows.keys()
         or statement.conflicts
-        or not {"other_income", "other_expenses"} <= statement.rows.keys()
-        or not {"income", "expense"} <= source_terms(question)
     ):
         return None
     rows = statement.rows
+    explicit_components = {
+        key
+        for key, label in (
+            ("other_income", "other income"),
+            ("other_expenses", "other expenses"),
+            ("cost", "cost of sales"),
+        )
+        if re.search(rf"\b(?:total )?{label}\b", question, re.IGNORECASE)
+    }
+    if explicit_components - rows.keys():
+        return None
     terms = [
         f"Total income ${rows['income']:,.2f}",
         f"minus total expenses ${rows['expenses']:,.2f}",
-        f"plus other income ${rows['other_income']:,.2f}",
-        f"minus other expenses ${rows['other_expenses']:,.2f}",
     ]
-    if "cost" in rows:
-        terms.insert(1, f"minus cost of sales ${rows['cost']:,.2f}")
-    difference = statement.differences().get("net", Decimal(0))
-    computed = rows["net"] - difference
+    components = explicit_components if report_comparison else rows.keys()
+    computed = rows["income"] - rows["expenses"]
+    for key, label, sign in (
+        ("cost", "cost of sales", -1),
+        ("other_income", "other income", 1),
+        ("other_expenses", "other expenses", -1),
+    ):
+        if key in components:
+            amount = rows[key]
+            terms.append(f"{'plus' if sign > 0 else 'minus'} {label} ${amount:,.2f}")
+            computed += sign * amount
+    difference = rows["net"] - computed
     comparison = (
-        f"Reported profit differs by ${difference:+,.2f}."
+        f"Reported profit is ${rows['net']:,.2f}, a difference of ${difference:+,.2f}."
         if difference
         else "This matches the reported profit."
     )
@@ -2270,22 +2406,75 @@ def verified_profit_reply(
     )
 
 
+# Compare the printed operands from a statement and a snapshot, preserving both original dates.
+async def match_reported_profit(
+    state: RagflowSession, keys: tuple[str, ...], mode: Literal["standard", "agentic"]
+) -> ChatResponse | None:
+    if len(keys) != 2:
+        return None
+    records = await asyncio.gather(*(retained_file(state, key) for key in keys))
+    snapshot: tuple[VerifiedFile, Decimal] | None = None
+    profit: tuple[VerifiedFile, Decimal] | None = None
+    for match in records:
+        if match is None:
+            return None
+        if statement := parse_statement(match.text):
+            if statement.conflicts or "net" not in statement.rows:
+                return None
+            profit = match, statement.rows["net"]
+            continue
+        layout = numeric_layout(match.text, "Profit for the year")
+        amounts = quantity_rows(layout, 1)
+        rows = measure_rows(
+            Measure(row="Profit for the year", column="", record=1),
+            amounts,
+            1,
+            [match.source.name],
+        )
+        if len(rows) != 1:
+            return None
+        snapshot = match, amounts[rows[0] - 1].number
+    if snapshot is None or profit is None:
+        return None
+    left, x = snapshot
+    right, y = profit
+    comparison = (
+        "The printed amounts match."
+        if x == y
+        else f"The amounts differ by ${abs(x - y):,.2f}."
+    )
+    return ChatResponse(
+        answer=f"{comparison}\n\n- {left.source.name} reports ${x:,.2f} as profit for the year. [1]\n"
+        f"- {right.source.name} reports ${y:,.2f} as profit or loss. [2]",
+        sources=[left.source, right.source],
+        mode_used=mode,
+    )
+
+
 # Plan operations before retrieving figures, then bind each measure to an original row.
 async def quantify(
     state: RagflowSession, question: str, payload: Question
 ) -> ChatResponse | None:
-    previous = next(
-        (
-            message.evidence_context
-            for message in reversed(payload.history)
-            if message.evidence_context
-        ),
-        None,
-    )
+    archive = source_history(payload)
+    previous = archive[-1] if archive else None
     originals = dict(indexed_originals(state))
+    recalled = historical_original_ids(question, archive, originals)
+    period_reference = PRIOR_CALCULATION_PERIOD.search(question)
+    if period_reference and not recalled and previous is not None:
+        # A monthly/cumulative change can refer to a report omitted by the last answer.
+        same_set = next(
+            (
+                context.document_ids
+                for context in reversed(archive)
+                if len(context.document_ids) > 1
+                and set(context.document_ids) & set(previous.document_ids)
+            ),
+            previous.document_ids,
+        )
+        recalled = tuple(key for key in same_set if key in originals)
     references = [
         originals[key]
-        for key in (previous.document_ids if previous else [])
+        for key in (recalled or (previous.document_ids if previous else []))
         if key in originals
     ]
     operation = requested_operation(question)
@@ -2313,6 +2502,8 @@ async def quantify(
             "For example working capital requires Total Current Assets and Total Current Liabilities, and only those two. "
             "Their difference is working capital; their quotient is current ratio. "
             "For each requested calculation include an equation using one-based indices into measures, with default precision 2. "
+            "To use an earlier calculation as an input, give its negative equation index: -1 refers to equation 1. "
+            "When comparing a derived metric between records, compute the whole metric for each record before comparing those equations. "
             "Difference is exactly [target, baseline]. Remainder is a reconciliation with three or more distinct terms. "
             "To subtract two or more distinct terms from a starting amount, use remainder with every term in the equation. "
             "Do not introduce intermediate calculations or additional metrics the request does not require. "
@@ -2337,8 +2528,11 @@ async def quantify(
     )
     if any(
         len(set(equation.inputs)) != len(equation.inputs)
-        or not all(1 <= row <= len(plan.measures) for row in equation.inputs)
-        for equation in plan.equations
+        or not all(
+            1 <= row <= len(plan.measures) or -index < row < 0
+            for row in equation.inputs
+        )
+        for index, equation in enumerate(plan.equations, 1)
     ) or (
         compound_subtraction
         and not any(equation.operation == "remainder" for equation in plan.equations)
@@ -2352,6 +2546,7 @@ async def quantify(
                 state,
                 "Choose the requested equations over the numbered inputs. Use distinct existing IDs. "
                 "Difference is target minus baseline. Percent change is (new minus old) divided by old. "
+                "Negative input IDs refer to previously listed equations; -1 refers to equation 1. "
                 "For a starting amount minus two or more terms, use a single remainder with all terms in order. "
                 "Use two decimal places unless the user requests another precision.",
                 f"Question: {plan.question}\nInputs:\n{available}",
@@ -2379,9 +2574,12 @@ async def quantify(
         return original
 
     explicit = explicit_ids(question, originals.items(), filenames_only=True)
-    named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit)
+    named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit or recalled)
+    if len(explicit) == 1 and (original := await retained_file(state, explicit[0])):
+        named[original.document_id] = original
+        if reply := verified_profit_reply(question, original, payload.mode):
+            return remember_evidence(reply, question)
     explicit_dates = {day for day, _, _ in mentioned_dates(question)}
-    period_reference = PRIOR_CALCULATION_PERIOD.search(question)
     if (
         not named
         and previous
@@ -2403,6 +2601,35 @@ async def quantify(
         named.update(
             (match.document_id, match) for match in retained if match is not None
         )
+        if recalled and HISTORICAL_RECORD.search(question):
+            dated_recalled = sorted(
+                (match.day, match.document_id, match)
+                for match in retained
+                if match is not None and match.day is not None
+            )
+            months = {
+                MONTH_NUMBER[word]
+                for word in title_tokens(question)
+                if word in MONTH_NUMBER
+            }
+            relative = re.search(
+                r"\b(?P<order>earliest|latest|first|last) of\b", question, re.IGNORECASE
+            )
+            if len(dated_recalled) > 1 and relative:
+                index = (
+                    0 if relative["order"].casefold() in {"earliest", "first"} else -1
+                )
+                named = {dated_recalled[index][1]: dated_recalled[index][2]}
+            elif len(months) == 1 and re.search(
+                r"\b(?:alone|only)\b", question, re.IGNORECASE
+            ):
+                monthly_records: dict[str, VerifiedFile | None] = {
+                    key: match
+                    for day, key, match in dated_recalled
+                    if day.month in months
+                }
+                if len(monthly_records) == 1:
+                    named = monthly_records
         if period_reference:
             cumulative = period_reference["period"].casefold() not in {
                 "monthly",
@@ -2457,7 +2684,7 @@ async def quantify(
             )
 
     record_ids: dict[int, str] = {}
-    if len(named) == 2 and (
+    if 2 <= len(named) <= 5 and (
         len(set(dates.values())) == 1 or CALCULATION_REFERENCE.search(question)
     ):
         previously_verified = await asyncio.gather(
@@ -2618,16 +2845,27 @@ async def quantify(
                 ]
 
     parts = []
-    for equation in plan.equations:
+    results_by_id: dict[int, Calculation] = {}
+    for equation_id, equation in enumerate(plan.equations, 1):
         bound = [
             row
             for index in equation.inputs
-            if 1 <= index <= len(chosen) and (row := chosen[index - 1]) is not None
+            if (
+                row := index
+                if index < 0
+                else chosen[index - 1]
+                if 1 <= index <= len(chosen)
+                else None
+            )
+            is not None
         ]
         if len(bound) == len(equation.inputs) and (
-            result := calculate(equation.model_copy(update={"inputs": bound}), amounts)
+            calculated := evaluate_equation(
+                equation.model_copy(update={"inputs": bound}), amounts, results_by_id
+            )
         ):
-            parts.append(result)
+            results_by_id[equation_id] = calculated
+            parts.append(calculated.text)
     inputs = [
         f"- {amount.line.replace(' | ', ' - ')} [{amount.source}]"
         for row in dict.fromkeys(chosen)
@@ -3635,6 +3873,7 @@ async def answer_parts(
                 or APPROVAL_AUTHORITY.search(question)
                 or PERMISSION_REQUEST.search(question)
                 or THRESHOLD_REQUEST.search(question)
+                or FILE_DATE_COMPARISON.search(question)
                 or len(parts) > 1
             )
         ):
@@ -3658,6 +3897,18 @@ async def answer_parts(
 
         # Validate each requested value against its own supporting passage.
         async def find_field(part: str) -> RecordAnswer:
+            if original_text and FILE_DATE_COMPARISON.search(part):
+                title = Path(sources[first].name).stem
+                filename = mentioned_dates(title)
+                stated = filename[0][0] if filename else filename_date(title)
+                printed = document_period(
+                    "", original_text[:1400], year_hint=stated.year if stated else None
+                )
+                if stated is not None and printed is not None:
+                    return RecordAnswer(
+                        f"The filename indicates **{stated:%B %d, %Y}**. "
+                        f"The original heading says **{printed:%B %d, %Y}**. [{original_reference(printed.isoformat()) + 1}]"
+                    )
             if (
                 len(urls) == 1
                 and original_text
@@ -4258,16 +4509,42 @@ async def answer_question(
         ),
         None,
     )
+    if REPORTED_PROFIT_COMPARISON.search(question) and HISTORICAL_RECORD.search(
+        question
+    ):
+        recalled = historical_original_ids(
+            question, source_history(payload), dict(indexed_originals(state))
+        )
+        if comparison := await match_reported_profit(state, recalled, payload.mode):
+            return remember_evidence(comparison, question)
     record_question = question
     retained_match = None
     async with asyncio.timeout(25):
         record_scope = question
         pinned: tuple[str, ...] = ()
-        if prior is not None and (
-            PRIOR_RECORDS.search(question)
-            or PRIOR_RECORD_YEAR.search(question)
-            or PRIOR_SUBJECT.search(question)
-            or SOURCE_PRONOUN.search(question)
+        if HISTORICAL_RECORD.search(question):
+            originals_by_id = dict(indexed_originals(state))
+            recalled = historical_original_ids(
+                question, source_history(payload), originals_by_id
+            )
+            if recalled:
+                named = explicit_ids(
+                    question, originals_by_id.items(), filenames_only=True
+                )
+                pinned = tuple(dict.fromkeys((*recalled, *named)))[
+                    :MAX_EXPLICIT_ORIGINALS
+                ]
+                if len(pinned) == 1:
+                    retained_match = await retained_file(state, pinned[0])
+        if (
+            not pinned
+            and prior is not None
+            and (
+                PRIOR_RECORDS.search(question)
+                or PRIOR_RECORD_YEAR.search(question)
+                or PRIOR_SUBJECT.search(question)
+                or SOURCE_PRONOUN.search(question)
+            )
         ):
             originals = list(indexed_originals(state))
             if retained := retained_original_ids(question, prior, originals):
@@ -4435,10 +4712,12 @@ async def answer_question(
                     2200,
                     baseline,
                 )
-    parts = requested_parts(raw_scope)
+    fields = [
+        field for part in requested_parts(raw_scope) for field in requested_fields(part)
+    ]
     if (
         len(years) < 2
-        and len(parts) > 1
+        and len(fields) > 1
         and (
             THRESHOLD_REQUEST.search(raw_scope) or PERMISSION_REQUEST.search(raw_scope)
         )

@@ -4,7 +4,7 @@ import Markdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { askQuestion, connecting, fetchIndexStatus } from './api';
-import type { AnswerMode, ChatMessage, ChatResponse, IndexStatus, Source } from './api';
+import type { AnswerMode, ChatMessage, ChatResponse, EvidenceContext, IndexStatus, Source } from './api';
 import PdfPreview from './PdfPreview';
 import Sources from './Sources';
 import remarkCitations from './remarkCitations';
@@ -185,12 +185,17 @@ const ChatTurn = memo(function ChatTurn({ turn }: { turn: Turn }) {
   );
 });
 
-/** Collect at most three completed exchanges, regardless of the thread length. */
-function recentHistory(turns: Turn[]): ChatMessage[] {
+/** Preserve recent dialogue and a bounded list of older cited originals. */
+function conversationContext(turns: Turn[]) {
   const history: ChatMessage[] = [];
-  for (let index = turns.length - 1; index >= 0 && history.length < 6; index--) {
+  const earlier_sources: EvidenceContext[] = [];
+  for (let index = turns.length - 1; index >= 0 && earlier_sources.length < 16; index--) {
     const turn = turns[index];
     if (turn?.kind !== 'answered') continue;
+    if (history.length >= 6) {
+      if (turn.result.evidenceContext) earlier_sources.unshift(turn.result.evidenceContext);
+      continue;
+    }
     history.unshift(
       { role: 'user', content: turn.question },
       {
@@ -202,7 +207,7 @@ function recentHistory(turns: Turn[]): ChatMessage[] {
       },
     );
   }
-  return history;
+  return { history, earlier_sources };
 }
 
 export default function App() {
@@ -241,7 +246,7 @@ export default function App() {
     const timer = setTimeout(() => request.abort(timeout), CHAT_TIMEOUT_MS);
     let finished: Turn;
     try {
-      const result = await askQuestion(question, mode, recentHistory(turns), request.signal);
+      const result = await askQuestion(question, mode, conversationContext(turns), request.signal);
       finished = { ...turn, kind: 'answered', result };
     } catch (error) {
       const reason: unknown = request.signal.reason;

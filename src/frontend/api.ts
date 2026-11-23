@@ -9,7 +9,7 @@ interface RollCallScope {
   directory?: boolean;
 }
 
-interface EvidenceContext {
+export interface EvidenceContext {
   question: string;
   document_ids: string[];
 }
@@ -156,13 +156,13 @@ export async function fetchIndexStatus(signal: AbortSignal): Promise<IndexStatus
 export async function askQuestion(
   question: string,
   mode: AnswerMode,
-  history: ChatMessage[],
+  context: { history: ChatMessage[]; earlier_sources: EvidenceContext[] },
   signal: AbortSignal,
 ): Promise<ChatResponse> {
   const response = await fetch('/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, mode, history }),
+    body: JSON.stringify({ question, mode, ...context }),
     signal,
   });
   const data: unknown = await response.json().catch(() => null);

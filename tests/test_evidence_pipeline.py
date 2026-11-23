@@ -34,6 +34,48 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Explicit callbacks resolve older references and can bring two originals together.
+    def test_archived_references_survive_source_switches(self) -> None:
+        documents = {
+            "a": "Reviews/Permit Advisory Group/Signed Terms.docx",
+            "b": "People/Inspector Recruitment/Inspector expectations.docx",
+            "c": "Finance/Appropriations Report.pdf",
+        }
+        prior = [
+            server.EvidenceContext(
+                question="Summarize the permit group charter.", document_ids=["a"]
+            ),
+            server.EvidenceContext(
+                question="What do the inspector recruitment records say?",
+                document_ids=["b"],
+            ),
+            server.EvidenceContext(
+                question="Explain the finance records.", document_ids=["c"]
+            ),
+        ]
+        self.assertEqual(
+            server.historical_original_ids(
+                "Back to the permit advisory group charter we started with. Who appoints the chair?",
+                prior,
+                documents,
+            ),
+            ("a",),
+        )
+        self.assertEqual(
+            server.historical_original_ids(
+                "Using that charter and the inspector recruitment document we used earlier, compare workloads.",
+                prior,
+                documents,
+            ),
+            ("a", "b"),
+        )
+        self.assertEqual(
+            server.historical_original_ids(
+                "What about the finance report?", prior, documents
+            ),
+            (),
+        )
+
     # Identical multi-source sections can answer two fields without repeating the citations.
     def test_record_answer_eliminates_duplicate_sections(self) -> None:
         text = "**First original**\n\n> The amount is $40. [1]\n\n**Second original**\n\n> The amount is $80. [2]"

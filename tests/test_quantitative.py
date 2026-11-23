@@ -10,6 +10,7 @@ from src.backend.quantitative import (
     Measure,
     QuantityPlan,
     calculate,
+    evaluate_equation,
     measure_rows,
     numeric_layout,
     numeric_workbook,
@@ -22,6 +23,56 @@ from src.backend.tabular import Worksheet
 
 
 class QuantityTests(unittest.TestCase):
+    # Compare results of the full formula, keeping the inputs and dates distinct.
+    def test_composite_financial_comparison_uses_each_intermediate(self) -> None:
+        dates = [date(2012, 1, 31), date(2012, 3, 31), date(2012, 4, 30)]
+        plan = QuantityPlan(
+            question="Find the lowest working capital",
+            reuse_sources=True,
+            sources=[],
+            measures=[Measure(row="Assets", column="", record=1)],
+            equations=[],
+        )
+        selected = period_calculation(
+            "Which date has the lowest working capital and how did it change from the first date to the last?",
+            dates,
+            plan,
+        )
+        assert selected is not None
+        measures, equations = selected
+        self.assertEqual([field.record for field in measures], [1, 1, 2, 2, 3, 3])
+        amounts = [
+            row
+            for index, (assets, liabilities) in enumerate(
+                ((125, 40), (175, 110), (200, 180)), 1
+            )
+            for row in quantity_rows(
+                f"Assets | ${assets}.00\nLiabilities | ${liabilities}.00", index
+            )
+        ]
+        first = evaluate_equation(equations[0], amounts, {})
+        assert first is not None
+        self.assertIsNone(evaluate_equation(equations[-1], amounts, {1: first}))
+        middle = evaluate_equation(equations[1], amounts, {})
+        last = evaluate_equation(equations[2], amounts, {})
+        assert middle is not None and last is not None
+        intermediates = {1: first, 2: middle, 3: last}
+        minimum = evaluate_equation(equations[-2], amounts, intermediates)
+        change = evaluate_equation(equations[-1], amounts, intermediates)
+        assert minimum is not None and change is not None
+        self.assertIn("2012-04-30", minimum.text)
+        self.assertEqual(minimum.amount.number, Decimal("20.00"))
+        self.assertEqual(minimum.sources, (1, 2, 3))
+        self.assertEqual(change.amount.number, Decimal("-65.00"))
+        self.assertEqual(change.sources, (3, 1))
+
+    # Treat a printed profit or loss label as net without mixing it with gross profit.
+    def test_net_result_alias_keeps_the_reported_sign(self) -> None:
+        rows = quantity_rows("Gross profit | $380.00\nProfit | -$40.13", 1)
+        measure = Measure(row="Reported Net Profit or Loss", column="", record=1)
+        self.assertEqual(measure_rows(measure, rows, 1, ["Statement"]), [2])
+        self.assertEqual(rows[1].number, Decimal("-40.13"))
+
     # A model that finds one period cannot collapse a comparison across two periods.
     def test_period_change_expands_metrics_over_verified_dates(self) -> None:
         days = [date(2014, 10, 15), date(2017, 10, 15)]
