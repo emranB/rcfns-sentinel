@@ -1,8 +1,15 @@
 export type AnswerMode = 'standard' | 'agentic';
 
+interface RollCallScope {
+  document_id: string;
+  group: string;
+  year: number;
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  roll_call?: RollCallScope;
 }
 
 export interface CitationRegion {
@@ -36,6 +43,7 @@ export interface ChatResponse {
   answer: string;
   sources: Source[];
   mode: AnswerMode;
+  rollCall?: RollCallScope;
 }
 
 export const connecting: IndexStatus = {
@@ -52,6 +60,15 @@ export const connecting: IndexStatus = {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readRollCall(value: unknown): RollCallScope | undefined {
+  if (!isObject(value)) return undefined;
+  const { document_id, group, year } = value;
+  if (typeof document_id !== 'string' || typeof group !== 'string' || typeof year !== 'number') {
+    return undefined;
+  }
+  return { document_id, group, year };
 }
 
 function isCoordinate(value: unknown): value is number {
@@ -130,5 +147,6 @@ export async function askQuestion(
     answer: data.answer,
     sources: Array.isArray(data.sources) ? data.sources.map(readSource) : [],
     mode: data.mode_used === 'agentic' ? 'agentic' : 'standard',
+    rollCall: readRollCall(data.roll_call),
   };
 }

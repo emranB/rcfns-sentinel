@@ -193,7 +193,7 @@ function recentHistory(turns: Turn[]): ChatMessage[] {
     if (turn?.kind !== 'answered') continue;
     history.unshift(
       { role: 'user', content: turn.question },
-      { role: 'assistant', content: turn.result.answer.slice(0, 8000) },
+      { role: 'assistant', content: turn.result.answer.slice(0, 8000), roll_call: turn.result.rollCall },
     );
   }
   return history;

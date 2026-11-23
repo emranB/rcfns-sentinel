@@ -1,6 +1,7 @@
 '''Check the shared evidence pipeline when follow-up search helps or fails.'''
 
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -15,6 +16,7 @@ from src.backend.grounding import (
 )
 from src.backend.library_overview import build_overview
 from src.backend.ragflow import IndexProgress, RagflowSession
+from src.backend.roll_call import RollCall
 
 
 # Build a deterministic model reply from exact supporting test passages.
@@ -31,6 +33,45 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Keep the exact cited record while a later turn changes the requested view.
+    async def test_roll_call_follow_up_reuses_the_original_record(self) -> None:
+        scope = server.RollCallScope(document_id="original", group="council", year=2025)
+        original = server.Citation(
+            name="Minutes.docx", path="Council/Minutes.docx", url="/sources/original"
+        )
+        roll_call = RollCall("council", ("Mei Tan",), ("Noor Khan",))
+        record = server.RollCallRecord(scope, date(2025, 10, 8), original, roll_call)
+        history = [
+            server.ChatMessage(
+                role="user", content="How many council members in 2025?"
+            ),
+            server.ChatMessage(
+                role="assistant", content="Two members [1].", roll_call=scope
+            ),
+        ]
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client)
+            with (
+                patch.object(
+                    server,
+                    "generate",
+                    AsyncMock(return_value='{"output":"names","members":"absent"}'),
+                ),
+                patch.object(
+                    server, "load_roll_call", AsyncMock(return_value=record)
+                ) as load,
+            ):
+                response = await server.roll_call_follow_up(
+                    state, "Which of them couldn't make it?", history, "agentic"
+                )
+        self.assertIsNotNone(response)
+        assert response is not None
+        self.assertIn("Noor Khan", response.answer)
+        self.assertNotIn("Mei Tan", response.answer)
+        self.assertEqual(response.sources, [original])
+        self.assertEqual(response.roll_call, scope)
+        load.assert_awaited_once_with(state, scope)
+
     # Preserve a low-ranking field passage within the document budget.
     def test_requested_field_survives_chunk_budget(self) -> None:
         noise = "The project pilot duration will be specialized later. " * 400
@@ -473,8 +514,15 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     )
                     result = await server.respond_to_question(state, question, payload)
                     self.assertIn("**3 members**", result.answer)
-                    self.assertIn("2 present and 1 listed as absent", result.answer)
+                    self.assertIn("2 present and 1 absent", result.answer)
                     self.assertEqual([source.path for source in result.sources], [path])
+                    self.assertEqual(result.mode_used, mode)
+                    self.assertEqual(
+                        result.roll_call,
+                        server.RollCallScope(
+                            document_id="current", group="council", year=2025
+                        ),
+                    )
                 generate.assert_not_awaited()
 
     # Put recent applicable records ahead of stale keyword hits.

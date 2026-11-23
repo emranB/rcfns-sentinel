@@ -5,6 +5,7 @@ import unittest
 from src.backend.roll_call import (
     RollCallCount,
     dated_count_scope,
+    parse_roll_call,
     roll_call_count,
     roster_aliases,
     roster_group,
@@ -22,6 +23,17 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Keep original spelling and attendance status for subsequent roster requests.
+    def test_count_and_roster_share_the_same_entries(self) -> None:
+        call = parse_roll_call(QUESTION, ROLL_CALL, source=SOURCE)
+        self.assertIsNotNone(call)
+        assert call is not None
+        self.assertEqual(
+            call.present, ("Mei Tan", "Amélie D'Arcy", "A. Jean-Luc van Dijk")
+        )
+        self.assertEqual(call.absent, ("Noor Khan", "Priya Patel"))
+        self.assertEqual(call.count.total, 5)
+
     # Resolve short headcount questions without treating attendance as membership.
     def test_dated_counts_identify_group_and_year(self) -> None:
         self.assertEqual(

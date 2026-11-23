@@ -1,4 +1,4 @@
-"""Count members accounted for by an unambiguous roll call."""
+'''Read names and counts from an unambiguous roll call.'''
 
 import re
 from collections import Counter
@@ -112,6 +112,18 @@ class RollCallCount:
         return self.present + self.absent
 
 
+@dataclass(frozen=True)
+class RollCall:
+    group: str
+    present: tuple[str, ...]
+    absent: tuple[str, ...]
+
+    # Count the same verified names that a roster reply will display.
+    @property
+    def count(self) -> RollCallCount:
+        return RollCallCount(len(self.present), len(self.absent))
+
+
 # Recognize concise year-scoped totals without capturing questions about attendance.
 def dated_count_scope(question: str) -> tuple[str, int] | None:
     match = DATED_COUNT.fullmatch(" ".join(question.casefold().split()))
@@ -126,7 +138,7 @@ def dated_count_scope(question: str) -> tuple[str, int] | None:
 
 
 # Accept only a simple membership count whose group appears in the source path.
-def membership_group(question: str, source: str) -> set[str]:
+def membership_group(question: str, source: str) -> str:
     normalized = " ".join(question.casefold().split())
     match = QUESTION.fullmatch(normalized)
     if match is not None:
@@ -139,22 +151,22 @@ def membership_group(question: str, source: str) -> set[str]:
     ):
         group, where = attendance["group"], None
     else:
-        return set()
+        return ""
     if not (group or where) or (group and where):
-        return set()
+        return ""
     words = re.findall(WORD, group or where or "")
     source_words = " ".join(re.findall(WORD, source.casefold()))
     if (
         GROUP_EXCLUSIONS.intersection(words)
         or f" {' '.join(words)} " not in f" {source_words} "
     ):
-        return set()
-    return set(words)
+        return ""
+    return " ".join(words)
 
 
 # Parse plainly delimited names and normalize harmless differences before counting.
-def listed_names(value: str) -> set[str] | None:
-    entries: set[str] = set()
+def listed_names(value: str) -> dict[str, str] | None:
+    entries: dict[str, str] = {}
     for part in re.split(r"[,;]", normalize("NFKC", value)):
         name = " ".join(part.split())
         if suffix := ROLE_SUFFIX.search(name):
@@ -167,23 +179,23 @@ def listed_names(value: str) -> set[str] | None:
             for word in name.split()
         ):
             return None
-        entries.add(
+        entries.setdefault(
             name.casefold()
             .replace("’", "'")
             .replace("\u2010", "-")
             .replace("\u2011", "-")
-            .replace(".", "")
+            .replace(".", ""),
+            name,
         )
     return entries
 
 
-# Count a single adjacent roll call whose labels distinguish members from visitors.
-def roll_call_count(
-    question: str, excerpt: str, *, source: str
-) -> RollCallCount | None:
+# Read a single adjacent roll call whose labels distinguish members from visitors.
+def parse_roll_call(question: str, excerpt: str, *, source: str) -> RollCall | None:
     group = membership_group(question, source)
     if not group:
         return None
+    group_words = set(group.split())
 
     sections: dict[str, tuple[int, str, bool]] = {}
     nonmembers: set[int] = set()
@@ -197,7 +209,7 @@ def roll_call_count(
             continue
         words = set(label.split())
         statuses = words & (ABSENT | {PRESENT})
-        if len(statuses) != 1 or words - statuses - ROLES - group:
+        if len(statuses) != 1 or words - statuses - ROLES - group_words:
             continue
         key = PRESENT if PRESENT in statuses else "absent"
         if key in sections:
@@ -217,12 +229,21 @@ def roll_call_count(
         return None
 
     present = listed_names(present_text)
-    absent = (
-        set() if absent_text.casefold() in NO_ABSENCES else listed_names(absent_text)
-    )
-    if not present or absent is None or present & absent:
+    absent = {} if absent_text.casefold() in NO_ABSENCES else listed_names(absent_text)
+    if not present or absent is None or present.keys() & absent.keys():
         return None
-    return RollCallCount(present=len(present), absent=len(absent))
+    return RollCall(group, tuple(present.values()), tuple(absent.values()))
+
+
+# Count entries only after validating both membership sections.
+def roll_call_count(
+    question: str, excerpt: str, *, source: str
+) -> RollCallCount | None:
+    return (
+        call.count
+        if (call := parse_roll_call(question, excerpt, source=source))
+        else None
+    )
 
 
 # Find dated membership list requests, tolerating minor spelling errors in the role.

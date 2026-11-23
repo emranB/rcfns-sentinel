@@ -103,10 +103,11 @@ from src.backend.record_lookup import (
     title_tokens,
 )
 from src.backend.roll_call import (
+    RollCall,
     attendance_names,
     attendance_sections,
     dated_count_scope,
-    roll_call_count,
+    parse_roll_call,
     roster_aliases,
     roster_group,
     roster_names,
@@ -370,10 +371,17 @@ class Citation(BaseModel):
     regions: list[Region] = Field(default_factory=list)
 
 
+class RollCallScope(BaseModel):
+    document_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,96}$")
+    group: str = Field(min_length=1, max_length=100)
+    year: int = Field(ge=1900, le=2099)
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Citation]
     mode_used: Literal["standard", "agentic"]
+    roll_call: RollCallScope | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -399,6 +407,7 @@ class ModelResponse(BaseModel):
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=8000)
+    roll_call: RollCallScope | None = None
 
 
 class Question(BaseModel):
@@ -410,6 +419,19 @@ class Question(BaseModel):
 class FollowUpPlan(BaseModel):
     question: str = Field(min_length=1)
     queries: list[str] = Field(max_length=3)
+
+
+class RollCallView(BaseModel):
+    output: Literal["count", "names", "record", "other"]
+    members: Literal["all", "present", "absent"]
+
+
+@dataclass(frozen=True)
+class RollCallRecord:
+    scope: RollCallScope
+    day: date
+    source: Citation
+    call: RollCall
 
 
 @dataclass
@@ -1034,7 +1056,10 @@ async def retrieve_named(state: RagflowSession, question: str) -> list[Retrieved
 
 # Calculate a dated membership total from a complete, clearly labeled roll call.
 def documented_membership(
-    state: RagflowSession, question: str, chunks: list[RetrievedChunk]
+    state: RagflowSession,
+    question: str,
+    chunks: list[RetrievedChunk],
+    mode: Literal["standard", "agentic"],
 ) -> ChatResponse | None:
     if not chunks:
         return None
@@ -1046,17 +1071,18 @@ def documented_membership(
         day = filename_date(Path(source.path).stem)
         if day is None:
             break
-        count = roll_call_count(
+        call = parse_roll_call(
             question, format_excerpt(chunk.content), source=source.path
         )
-        if count is not None:
-            return ChatResponse(
-                answer=(
-                    f"The {day:%B} {day.day}, {day.year} roll call records **{count.total} members**, "
-                    f"with {count.present} present and {count.absent} listed as absent [1]."
+        if call is not None:
+            return roll_call_reply(
+                RollCallRecord(
+                    RollCallScope(document_id=latest, group=call.group, year=day.year),
+                    day,
+                    source,
+                    call,
                 ),
-                sources=[source],
-                mode_used="standard",
+                mode,
             )
     return None
 
@@ -1394,43 +1420,143 @@ async def record_opening(
     return next(iter(await record_chunks(state, document_id, 1)), None)
 
 
-# Count the latest complete roll call for a single requested group and year.
-async def dated_membership(
-    state: RagflowSession,
-    group: str,
-    year: int,
-    mode: Literal["standard", "agentic"],
-) -> ChatResponse | None:
-    originals = dict(indexed_originals(state))
+# Reopen a cited roll call and verify its year, group and attendance sections.
+async def load_roll_call(
+    state: RagflowSession, scope: RollCallScope
+) -> RollCallRecord | None:
+    document_id = scope.document_id
+    if (opening := await record_opening(state, document_id)) is None:
+        return None
+    source = citation(state, opening)
+    day = filename_date(Path(source.path).stem)
+    if day is None or day.year != scope.year:
+        return None
+    text = format_excerpt(opening.content)
+    if Path(source.path).suffix.casefold() == ".docx":
+        archive = await word_archive(state, document_id)
+        text = await asyncio.to_thread(word_body, archive) or text
+    question = f"How many {scope.group} members do we have?"
+    call = parse_roll_call(question, text, source=source.path)
+    return RollCallRecord(scope, day, source, call) if call is not None else None
+
+
+# Select the latest complete roll call for a single requested group and year.
+async def dated_roll_call(
+    state: RagflowSession, group: str, year: int
+) -> RollCallRecord | None:
     periods = dated_document_ids(
-        f"{group} meeting minutes in {year}", originals.items()
+        f"{group} meeting minutes in {year}", indexed_originals(state)
     )
-    question = f"How many {group} members do we have?"
     with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
         async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
             for document_id in reversed(periods.get(year, [])):
-                if (opening := await record_opening(state, document_id)) is None:
-                    continue
-                source = citation(state, opening)
-                day = filename_date(Path(source.path).stem)
-                if day is None or day.year != year:
-                    continue
-                text = format_excerpt(opening.content)
-                if Path(source.path).suffix.casefold() == ".docx":
-                    archive = await word_archive(state, document_id)
-                    text = await asyncio.to_thread(word_body, archive) or text
-                count = roll_call_count(question, text, source=source.path)
-                if count is not None:
-                    return ChatResponse(
-                        answer=(
-                            f"The latest complete {group} roll call I found for {year}, "
-                            f"dated {day:%B} {day.day}, records **{count.total} members** "
-                            f"({count.present} present and {count.absent} absent) [1]."
-                        ),
-                        sources=[source],
-                        mode_used=mode,
-                    )
+                scope = RollCallScope(document_id=document_id, group=group, year=year)
+                if record := await load_roll_call(state, scope):
+                    return record
     return None
+
+
+# Render counts or names from the same validated membership sections.
+def roll_call_reply(
+    record: RollCallRecord,
+    mode: Literal["standard", "agentic"],
+    view: RollCallView | None = None,
+) -> ChatResponse:
+    call = record.call
+    heading = f"The {record.day:%B} {record.day.day}, {record.day.year} {call.group} roll call"
+    if view is None or (view.output == "count" and view.members == "all"):
+        count = call.count
+        answer = (
+            f"{heading} records **{count.total} members** "
+            f"({count.present} present and {count.absent} absent) [1]."
+        )
+    else:
+        sections = tuple(
+            (label, names)
+            for label, names in (("present", call.present), ("absent", call.absent))
+            if view.members in ("all", label)
+        )
+        if view.output == "count":
+            label, names = sections[0]
+            answer = f"{heading} lists **{len(names)} {label}** [1]."
+        else:
+            roster = "\n\n".join(
+                f"**{label.capitalize()} ({len(names)})**\n\n"
+                + ("\n".join(f"- {name}" for name in names) or "None recorded.")
+                for label, names in sections
+            )
+            answer = f"{heading} [1].\n\n{roster}"
+    return ChatResponse(
+        answer=answer, sources=[record.source], mode_used=mode, roll_call=record.scope
+    )
+
+
+# Find the latest roll call in history, including exchanges from older clients.
+def roll_call_context(
+    history: list[ChatMessage],
+) -> tuple[int, str, int, RollCallScope | None] | None:
+    for index in range(len(history) - 2, -1, -1):
+        previous, reply = history[index : index + 2]
+        if previous.role != "user" or reply.role != "assistant":
+            continue
+        if scope := reply.roll_call:
+            return index, scope.group, scope.year, scope
+        if earlier := dated_count_scope(previous.content):
+            return index, *earlier, None
+    return None
+
+
+# Interpret a dependent request without letting the model select a record or supply names.
+async def roll_call_follow_up(
+    state: RagflowSession,
+    question: str,
+    history: list[ChatMessage],
+    mode: Literal["standard", "agentic"],
+) -> ChatResponse | None:
+    context = roll_call_context(history)
+    if context is None:
+        return None
+    index, group, year, scope = context
+    periods = requested_years(question)
+    if periods and periods != (year,):
+        return None
+    record = None
+    view = None
+    with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            raw = await generate(
+                state,
+                "Classify the current request in relation to the previous verified roll call. "
+                "A request for the people, names, membership list or roster means names. "
+                "A question asking how many means count. Select all unless the user asks "
+                "only for those who attended or those who were absent. Use record for other "
+                "questions about the same meeting. Use other for a different subject, group or meeting. "
+                "Check the intervening turns for a change of subject before resolving a pronoun. "
+                "Return only the classification and follow the schema.",
+                f"Roll call group: {group}\nYear: {year}\nConversation:\n{conversation(history[index:])}\n"
+                f"Current user request: {question}",
+                output_format=RollCallView.model_json_schema(),
+                answer_tokens=80,
+            )
+            view = RollCallView.model_validate_json(raw)
+            if view.output == "other":
+                return None
+            record = (
+                await load_roll_call(state, scope)
+                if scope is not None
+                else await dated_roll_call(state, group, year)
+            )
+    if record is None or view is None:
+        return None
+    if view.output == "record":
+        selection = await select_records(
+            state, question, pinned=(record.scope.document_id,)
+        )
+        answer = await answer_records(
+            state, question, Question(question=question, mode=mode), selection
+        )
+        return answer.model_copy(update={"roll_call": record.scope})
+    return roll_call_reply(record, mode, view)
 
 
 # Resolve file inventory entries before searching similarly named documents.
@@ -2627,12 +2753,14 @@ async def respond_to_question(
             record_question = scoped
     if records.requested:
         return await answer_records(state, record_question, payload, records)
-    if count_scope and (
-        membership := await dated_membership(state, *count_scope, payload.mode)
+    if count_scope and (record := await dated_roll_call(state, *count_scope)):
+        return roll_call_reply(record, payload.mode)
+    if membership := await roll_call_follow_up(
+        state, question, payload.history, payload.mode
     ):
         return membership
     recent_hits = await retrieve_recent(state, scoped)
-    membership = documented_membership(state, question, recent_hits)
+    membership = documented_membership(state, question, recent_hits, payload.mode)
     if membership is not None:
         return membership
     baseline = select_evidence(recent_hits, RECENT_EVIDENCE_BUDGET)
