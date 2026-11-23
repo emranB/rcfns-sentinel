@@ -209,7 +209,7 @@ export default function App() {
   const activeRequest = useRef<AbortController | null>(null);
   const pending = turns.at(-1)?.kind === 'pending';
   const turnCount = turns.length;
-  const canSend = index.ready && !pending && (mode === 'standard' || index.agentic) && !!draft.trim();
+  const canSend = index.ready && !pending && !!draft.trim();
 
   useEffect(() => {
     localStorage.setItem(THEME_KEY, theme);
@@ -324,11 +324,10 @@ export default function App() {
                 className="mode-select"
                 aria-label="Answer mode"
                 value={mode}
-                disabled={pending}
                 onChange={event => setMode(event.target.value === 'agentic' ? 'agentic' : 'standard')}
               >
                 <option value="standard">Standard</option>
-                <option value="agentic" disabled={!index.agentic}>Agentic</option>
+                <option value="agentic">Agentic</option>
               </select>
               {pending ? (
                 <button className="send-button" type="button" onClick={() => activeRequest.current?.abort()}>

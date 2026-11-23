@@ -30,7 +30,6 @@ export interface IndexStatus {
   failed: number;
   skipped: number;
   inventory: number;
-  agentic: boolean;
 }
 
 export interface ChatResponse {
@@ -49,7 +48,6 @@ export const connecting: IndexStatus = {
   failed: 0,
   skipped: 0,
   inventory: 0,
-  agentic: false,
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -106,7 +104,6 @@ export async function fetchIndexStatus(signal: AbortSignal): Promise<IndexStatus
     failed: count(data.failed_count),
     skipped: count(data.skipped_count),
     inventory: count(data.inventory_count),
-    agentic: data.agentic_ready === true,
   };
 }
 

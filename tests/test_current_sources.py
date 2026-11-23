@@ -3,10 +3,29 @@
 import unittest
 from datetime import date
 
-from src.backend.current_sources import latest_document_ids
+from src.backend.current_sources import comparison_document_ids, latest_document_ids
 
 
 class CurrentSourceTests(unittest.TestCase):
+    # Keep records from both years, including older entries that fall outside a recent lookup.
+    def test_comparison_covers_each_year_and_prefers_a_consistent_series(self) -> None:
+        documents = [
+            ("recent", "Warehouse/Inventory/2025/20251202InventoryReport.pdf"),
+            ("early", "Warehouse/Inventory/2025/Inventory report 01.10.2025.pdf"),
+            ("previous", "Warehouse/Inventory/2024/20241128InventoryReport.pdf"),
+            ("older", "Warehouse/Inventory/2024/20240303InventoryReport.pdf"),
+            ("agenda", "Warehouse/Inventory/2025/20251212InventoryAgenda.docx"),
+            ("template", "Warehouse/Inventory/2024/20240601InventoryTemplate.docx"),
+            ("unrelated", "Contacts/2024/20240109AdvisoryReport.docx"),
+        ]
+        result = comparison_document_ids(
+            "List inventory totals in 2025 vs 2024", documents, today=date(2026, 1, 1)
+        )
+        self.assertEqual(list(result), [2025, 2024])
+        self.assertEqual(
+            result, {2025: ["early", "recent"], 2024: ["older", "previous"]}
+        )
+
     # Match the meeting folder when the filename uses an abbreviation.
     def test_finds_current_records_by_original_path(self) -> None:
         folder = "Board/Board Meeting Records/2026/November/"

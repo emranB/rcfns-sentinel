@@ -1,6 +1,7 @@
-'''Find recent originals that match the subject of a current-state question.'''
+'''Find dated originals that match the subject and periods of a question.'''
 
 import re
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -28,6 +29,14 @@ EXPLICIT_PERIOD = re.compile(
     re.IGNORECASE,
 )
 FILENAME_DATE = re.compile(r"(?<!\d)((?:19|20)\d{2})[-_. ]?(\d{2})[-_. ]?(\d{2})(?!\d)")
+MONTH_FIRST_DATE = re.compile(
+    r"(?<!\d)(\d{1,2})[._-](\d{1,2})[._-]((?:19|20)\d{2})(?!\d)"
+)
+YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+RECORD_KIND = re.compile(
+    r"minutes|report|roster|register|statement|ledger|summary", re.IGNORECASE
+)
+TITLE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 WORD = re.compile(r"[^\W\d_]+")
 OLDER_RECORD_WORDS = frozenset(
     {
@@ -42,6 +51,8 @@ OLDER_RECORD_WORDS = frozenset(
     }
 )
 MAX_CURRENT_DOCUMENTS = 4
+MAX_COMPARISON_DOCUMENTS = 9
+MAX_COMPARISON_YEARS = 4
 TITLE_PATH_COMPONENTS = 4
 
 
@@ -72,7 +83,8 @@ QUESTION_STOP_WORDS = frozenset(
         "a about an and are as at be by can could count current currently did do does "
         "for from had has have how i in is it latest many me most much new newest now "
         "number of on or our present recent report show the their there they this to "
-        "today total update us was we were what when where which who with would you your"
+        "today total update us was we were what when where which who with would you your "
+        "all compare comparison difference differ list name versus vs between"
     )
 )
 
@@ -80,23 +92,40 @@ QUESTION_STOP_WORDS = frozenset(
 # Use dates stated in the filename and ignore invalid calendar dates.
 def filename_date(stem: str) -> date | None:
     dates = []
-    for match in FILENAME_DATE.finditer(stem):
+    parts = chain_dates(stem)
+    for year, month, day in parts:
         try:
-            dates.append(date(int(match[1]), int(match[2]), int(match[3])))
+            dates.append(date(int(year), int(month), int(day)))
         except ValueError:
             continue
     return max(dates, default=None)
 
 
+# Read both year-first and separated month-first dates from filenames.
+def chain_dates(stem: str) -> Iterable[tuple[str, str, str]]:
+    yield from ((m[1], m[2], m[3]) for m in FILENAME_DATE.finditer(stem))
+    yield from ((m[3], m[1], m[2]) for m in MONTH_FIRST_DATE.finditer(stem))
+
+
 # Match a dated record by its title or the directories that describe it.
 def match_source(
-    document_id: str, path: str, topics: set[str], today: date
+    document_id: str,
+    path: str,
+    topics: set[str],
+    today: date,
+    *,
+    year_only: bool = False,
 ) -> DatedSource | None:
     original = PurePosixPath(path.replace("\\", "/"))
     record_date = filename_date(original.stem)
+    if record_date is None and year_only:
+        for part in (original.stem, *reversed(original.parts[:-1])):
+            if len(years := YEAR.findall(part)) == 1:
+                record_date = date(int(years[0]), 1, 1)
+                break
     if record_date is None or record_date > today:
         return None
-    if OLDER_RECORD_WORDS & source_terms(original.as_posix()):
+    if OLDER_RECORD_WORDS & source_terms(TITLE_BOUNDARY.sub(" ", original.as_posix())):
         return None
     title = topics & source_terms(original.stem)
     folders = [
@@ -159,3 +188,81 @@ def latest_document_ids(
             break
         selected[source.document_id] = None
     return list(selected)
+
+
+# Preserve the requested order and bound the number of independent year searches.
+def comparison_years(question: str) -> tuple[int, ...]:
+    years = tuple(dict.fromkeys(int(match[0]) for match in YEAR.finditer(question)))
+    return years if 2 <= len(years) <= MAX_COMPARISON_YEARS else ()
+
+
+# Group records by the directory they share before their dated subfolders.
+def source_series(path: str, year: int) -> tuple[str, ...]:
+    original = PurePosixPath(path.replace("\\", "/"))
+    folders = original.parts[:-1]
+    kind = RECORD_KIND.search(original.stem)
+    for index, folder in enumerate(folders):
+        if str(year) in YEAR.findall(folder):
+            folders = folders[:index]
+            break
+    return (*folders, kind[0].casefold() if kind else "")
+
+
+# Keep a comparable record series when available and cover each year's timeline.
+def comparison_document_ids(
+    question: str, documents: Iterable[tuple[str, str]], *, today: date | None = None
+) -> dict[int, list[str]]:
+    years = comparison_years(question)
+    if not years:
+        return {}
+    topics = source_terms(question) - QUESTION_STOP_WORDS
+    as_of = today or datetime.now(UTC).date()
+    periods: dict[int, list[DatedSource]] = {year: [] for year in years}
+    series: dict[tuple[str, ...], list[DatedSource]] = defaultdict(list)
+    for document_id, path in documents:
+        source = match_source(document_id, path, topics, as_of, year_only=True)
+        if source is not None and source.record_date.year in periods:
+            periods[source.record_date.year].append(source)
+            series[source_series(path, source.record_date.year)].append(source)
+
+    recurring = []
+    for records in series.values():
+        dates = {record.record_date for record in records}
+        if all(sum(day.year == year for day in dates) >= 2 for year in years):
+            recurring.append((len(dates), records))
+    if recurring:
+        _, chosen = max(
+            recurring,
+            key=lambda group: (
+                max(len(record.topics) for record in group[1]),
+                group[0],
+            ),
+        )
+        periods = {
+            year: [record for record in chosen if record.record_date.year == year]
+            for year in years
+        }
+
+    return {year: representative_ids(records) for year, records in periods.items()}
+
+
+# Reserve one record per month and sample across the full year when a series is large.
+def representative_ids(records: list[DatedSource]) -> list[str]:
+    monthly: dict[int, DatedSource] = {}
+    for record in sorted(
+        records,
+        key=lambda item: (
+            -len(item.topics),
+            -item.title_matches,
+            -item.folder_matches,
+            *source_order(item),
+        ),
+    ):
+        monthly.setdefault(record.record_date.month, record)
+    ordered = sorted(monthly.values(), key=lambda record: record.record_date)
+    if len(ordered) > MAX_COMPARISON_DOCUMENTS:
+        last = MAX_COMPARISON_DOCUMENTS - 1
+        ordered = [
+            ordered[round(i * (len(ordered) - 1) / last)] for i in range(last + 1)
+        ]
+    return [record.document_id for record in ordered]

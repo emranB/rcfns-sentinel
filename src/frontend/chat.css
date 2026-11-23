@@ -588,10 +588,6 @@ textarea {
   color: var(--text);
 }
 
-.mode-select:disabled {
-  color: var(--muted);
-}
-
 .send-button {
   min-width: 74px;
   border-color: transparent;

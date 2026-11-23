@@ -24,7 +24,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from src.backend.current_sources import filename_date, latest_document_ids
+from src.backend.current_sources import (
+    YEAR,
+    comparison_document_ids,
+    comparison_years,
+    filename_date,
+    latest_document_ids,
+)
 from src.backend.evidence import format_excerpt
 from src.backend.index_cache import IndexCache, prepare_index_cache
 from src.backend.library_overview import CollectionOverview, build_overview
@@ -82,6 +88,9 @@ ANSWER_INSTRUCTIONS = (
     "Cite the numbered excerpts that support each finding, such as [1]. "
     "File paths identify the originals. Use document text for exact quotes and printed titles. "
     "For a question with several parts, answer each part and connect the relevant documents. "
+    "For comparisons across years, use records from each requested year. If asked for all "
+    "entries, include distinct entries documented at any point in each year. Keep any latest "
+    "snapshot separate from the full-year list, and exclude people mentioned only as staff, guests, or nominees. "
     "Preserve row and column associations, dates, units, and qualifications. In tables, "
     "use the original column order and only pair a value with a heading if the alignment is clear. "
     "In outlines, equally indented items are siblings. Use the section headings "
@@ -953,6 +962,8 @@ async def investigate(
     question: str,
     dialogue: str,
     excerpts: list[Excerpt],
+    *,
+    periods: dict[int, list[str]] | None = None,
 ) -> Investigation:
     sample = "\n".join(
         f"{citation(state, item.chunk).name}: {item.text[:PLANNING_SAMPLE_SIZE]}"
@@ -977,9 +988,24 @@ async def investigate(
         if len(queries) == 3:
             break
 
+    # Keep year-specific follow-ups inside the applicable record set when available.
+    async def search(query: str) -> list[RetrievedChunk]:
+        requested_years = {int(match[0]) for match in YEAR.finditer(query)}
+        scopes = periods or {}
+        ids = [
+            doc
+            for year, group in scopes.items()
+            if not requested_years or year in requested_years
+            for doc in group
+        ]
+        return (
+            await retrieve(state, query, 5, document_ids=ids)
+            if ids
+            else await retrieve(state, query, 5)
+        )
+
     batches = await asyncio.gather(
-        *(retrieve(state, query, 5) for query in queries),
-        return_exceptions=True,
+        *(search(query) for query in queries), return_exceptions=True
     )
     for batch in batches:
         if isinstance(batch, BaseException):
@@ -1037,6 +1063,38 @@ def select_evidence(
     return selected
 
 
+# Search each year independently and reserve evidence space for every period and file.
+async def comparison_evidence(
+    state: RagflowSession, question: str, periods: dict[int, list[str]], budget: int
+) -> list[Excerpt]:
+    subject = YEAR.sub(" ", question)
+
+    # Pick the strongest excerpt from each representative original in chronological order.
+    async def search(year: int, document_ids: list[str]) -> list[Excerpt]:
+        query = f"{subject}\nPeriod: {year}"
+        try:
+            async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                if not document_ids:
+                    return select_evidence(await retrieve(state, query), budget)
+                hits = await retrieve(state, query, 64, document_ids=document_ids)
+                by_document: dict[str, RetrievedChunk] = {}
+                for hit in hits:
+                    by_document.setdefault(hit.document_id, hit)
+                limit = budget // max(1, len(document_ids))
+                return [
+                    Excerpt(selected, text[:limit])
+                    for document_id in document_ids
+                    if (selected := by_document.get(document_id)) is not None
+                    and (text := format_excerpt(selected.content))
+                ]
+        except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError) as error:
+            LOGGER.warning("Period search for %s failed: %s", year, error)
+            return []
+
+    groups = await asyncio.gather(*(search(year, ids) for year, ids in periods.items()))
+    return [item for group in groups for item in group]
+
+
 # Use the same answer path in both modes. Agentic can resolve a follow-up and
 # add evidence from independent searches without displacing the standard results.
 async def respond_to_question(
@@ -1076,7 +1134,20 @@ async def respond_to_question(
     if membership is not None:
         return membership
     baseline = select_evidence(recent_hits, RECENT_EVIDENCE_BUDGET)
-    if baseline:
+    periods = (
+        comparison_document_ids(scoped, indexed_originals(state))
+        if comparison_years(scoped)
+        else {}
+    )
+    if periods:
+        named_hits, dated_evidence = await asyncio.gather(
+            retrieve_named(state, scoped),
+            comparison_evidence(state, scoped, periods, EXCERPT_BUDGET // len(periods)),
+        )
+        baseline = [*dated_evidence, *select_evidence(named_hits, 2500, dated_evidence)]
+        if not baseline:
+            baseline = select_evidence(await retrieve(state, scoped), EXCERPT_BUDGET)
+    elif baseline:
         if named_hits := await retrieve_named(state, scoped):
             baseline = select_evidence(chain(named_hits, recent_hits), EXCERPT_BUDGET)
     else:
@@ -1091,13 +1162,18 @@ async def respond_to_question(
     if payload.mode == "agentic":
         try:
             async with asyncio.timeout(AGENTIC_TIMEOUT_SECONDS):
-                investigation = await investigate(state, scoped, dialogue, baseline)
+                if periods:
+                    investigation = await investigate(
+                        state, scoped, dialogue, baseline, periods=periods
+                    )
+                else:
+                    investigation = await investigate(state, scoped, dialogue, baseline)
+            mode = "agentic"
             additional = select_evidence(
                 investigation.chunks, SUPPLEMENT_BUDGET, baseline
             )
             if additional:
                 evidence = [*baseline, *additional]
-                mode = "agentic"
                 if payload.history and investigation.question != scoped:
                     follow_up_context = (
                         f"\nResolved follow-up context: {investigation.question}"
