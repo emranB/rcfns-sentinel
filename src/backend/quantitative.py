@@ -8,7 +8,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from src.backend.current_sources import source_terms
-from src.backend.grounding import EvidenceText, normalized
 from src.backend.tabular import Worksheet, worksheet_tables
 
 CALCULATION_REQUEST = re.compile(
@@ -30,6 +29,7 @@ CELL_REFERENCE = re.compile(r"([A-Z]{1,3})([1-9]\d*)")
 OPERATORS = {
     "sum": "+",
     "difference": "-",
+    "remainder": "-",
     "product": "x",
     "ratio": "/",
     "share": "/",
@@ -52,23 +52,17 @@ class QuantityPlan(BaseModel):
     sources: list[OperandSource] = Field(min_length=1, max_length=5)
 
 
-class NumericInput(BaseModel):
-    source: int = Field(ge=1)
-    quote: str = Field(min_length=4, max_length=400)
-    amount: str = Field(min_length=1, max_length=40)
-
-
 class Equation(BaseModel):
     label: str = Field(min_length=1, max_length=120)
     operation: Literal[
-        "sum", "difference", "product", "ratio", "share", "percent_change"
+        "sum", "difference", "remainder", "product", "ratio", "share", "percent_change"
     ]
     inputs: list[int] = Field(min_length=2, max_length=8)
     precision: int = Field(ge=0, le=4)
 
 
 class QuantityAnswer(BaseModel):
-    inputs: list[NumericInput] = Field(max_length=12)
+    inputs: list[int] = Field(max_length=12)
     equations: list[Equation] = Field(max_length=5)
     missing: list[str] = Field(max_length=6)
 
@@ -231,22 +225,19 @@ def numeric_workbook(payload: bytes, question: str, limit: int = 36) -> str:
     return "\n".join(sorted(selected, key=selected.__getitem__, reverse=True)[:limit])
 
 
-# Accept an input only when the cited line fixes its context and numeric value.
-def cited_amount(
-    fact: NumericInput, evidence: list[EvidenceText]
-) -> CitedAmount | None:
-    if fact.source > len(evidence) or (expected := amount_value(fact.amount)) is None:
-        return None
-    quote = normalized(fact.quote)
-    for line in evidence[fact.source - 1].content.splitlines():
-        if normalized(line) != quote or not any(
-            character.isalpha() for character in line
+# Assign IDs only to original rows that identify one unambiguous numeric amount.
+def quantity_rows(text: str, source: int) -> list[CitedAmount]:
+    rows = []
+    for line in dict.fromkeys(text.splitlines()):
+        if not any(character.isalpha() for character in line) or (
+            "|" not in line
+            and re.fullmatch(r"[A-Za-z -]+ (?:19|20)\d{2}", line.strip())
         ):
             continue
-        if " | " in line:
+        if "|" in line:
             matches = [
                 part.strip()
-                for part in line.split(" | ")
+                for part in line.split("|")
                 if NUMBER.fullmatch(part.strip())
             ]
         else:
@@ -254,27 +245,22 @@ def cited_amount(
                 match[0]
                 for match in re.finditer(rf"(?<!\w){NUMBER.pattern}(?!\w)", line)
             ]
-        if len(matches) != 1 or (actual := amount_value(matches[0])) is None:
-            continue
-        if actual[0] == expected[0] and (not expected[1] or expected[1] == actual[1]):
-            return CitedAmount(*actual, fact.source, line)
-    return None
+        if len(matches) == 1 and (amount := amount_value(matches[0])) is not None:
+            rows.append(CitedAmount(*amount, source, line))
+    return rows
 
 
 # Evaluate only the declared operation on vetted inputs with compatible units.
-def calculate(equation: Equation, amounts: list[CitedAmount | None]) -> str:
+def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
     if not all(1 <= index <= len(amounts) for index in equation.inputs):
         return ""
-    selected = [amounts[index - 1] for index in equation.inputs]
-    known = [item for item in selected if item is not None]
-    if len(known) != len(selected) or len(set(equation.inputs)) != len(selected):
+    known = [amounts[index - 1] for index in equation.inputs]
+    if len(set(equation.inputs)) != len(known):
         return ""
     operation = equation.operation
     units = {item.unit for item in known if item.unit}
-    if (
-        len(units) > 1
-        or operation in {"ratio", "share", "percent_change"}
-        and len(known) != 2
+    if len(units) > 1 or (
+        operation not in {"sum", "product", "remainder"} and len(known) != 2
     ):
         return ""
     values = [item.number for item in known]
@@ -284,7 +270,7 @@ def calculate(equation: Equation, amounts: list[CitedAmount | None]) -> str:
         first, second = values[:2]
         if operation in {"ratio", "share", "percent_change"} and not second:
             return ""
-        if operation == "difference":
+        if operation in {"difference", "remainder"}:
             result = first - sum(values[1:], Decimal(0))
         elif operation == "sum":
             result = sum(values, Decimal(0))
