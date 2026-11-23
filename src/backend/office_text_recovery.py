@@ -18,6 +18,11 @@ WORD_MARGINS = re.compile(r"word/(?:header|footer)[^/]*\.xml")
 SHEETS = re.compile(r"xl/worksheets/[^/]+\.xml")
 SLIDES = re.compile(r"ppt/slides/slide[0-9]+\.xml")
 SLIDE_REFERENCE = re.compile(r"\bslide\b", re.IGNORECASE)
+SLIDE_LIST_REQUEST = re.compile(
+    r"\b(?:list|give|identify|what)\b[^.?!\n]{0,80}"
+    r"\b(?:decisions|goals|actions|items|priorities|steps|milestones)\b",
+    re.IGNORECASE,
+)
 MEDIA_DIRS = ("word/media/", "xl/media/", "ppt/media/")
 EMBEDDED_DIRS = ("word/embeddings/", "xl/embeddings/", "ppt/embeddings/")
 
@@ -260,6 +265,20 @@ def named_slide(payload: bytes, question: str) -> str:
         ):
             matches.append("\n\n".join("\n".join(group) for group in groups))
     return matches[0] if len(matches) == 1 else ""
+
+
+# Return an unambiguous list from a text box without treating nearby notes as list items.
+def slide_items(question: str, slide: str) -> list[str]:
+    if not SLIDE_LIST_REQUEST.search(question):
+        return []
+    groups = [group.splitlines() for group in slide.split("\n\n")]
+    lists = [
+        group
+        for group in groups
+        if 2 <= len(group) <= 16
+        and all(2 <= len(item) <= 180 and "?" not in item for item in group)
+    ]
+    return lists[0] if len(lists) == 1 else []
 
 
 # Require real worksheets and rule out formulas, values, comments, and visual content.

@@ -76,8 +76,14 @@ def explicit_ids(question: str, originals: Iterable[tuple[str, str]]) -> list[st
         ):
             continue
         matched = full_name if with_extension else f" {phrase} "
+        # Adjacent filenames share a separator after normalization.
         matches.append(
-            (split_words.index(matched), -len(matched), path.casefold(), document_id)
+            (
+                split_words.index(matched) + 1,
+                2 - len(matched),
+                path.casefold(),
+                document_id,
+            )
         )
     picked: list[str] = []
     covered_until = -1

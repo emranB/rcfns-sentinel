@@ -155,6 +155,40 @@ NUMERIC_PART = re.compile(
 )
 REQUESTED_LABEL = re.compile(r"\b(?:deadline|update)\b", re.IGNORECASE)
 CAP_TERMS = frozenset({"ceiling", "cap", "maximum", "limit"})
+FIELD_JOIN = re.compile(
+    r"[,;]?\s+and\s+(?=(?:what|when|where|who|how|whether)\b"
+    r"|the\s+(?:(?:actual|approved|exact|recorded|specific)\s+)?"
+    r"(?:date|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|vote (?:count|tally))\b)",
+    re.IGNORECASE,
+)
+EVENT_DATE_FIELD = re.compile(
+    r"^(?:(?:what|which|give|report)\s+)?(?:the\s+)?"
+    r"(?:(?:exact|calendar|actual|specific|scheduled|recorded)\s+)?"
+    r"(?P<event>(?:[\w-]+\s+){0,3}?)date\b",
+    re.IGNORECASE,
+)
+PERIOD_FIELD = re.compile(
+    r"\b(start|beginning|early|mid|middle|late|end)(?:[ -]+of)?[ -]+((?:19|20)\d{2})\b",
+    re.IGNORECASE,
+)
+PERIOD_ALIASES = {"beginning": "start", "middle": "mid"}
+VOTE_FIELD = re.compile(
+    r"\b(?:how many\s+(?:\w+\s+){0,2}(?:votes|ballots)|number of (?:votes|ballots)"
+    r"|(?:vote|ballot) (?:tally|count|total))\b",
+    re.IGNORECASE,
+)
+VOTE_LABEL = r"(?:votes?|ballots?|for|in favou?r|against|opposed|abstentions?)"
+TALLY_NUMBER = (
+    r"(?:\d+(?:,\d{3})*|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+)
+TALLY_VALUE = re.compile(
+    rf"\b{TALLY_NUMBER}\s+(?!for\b){VOTE_LABEL}\b|\b{VOTE_LABEL}\s*[:=]\s*{TALLY_NUMBER}\b",
+    re.IGNORECASE,
+)
+VOTE_DIRECTIONS = ("against|opposed", "abstentions?|abstained", "in favou?r")
+CURRENCY_VALUE = re.compile(
+    r"[$£€]\s*\d|\b\d[\d,.]*\s+(?:dollars|euros|pounds)\b", re.IGNORECASE
+)
 
 INSTRUCTIONS = (
     "Answer with brief factual claims that address the question. Use one claim per finding "
@@ -189,6 +223,8 @@ class ClaimAnswer(BaseModel):
 class CoverageReview(BaseModel):
     covered_lines: list[int] = Field(max_length=24)
     missing: list[str] = Field(max_length=24)
+    recovered: list[Claim] = Field(default_factory=list, max_length=16)
+    unsupported_lines: list[int] = Field(default_factory=list, max_length=24)
 
 
 @dataclass(frozen=True)
@@ -247,6 +283,96 @@ def requested_parts(question: str) -> list[str]:
         else:
             parts.append(line)
     return parts[:8]
+
+
+# Keep an explicitly coordinated factual request separate from its neighbor.
+def requested_fields(part: str) -> list[str]:
+    return [piece.strip().rstrip(" ?,.;") for piece in FIELD_JOIN.split(part)]
+
+
+# Match the event and value together before exposing a date, amount, or count to generation.
+def field_evidence(question: str, text: str) -> str | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if match := EVENT_DATE_FIELD.match(question):
+        event = (
+            match["event"]
+            or re.split(
+                r"\s+(?:on|in|according to)\s+",
+                question[match.end() :].casefold().partition(" for ")[2],
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+        )
+        terms = source_terms(event) - STOP - {"a", "an", "of", "the", "to", "exact"}
+        if terms:
+            dated = [
+                line
+                for line in lines
+                if DATE.search(line)
+                and focus_matches(frozenset(source_terms(line)), terms) == len(terms)
+            ]
+            dated.extend(
+                f"{heading}\n{value}"
+                for heading, value in pairwise(lines)
+                if len(heading) <= 64
+                and not heading.endswith((".", "?"))
+                and DATE.match(value)
+                and focus_matches(frozenset(source_terms(heading)), terms) == len(terms)
+            )
+            return "\n".join(dated)
+    if VOTE_FIELD.search(question):
+        direction = next(
+            (
+                label
+                for label in VOTE_DIRECTIONS
+                if re.search(rf"\b(?:{label})\b", question, re.IGNORECASE)
+            ),
+            "",
+        )
+        tally = (
+            re.compile(
+                rf"\b{TALLY_NUMBER}\s+(?:votes?\s+)?(?:{direction})\b"
+                rf"|\b(?:{direction})\s*[:=]\s*{TALLY_NUMBER}\b",
+                re.IGNORECASE,
+            )
+            if direction
+            else TALLY_VALUE
+        )
+        return "\n".join(
+            line
+            for line in lines
+            if tally.search(line)
+            and re.search(r"\b(?:vote|ballot|motion)\w*\b", line, re.IGNORECASE)
+        )
+    if re.search(r"\b(?:percent(?:age)?|proportion)\b", question, re.IGNORECASE) and (
+        period := PERIOD_FIELD.search(question)
+    ):
+        position = PERIOD_ALIASES.get(period[1].lower(), period[1].lower())
+        return "\n".join(
+            piece.strip()
+            for line in lines
+            for piece in re.split(r"[|;]|(?<=[.!?])\s+", line)
+            if re.search(r"\d\s*(?:%|percent\b)", piece, re.IGNORECASE)
+            and any(
+                (PERIOD_ALIASES.get(match[1].lower(), match[1].lower()), match[2])
+                == (position, period[2])
+                for match in PERIOD_FIELD.finditer(piece)
+            )
+        )
+    if re.search(r"\bdollar amount\b", question, re.IGNORECASE):
+        anchor = re.search(
+            r"\b(?:beside|next to|for)\s+(.+?)(?=\s+(?:on|in)\b|$)",
+            question,
+            re.IGNORECASE,
+        )
+        terms = source_terms(anchor[1]) - STOP - {"a", "an", "the"} if anchor else set()
+        return "\n".join(
+            line
+            for line in lines
+            if CURRENCY_VALUE.search(line)
+            and focus_matches(frozenset(source_terms(line)), terms) == len(terms)
+        )
+    return None
 
 
 # Score a request against a literal passage and its source label.

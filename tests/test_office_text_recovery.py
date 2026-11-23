@@ -9,6 +9,7 @@ from src.backend.office_text_recovery import (
     named_slide,
     recover_office_text,
     restore_word_outline,
+    slide_items,
 )
 
 
@@ -21,6 +22,14 @@ def make_package(path: Path, parts: dict[str, str]) -> Path:
 
 
 class OfficeTextRecoveryTests(unittest.TestCase):
+    # Separate a slide's grouped actions from a date and a nearby open question.
+    def test_slide_list_preserves_the_text_box(self) -> None:
+        listing = "Readiness\n\nMeeting date: June 6\n\nFit rails\nTest alarms\n\nMore training?"
+        self.assertEqual(
+            slide_items("What actions are listed on the Readiness slide?", listing),
+            ["Fit rails", "Test alarms"],
+        )
+
     # A question about a named slide cannot borrow figures from its neighbors.
     def test_named_slide_reads_only_the_unique_match(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

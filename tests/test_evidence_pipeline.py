@@ -261,22 +261,66 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             sources = [server.citation(state, item.chunk) for item in evidence]
-            stub = server.RecordAnswer(
-                "The revised forklift inspection goal is 60 by October. [1] [2]\n"
-                "The onboarding seminar lasts 16 hours. [3]",
-                missing=("the location of the onboarding seminar",),
-            )
             with patch.object(
-                server, "read_claims", AsyncMock(return_value=stub)
+                server,
+                "read_claims",
+                AsyncMock(
+                    side_effect=[
+                        server.RecordAnswer(
+                            "The onboarding seminar lasts 16 hours. [3]"
+                        ),
+                        server.RecordAnswer(
+                            missing=("the location of the onboarding seminar",)
+                        ),
+                    ]
+                ),
             ) as model:
                 answer = await server.record_claims(
                     state, question, evidence, sources, {}
                 )
-                model.assert_awaited_once()
+                self.assertEqual(model.await_count, 2)
+                self.assertTrue(
+                    all(call.args[3] == [2] for call in model.await_args_list)
+                )
             self.assertIn("40 forklift engines before June", answer.text)
             self.assertIn("60 by October", answer.text)
             self.assertIn("16 hours. [3]", answer.text)
             self.assertIn("the location of the onboarding seminar", answer.warning())
+
+    # Recover facts the draft skipped and remove a value borrowed from a different event.
+    async def test_coverage_recovers_supported_omissions(self) -> None:
+        actual = "The completion date was April 8, 2025."
+        inspection = "The inspection date was April 6, 2025."
+        draft = ClaimAnswer.model_validate_json(literal_claims(inspection))
+        draft.claims[0].text = "The completion date was April 6, 2025."
+        request = "Give the completion date and the signing date."
+        review = CoverageReview(
+            covered_lines=[],
+            missing=["the signing date"],
+            recovered=ClaimAnswer.model_validate_json(literal_claims(actual)).claims,
+            unsupported_lines=[1],
+        )
+        async with httpx.AsyncClient() as client:
+            with patch.object(
+                server,
+                "generate",
+                AsyncMock(
+                    side_effect=[draft.model_dump_json(), review.model_dump_json()]
+                ),
+            ):
+                answer = await server.read_claims(
+                    RagflowSession(client),
+                    request,
+                    [
+                        EvidenceText(
+                            "Completion and inspection log", f"{actual}\n{inspection}"
+                        )
+                    ],
+                    [0],
+                    coverage="always",
+                )
+        self.assertEqual(answer.text, f"{actual} [1]")
+        self.assertEqual(answer.missing, ("the signing date",))
 
     # A scoped comparison keeps the record opening when search ranks later text first.
     async def test_period_search_preserves_openings_and_ranked_chunks(self) -> None:

@@ -8,7 +8,9 @@ from zipfile import ZipFile
 from src.backend.grounding import (
     ClaimAnswer,
     EvidenceText,
+    field_evidence,
     quantitative_passage,
+    requested_fields,
     requested_part_score,
     requested_parts,
     values,
@@ -19,6 +21,68 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # A full filename next to another filename keeps priority over its shorter suffix.
+    def test_adjacent_filenames_do_not_select_a_suffix(self) -> None:
+        originals = [
+            ("notes", "Operations/Service notes.pdf"),
+            ("full", "Policy/Warehouse-Safety-Guidelines.docx"),
+            ("short", "Policy/Guidelines.docx"),
+        ]
+        self.assertEqual(
+            explicit_ids(
+                "Use Service notes.pdf, Warehouse-Safety-Guidelines.docx.", originals
+            ),
+            ["notes", "full"],
+        )
+
+    # Keep the evidence for an event separate from nearby values about different events.
+    def test_requested_field_requires_the_event_and_value(self) -> None:
+        fields = requested_fields(
+            "Give the planning decisions and the exact workshop date "
+            "and what dollar amount is printed beside supplies?"
+        )
+        self.assertEqual(len(fields), 3)
+        record = "Board meeting: May 4, 2026\nSelect workshop date\nTravel: $320"
+        self.assertEqual(field_evidence(fields[1], record), "")
+        self.assertEqual(field_evidence(fields[2], record), "")
+        self.assertEqual(
+            field_evidence(fields[1], record + "\nWorkshop date\nJune 8, 2026"),
+            "Workshop date\nJune 8, 2026",
+        )
+        self.assertEqual(
+            field_evidence(fields[2], record + "\nSupplies: $475"),
+            "Supplies: $475",
+        )
+
+    # A carried decision and a different reporting period leave the requested values open.
+    def test_qualified_tallies_and_periods_require_explicit_values(self) -> None:
+        self.assertEqual(
+            field_evidence(
+                "How many votes against the motion?",
+                "Motion to pay $800 for rails. Carried.",
+            ),
+            "",
+        )
+        self.assertEqual(
+            field_evidence(
+                "How many votes against the motion?", "Motion vote: 4 votes in favour."
+            ),
+            "",
+        )
+        self.assertEqual(
+            field_evidence(
+                "What percentage was set for the end of 2026?",
+                "40% by mid-2026. 60% by end of 2027.",
+            ),
+            "",
+        )
+        self.assertEqual(
+            field_evidence(
+                "What percentage was set for the end of 2026?", "70% by end of 2026."
+            ),
+            "70% by end of 2026.",
+        )
+
     # Keep related fields together and preserve commas in dates and amounts.
     def test_independent_requests_preserve_related_facts(self) -> None:
         parts = requested_parts(
