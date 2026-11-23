@@ -38,6 +38,13 @@ class TableRow:
     values: tuple[Decimal, ...]
 
 
+@dataclass(frozen=True)
+class Worksheet:
+    name: str
+    rows: list[dict[str, str]]
+    merges: tuple[str, ...]
+
+
 # Join explicit given-name and family-name columns without copying adjacent details.
 def table_person_names(question: str, text: str) -> list[str]:
     if not NAME_LIST.search(question):
@@ -166,8 +173,8 @@ def cell_value(cell: Element, strings: list[str]) -> str:
     return value.strip()
 
 
-# Open one named sheet through its workbook relationship and count populated name rows.
-def count_named_rows(payload: bytes, name: str) -> int | None:
+# Read native worksheet cells and labels through their workbook relationships.
+def worksheet_tables(payload: bytes, name: str = "") -> list[Worksheet]:
     try:
         with ZipFile(BytesIO(payload)) as archive:
             workbook, links = read_parts(archive, [WORKBOOK, RELATIONSHIPS])
@@ -175,50 +182,57 @@ def count_named_rows(payload: bytes, name: str) -> int | None:
                 sheet
                 for sheet in workbook.iter()
                 if tag_name(sheet) == "sheet"
-                and sheet.get("name", "").casefold() == name.casefold()
+                and (not name or sheet.get("name", "").casefold() == name.casefold())
             ]
-            if len(matches) != 1:
-                return None
-            link_id = next(
-                (
-                    value
-                    for key, value in matches[0].attrib.items()
-                    if key.endswith("}id")
-                ),
-                "",
-            )
-            target = next(
-                (
-                    rel.get("Target", "")
-                    for rel in links
-                    if rel.get("Id") == link_id and rel.get("TargetMode") != "External"
-                ),
-                "",
-            )
-            sheet_path = normpath(
-                target.lstrip("/") if target.startswith("/") else f"xl/{target}"
-            )
-            if not sheet_path.startswith("xl/worksheets/"):
-                return None
-            names = (
-                [sheet_path, STRINGS] if STRINGS in archive.namelist() else [sheet_path]
-            )
-            sheet, *shared = read_parts(archive, names)
-        strings = [
-            "".join(t.text or "" for t in item.iter() if tag_name(t) == "t")
-            for root in shared
-            for item in root
-            if tag_name(item) == "si"
-        ]
-        rows = [
-            {
-                re.sub(r"\d+$", "", cell.get("r", "")): cell_value(cell, strings)
-                for cell in row
-                if tag_name(cell) == "c"
+            if name and len(matches) != 1:
+                return []
+            strings = [
+                "".join(t.text or "" for t in item.iter() if tag_name(t) == "t")
+                for root in read_parts(
+                    archive, [STRINGS] if STRINGS in archive.namelist() else []
+                )
+                for item in root
+                if tag_name(item) == "si"
+            ]
+            targets = {
+                rel.get("Id", ""): rel.get("Target", "")
+                for rel in links
+                if rel.get("TargetMode") != "External"
             }
-            for row in sheet.iter()
-            if tag_name(row) == "row"
-        ]
+            worksheets = []
+            for record in matches[:12]:
+                link = next(
+                    (
+                        value
+                        for key, value in record.attrib.items()
+                        if key.endswith("}id")
+                    ),
+                    "",
+                )
+                target = targets.get(link, "")
+                path = normpath(
+                    target[1:] if target.startswith("/") else f"xl/{target}"
+                )
+                if not path.startswith("xl/worksheets/"):
+                    continue
+                (sheet,) = read_parts(archive, [path])
+                rows = [
+                    {
+                        cell.get("r", ""): value
+                        for cell in row
+                        if tag_name(cell) == "c"
+                        and (value := cell_value(cell, strings))
+                    }
+                    for row in sheet.iter()
+                    if tag_name(row) == "row"
+                ]
+                merges = tuple(
+                    cell.get("ref", "")
+                    for cell in sheet.iter()
+                    if tag_name(cell) == "mergeCell"
+                )
+                worksheets.append(Worksheet(record.get("name", ""), rows, merges))
+            return worksheets
     except (
         BadZipFile,
         IndexError,
@@ -228,8 +242,18 @@ def count_named_rows(payload: bytes, name: str) -> int | None:
         RuntimeError,
         ValueError,
     ):
-        return None
+        return []
 
+
+# Count populated name rows in the requested original worksheet.
+def count_named_rows(payload: bytes, name: str) -> int | None:
+    sheets = worksheet_tables(payload, name)
+    if len(sheets) != 1:
+        return None
+    rows = [
+        {re.sub(r"\d+$", "", key): value for key, value in row.items()}
+        for row in sheets[0].rows
+    ]
     for index, row in enumerate(rows[:12]):
         columns = {
             key for key, value in row.items() if value.casefold() in NAME_HEADERS

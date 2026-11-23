@@ -81,6 +81,7 @@ from src.backend.office_text_recovery import (
 )
 from src.backend.pdf_recovery import normalize_pdf, pdf_text
 from src.backend.quantitative import (
+    CALCULATION_REFERENCE,
     CALCULATION_REQUEST,
     OperandSource,
     QuantityAnswer,
@@ -88,6 +89,7 @@ from src.backend.quantitative import (
     calculate,
     cited_amount,
     numeric_layout,
+    numeric_workbook,
 )
 from src.backend.ragflow import (
     CHAT_MODEL,
@@ -1799,9 +1801,12 @@ async def resolve_file(
     # Normalize record-type abbreviations consistently in titles and filenames.
     def terms_for(value: str) -> set[str]:
         words = " ".join(title_tokens(value))
-        words = re.sub(r"\bp l\b|\bpl\b|\bprofitandloss\b", "profit loss", words)
+        words = re.sub(r"\bp l\b|\bpl\b|\bprofit\s*and\s*loss", "profit loss ", words)
         words = re.sub(r"\bprofi loss\b|\bprofit lozz\b", "profit loss", words)
-        return source_terms(words) - TITLE_STOP_WORDS
+        terms = source_terms(words) - TITLE_STOP_WORDS
+        if requested.month is not None:
+            terms -= MONTH_NUMBER.keys()
+        return terms
 
     terms = terms_for(requested.title)
     if not terms:
@@ -1880,9 +1885,11 @@ async def resolve_file(
                     start, end = statement_period(heading.splitlines()[:8])
                     if end is not None:
                         day = end
-                    if requested.period != "any":
-                        if start is None or end is None:
-                            return None
+                    if (
+                        requested.period != "any"
+                        and start is not None
+                        and end is not None
+                    ):
                         monthly = start.year == end.year and start.month == end.month
                         if monthly != (requested.period == "monthly"):
                             return None
@@ -1939,6 +1946,7 @@ async def quantify(
             "omit the date from title. Fill year, month and day from the requested period. For a range use the end date. "
             "Set period to monthly only if the user wants a one-month reporting period, cumulative for year-to-date, "
             "or any for a snapshot or unspecified period. Leave unknown fields null and an unknown title empty. "
+            "A balance sheet is a snapshot. Write simple search phrases, never database commands. "
             "Set reuse_sources only when the user explicitly continues to use the same previous originals. "
             "Do not reuse if the request changes the document, date or subject. Do not answer the question.",
             f"Conversation:\n{conversation(payload.history)}\nPrevious originals: {', '.join(references)}\nQuestion: {question}",
@@ -1974,7 +1982,8 @@ async def quantify(
             if match
             else citation(state, RetrievedChunk(document_id=key, content=""))
         )
-        if Path(source.path).suffix.casefold() == ".pdf":
+        suffix = Path(source.path).suffix.casefold()
+        if suffix == ".pdf":
             layout = (
                 match.text
                 if match
@@ -1987,17 +1996,48 @@ async def quantify(
             )
             if values := numeric_layout(layout, f"{question}\n{plan.question}"):
                 return source, EvidenceText(source.path, values)
+        elif suffix == ".xlsx":
+            payload = await original_archive(
+                state, key, suffix=suffix, limit=PRESENTATION_ARCHIVE_LIMIT
+            )
+            if values := await asyncio.to_thread(
+                numeric_workbook, payload, f"{question}\n{plan.question}"
+            ):
+                return source, EvidenceText(source.path, values)
         hits = await record_chunks(state, key, 12)
         text = "\n".join(format_excerpt(hit.content) for hit in hits)
         return (source, EvidenceText(source.path, text[:4000])) if text else None
 
-    named: dict[str, VerifiedFile | None] = (
-        {key: None for key in previous.document_ids if key in originals}
-        if plan.reuse_sources and previous
-        else {}
-    )
+    explicit = explicit_ids(question, originals.items(), filenames_only=True)
+    named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit)
+    if (
+        not named
+        and previous
+        and (plan.reuse_sources or CALCULATION_REFERENCE.search(question))
+    ):
+        current_dates = {day for day, _, _ in mentioned_dates(question)}
+        former_dates = {day for day, _, _ in mentioned_dates(previous.question)}
+        current_years = set(YEAR.findall(question))
+        if current_dates <= former_dates and current_years <= set(
+            YEAR.findall(previous.question)
+        ):
+            named.update(
+                dict.fromkeys(key for key in previous.document_ids if key in originals)
+            )
     if not named:
-        resolved = await asyncio.gather(*(resolve(target) for target in plan.sources))
+        targets = {
+            (
+                target.title.casefold(),
+                target.year,
+                target.month,
+                target.day,
+                target.period,
+            ): target
+            for target in plan.sources
+        }
+        resolved = await asyncio.gather(
+            *(resolve(target) for target in targets.values())
+        )
         failed = [label for label, _ in resolved if label]
         if failed:
             answer = (
@@ -2047,7 +2087,8 @@ async def quantify(
             "single printed amount into amount. Check the printed reporting period, row, and column separately. "
             "Use exact totals, never substitute a similarly named subtotal or another period. "
             "List one equation per requested calculation. Inputs in an equation are one-based indices into your inputs list. "
-            "For difference use [target, baseline]; ratio uses [numerator, denominator]; share is the numerator as "
+            "Difference starts with the target and subtracts every subsequent input in order; for a roll-forward "
+            "subtract the opening balance and each accounted-for movement from closing. Ratio uses [numerator, denominator]; share is the numerator as "
             "a percent of denominator; percent_change is [new, old]; sum adds all listed inputs. Set requested precision "
             "or default to two decimals. Use descriptive equation labels without numeric results. Do not give an equation "
             "if an input is unavailable or incompatible. Explain only the specific missing inputs, if any. "

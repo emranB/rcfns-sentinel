@@ -9,18 +9,24 @@ from pydantic import BaseModel, Field
 
 from src.backend.current_sources import source_terms
 from src.backend.grounding import EvidenceText, normalized
+from src.backend.tabular import Worksheet, worksheet_tables
 
 CALCULATION_REQUEST = re.compile(
     r"\b(?:calculat\w*|comput\w*|subtract\w*|divid\w*|multiply|ratio|working capital|"
     r"variance|percentage (?:change|of|increase|decrease)|percent change|difference|"
     r"how much [^?!.]{0,45}\b(?:higher|lower|more|less|change[ds]?|increas\w*|decreas\w*)|"
-    r"add(?:s|ed)? up|tie(?:s)? out|reconcil\w*)\b",
+    r"add(?:s|ed)? up|tie(?:s)? out|reconcil(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
+CALCULATION_REFERENCE = re.compile(
+    r"\b(?:same|that|this|those)\s+(?:\w+\s+){0,2}(?:reports?|sheets?|workbooks?|files?|documents?)\b",
     re.IGNORECASE,
 )
 NUMBER = re.compile(
     r"\(?(?:-?[$\u00a3\u20ac]?|[$\u00a3\u20ac] ?-)\d[\d,]*(?:\.\d+)?%?\)?"
 )
 CELL = re.compile(r"\S.*?(?= {2,}|$)")
+CELL_REFERENCE = re.compile(r"([A-Z]{1,3})([1-9]\d*)")
 OPERATORS = {
     "sum": "+",
     "difference": "-",
@@ -87,12 +93,14 @@ class CitedAmount:
 
 # Read a single printed numeric token without changing its sign or unit.
 def amount_value(text: str) -> tuple[Decimal, str] | None:
-    if not NUMBER.fullmatch(text):
+    if len(text) > 40 or not NUMBER.fullmatch(text):
         return None
     unit = next((symbol for symbol in "$\u00a3\u20ac%" if symbol in text), "")
     number = Decimal(
         text.strip("()").replace(unit, "").replace(",", "").replace(" ", "")
     )
+    if number.adjusted() > 23:
+        return None
     return (-abs(number) if text.startswith("(") else number), unit
 
 
@@ -148,6 +156,81 @@ def numeric_layout(text: str, question: str, limit: int = 36) -> str:
     return "\n".join([*heading, *selected]) if selected else ""
 
 
+# Resolve spreadsheet column numbers independent of their letter length.
+def column_number(letters: str) -> int:
+    number = 0
+    for letter in letters:
+        number = number * 26 + ord(letter) - ord("A") + 1
+    return number
+
+
+# Read the first intact table header and any merged group immediately above it.
+def workbook_headers(sheet: Worksheet) -> dict[str, str]:
+    heading: dict[str, str] = {}
+    earlier: dict[str, str] = {}
+    for row in sheet.rows[:20]:
+        if len(row) < 2:
+            earlier.update(row)
+            continue
+        if any(amount_value(value) is not None for value in list(row.values())[1:]):
+            break
+        earlier.update(heading)
+        heading = row
+    result = {}
+    for cell, label in heading.items():
+        if not (header := CELL_REFERENCE.fullmatch(cell)):
+            continue
+        text = label
+        column = column_number(header[1])
+        for span in sheet.merges:
+            start, _, finish = span.partition(":")
+            left, right = (
+                CELL_REFERENCE.fullmatch(start),
+                CELL_REFERENCE.fullmatch(finish),
+            )
+            if left is None or right is None or start not in earlier:
+                continue
+            if int(left[2]) + 1 == int(header[2]) and column_number(
+                left[1]
+            ) <= column <= column_number(right[1]):
+                text = f"{earlier[start]} / {label}"
+                break
+        result[header[1]] = text
+    return result
+
+
+# Expose cached numeric cells with their sheet, row and column identities.
+def numeric_workbook(payload: bytes, question: str, limit: int = 36) -> str:
+    terms = source_terms(question)
+    selected: dict[str, int] = {}
+    for sheet in worksheet_tables(payload):
+        headers = workbook_headers(sheet)
+        if not headers:
+            continue
+        for row in sheet.rows:
+            if len(row) < 2:
+                continue
+            label = next(iter(row.values()))
+            for cell, text in list(row.items())[1:]:
+                if not (reference := CELL_REFERENCE.fullmatch(cell)) or not (
+                    header := headers.get(reference[1])
+                ):
+                    continue
+                if not (amount := amount_value(text)):
+                    continue
+                number, unit = amount
+                if "%" in header and not unit:
+                    number *= 100
+                    unit = "%"
+                number = round(number, 4 if unit == "%" else 2)
+                printed = CitedAmount(number, unit, 0, "").display()
+                quote = f"{label} | {header} | {sheet.name}!{cell} | {printed}"
+                selected[quote] = 4 * len(source_terms(label) & terms) + 2 * len(
+                    source_terms(header) & terms
+                )
+    return "\n".join(sorted(selected, key=selected.__getitem__, reverse=True)[:limit])
+
+
 # Accept an input only when the cited line fixes its context and numeric value.
 def cited_amount(
     fact: NumericInput, evidence: list[EvidenceText]
@@ -188,7 +271,11 @@ def calculate(equation: Equation, amounts: list[CitedAmount | None]) -> str:
         return ""
     operation = equation.operation
     units = {item.unit for item in known if item.unit}
-    if len(units) > 1 or operation not in {"sum", "product"} and len(known) != 2:
+    if (
+        len(units) > 1
+        or operation in {"ratio", "share", "percent_change"}
+        and len(known) != 2
+    ):
         return ""
     values = [item.number for item in known]
     unit = next(iter(units), "")
@@ -198,7 +285,7 @@ def calculate(equation: Equation, amounts: list[CitedAmount | None]) -> str:
         if operation in {"ratio", "share", "percent_change"} and not second:
             return ""
         if operation == "difference":
-            result = first - second
+            result = first - sum(values[1:], Decimal(0))
         elif operation == "sum":
             result = sum(values, Decimal(0))
         elif operation == "product":

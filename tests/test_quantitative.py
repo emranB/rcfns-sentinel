@@ -2,6 +2,7 @@
 
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from src.backend.grounding import EvidenceText
 from src.backend.quantitative import (
@@ -10,10 +11,29 @@ from src.backend.quantitative import (
     calculate,
     cited_amount,
     numeric_layout,
+    numeric_workbook,
 )
+from src.backend.tabular import Worksheet
 
 
 class QuantityTests(unittest.TestCase):
+    # Preserve merged worksheet headers and distinguish cached zero from a blank.
+    def test_workbook_uses_group_and_row_labels(self) -> None:
+        sheet = Worksheet(
+            "Estimate",
+            [
+                {"B4": "North", "D4": "South"},
+                {"B5": "Actual", "C5": "Budget", "D5": "Actual", "E5": "Budget"},
+                {"A6": "Labor", "B6": "0", "C6": "950.6", "E6": "600.0"},
+            ],
+            ("B4:C4", "D4:E4"),
+        )
+        with patch("src.backend.quantitative.worksheet_tables", return_value=[sheet]):
+            result = numeric_workbook(b"", "North labor actual compared with budget")
+        self.assertIn("Labor | North / Actual | Estimate!B6 | 0.00", result)
+        self.assertIn("Labor | North / Budget | Estimate!C6 | 950.60", result)
+        self.assertNotIn("Labor | South / Actual", result)
+
     # Keep the requested program separate from its own subtotal and the overall total.
     def test_layout_preserves_column_identity(self) -> None:
         headline = "Contract Spending\nAs of October 2027\n"
