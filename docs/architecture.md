@@ -8,4 +8,6 @@ Recovery indexes share the native dataset's embedding model and are searched alo
 
 Both chat modes use the same evidence checks. Explicit titles and dates are resolved before broad retrieval, and Agentic follow-ups stay within the resolved set. The app reads complete worksheet data for supported counts and computes comparisons from aligned table rows. Ollama returns claims with supporting passages, and the app validates the references before it renders an answer. Citations point to the exact original. PDF previews load on demand.
 
+For calculations, the model plans measures and operations before seeing figures. The app resolves each measure against the original report period, PDF column, or worksheet cell, then computes from the matched values. The optional `REASONING_MODEL` setting selects the local Ollama model for that planning step.
+
 Compose keeps the databases, queue, object store, and RAGFlow API on its internal network. The app publishes one loopback port and uses named volumes to retain index and account state.

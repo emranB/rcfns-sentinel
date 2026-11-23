@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from src.backend.current_sources import source_terms
+from src.backend.current_sources import MONTH_HINT, source_terms
 from src.backend.tabular import Worksheet, worksheet_tables
 
 CALCULATION_REQUEST = re.compile(
@@ -73,6 +73,10 @@ class RowChoices(BaseModel):
     rows: list[int | None] = Field(max_length=12)
 
 
+class Equations(BaseModel):
+    equations: list[Equation] = Field(max_length=5)
+
+
 @dataclass(frozen=True)
 class CitedAmount:
     number: Decimal
@@ -91,16 +95,19 @@ class CitedAmount:
         return f"{sign}{self.unit}{digits}"
 
 
-# Use the measure's distinctive terms to reject nearby fields and subtotal columns.
+# Bind requested metric and dimension words to their own cells before ranking.
 def measure_rows(
-    measure: Measure, rows: list[CitedAmount], source: int | None, titles: list[str]
+    measure: Measure,
+    rows: list[CitedAmount],
+    source: int | None,
+    titles: list[str],
+    question: str = "",
 ) -> list[int]:
     ignored = {
         "total",
         "for",
         "the",
         "of",
-        "current-period",
         "amount",
         "figure",
         "quarterly",
@@ -109,32 +116,56 @@ def measure_rows(
     }
     column = " ".join(measure.column.casefold().split())
     column_terms = source_terms(column)
-    wanted = source_terms(measure.row) - ignored - column_terms
-    if not wanted:
+    metric = re.sub(r"\byear[ -]to[ -]date\b", "", measure.row, flags=re.IGNORECASE)
+    requested = (
+        source_terms(metric) - ignored - column_terms - MONTH_HINT.keys() - {"only"}
+    )
+    if not requested:
         return []
-    candidates: list[tuple[tuple[int, int, int, int], int]] = []
-    for index, amount in enumerate(rows, 1):
-        if source is not None and source != amount.source:
+    queries = source_terms(question)
+    dimensions: dict[int, set[str]] = {}
+    parsed: list[tuple[int, CitedAmount, str, str]] = []
+    for index, item in enumerate(rows, 1):
+        if source is not None and source != item.source:
             continue
-        fields = [value.strip() for value in amount.line.strip("|").split("|")]
-        label = fields[0]
+        fields = [value.strip() for value in item.line.strip("|").split("|")]
         heading = fields[1].casefold() if len(fields) > 2 else ""
-        terms = source_terms(label) - ignored
-        if not wanted <= terms:
-            continue
+        dimensions.setdefault(item.source, set()).update(source_terms(heading))
+        parsed.append((index, item, fields[0], heading))
+
+    candidates: list[tuple[tuple[int, int, int, int, int, int], int]] = []
+    for index, amount, label, heading in parsed:
         headings = source_terms(heading)
+        qualifier = column_terms
         if (
-            column_terms
-            and not column_terms <= headings
+            qualifier == {"actual"}
+            and not {"actual", "budget"} & dimensions[amount.source]
+        ):
+            qualifier = set()
+        wanted = requested - headings
+        terms = source_terms(label) - ignored
+        if not wanted or not wanted <= terms:
+            continue
+        if (
+            qualifier
+            and not qualifier <= headings
             and not (
                 heading == "total"
-                and column_terms <= source_terms(titles[amount.source - 1])
+                and qualifier <= source_terms(titles[amount.source - 1])
             )
         ):
             continue
+        named_axis = headings - ignored - {"actual", "budget", "current", "prior"}
+        exact_context = (
+            bool(named_axis)
+            and named_axis <= queries
+            and not heading.startswith("total ")
+        )
         score = (
-            int(column == heading),
+            int(bool(column) and column == heading),
             int(wanted == terms),
+            int(exact_context),
+            int(heading == "total"),
             -len(terms - wanted),
             int(label.casefold().startswith("total ")),
         )
@@ -337,7 +368,7 @@ def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
             for value in values:
                 result *= value
         elif operation == "percent_change":
-            result = (first - second) / abs(second) * 100
+            result = (first - second) / second * 100
         else:
             result = first / second * (100 if operation == "share" else 1)
         if result.adjusted() > 36:
@@ -351,7 +382,7 @@ def calculate(equation: Equation, amounts: list[CitedAmount]) -> str:
         formula = (
             f"({formula}) x 100"
             if operation == "share"
-            else f"({formula}) / {abs(second):,f} x 100"
+            else f"({formula}) / {rendered[1]} x 100"
         )
         unit = "%"
     elif operation == "ratio":

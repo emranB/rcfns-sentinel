@@ -33,6 +33,7 @@ OLLAMA_SECONDARY_VISION_THREADS = int(os.getenv("OLLAMA_SECONDARY_VISION_THREADS
 STATE_DIR = Path(os.getenv("APP_STATE", "/state"))
 
 CHAT_MODEL = os.getenv("CHAT_MODEL") or "qwen3.5:4b"
+REASONING_MODEL = os.getenv("REASONING_MODEL") or CHAT_MODEL
 EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 PROVIDER_NAME = "Ollama"
 INSTANCE_NAME = "local"
@@ -302,10 +303,9 @@ async def prepare_models(state: RagflowSession) -> None:
     response.raise_for_status()
     tags = OllamaTags.model_validate_json(response.content)
     model_names = {model.name for model in tags.models}
-    if CHAT_MODEL not in model_names:
-        raise RuntimeError(
-            f"Install the Ollama chat model with ollama pull {CHAT_MODEL}."
-        )
+    for model in dict.fromkeys((CHAT_MODEL, REASONING_MODEL)):
+        if model not in model_names:
+            raise RuntimeError(f"Install the local model with ollama pull {model}.")
     if EMBEDDING_MODEL not in model_names:
         response = await state.client.post(
             f"{OLLAMA_URL}/api/pull",

@@ -83,6 +83,7 @@ from src.backend.pdf_recovery import normalize_pdf, pdf_text
 from src.backend.quantitative import (
     CALCULATION_REFERENCE,
     CALCULATION_REQUEST,
+    Equations,
     OperandSource,
     QuantityPlan,
     RowChoices,
@@ -100,6 +101,7 @@ from src.backend.ragflow import (
     OLLAMA_THREADS,
     OLLAMA_URL,
     POLL_INTERVAL_SECONDS,
+    REASONING_MODEL,
     STATE_DIR,
     IndexProgress,
     RagflowSession,
@@ -1186,18 +1188,19 @@ async def generate(
     *,
     output_format: dict[str, object] | None = None,
     answer_tokens: int | None = None,
+    reasoning: bool = False,
 ) -> str:
     response = await state.client.post(
         f"{OLLAMA_URL}/api/chat",
         timeout=180,
         json={
-            "model": CHAT_MODEL,
+            "model": REASONING_MODEL if reasoning else CHAT_MODEL,
             "stream": False,
             "think": False,
             "options": {
                 "temperature": 0,
                 "presence_penalty": 0,
-                "num_ctx": 8192,
+                "num_ctx": 4096 if reasoning else 8192,
                 "num_predict": answer_tokens or (384 if output_format else 768),
                 **({"num_thread": OLLAMA_THREADS} if OLLAMA_THREADS else {}),
             },
@@ -1986,8 +1989,8 @@ async def quantify(
             "For an unidentified report leave its title empty. Query is a short natural-language search phrase. "
             "Set reuse_sources only when the user wants the same originals. Do not reuse when they change a date or source. "
             "List a measure for each input, with row as the metric's likely printed label without dates or column qualifiers. "
-            "Use column for a requested class, group, actual, budget, or other column label; combine dimensions when needed "
-            "(example: 'North Actual'). Leave unspecified columns empty. Record is the one-based index in sources, or null. "
+            "Fill column only for a class, group, or column stated by the user. Otherwise it must be an empty string. "
+            "Combine explicit dimensions when needed. Record is the one-based index in sources, or null. "
             "For example working capital requires Total Current Assets and Total Current Liabilities, and only those two. "
             "Their difference is working capital; their quotient is current ratio. "
             "For each requested calculation include an equation using one-based indices into measures, with default precision 2. "
@@ -1998,19 +2001,46 @@ async def quantify(
             f"Conversation:\n{conversation(payload.history)}\nPrevious originals: {', '.join(references)}\nQuestion: {question}",
             output_format=QuantityPlan.model_json_schema(),
             answer_tokens=1050,
+            reasoning=True,
         )
         plan = QuantityPlan.model_validate_json(raw)
     except (httpx.HTTPError, ValueError, TimeoutError):
         return None
 
+    if any(
+        len(set(equation.inputs)) != len(equation.inputs)
+        or not all(1 <= row <= len(plan.measures) for row in equation.inputs)
+        for equation in plan.equations
+    ):
+        with suppress(httpx.HTTPError, ValueError, TimeoutError):
+            available = "\n".join(
+                f"{i}. {item.row} | {item.column} | record {item.record}"
+                for i, item in enumerate(plan.measures, 1)
+            )
+            result = await generate(
+                state,
+                "Choose the requested equations over the numbered inputs. Use distinct existing IDs. "
+                "Difference is target minus baseline. Percent change is (new minus old) divided by old. "
+                "Use two decimal places unless the user requests another precision.",
+                f"Question: {plan.question}\nInputs:\n{available}",
+                output_format=Equations.model_json_schema(),
+                answer_tokens=450,
+                reasoning=True,
+            )
+            plan.equations = Equations.model_validate_json(result).equations
+
     # Verify the planned period against the printed original.
     async def resolve(target: OperandSource) -> VerifiedFile | None:
-        if not target.title or target.year is None:
+        if target.year is None:
             return None
         _, original = await resolve_file(
             state,
             FileAvailability(
-                target.title, target.year, target.month, target.day, target.period
+                target.title or target.query,
+                target.year,
+                target.month,
+                target.day,
+                target.period,
             ),
         )
         return original
@@ -2037,7 +2067,8 @@ async def quantify(
     else:
         fixed = set(named)
         targets = [
-            (t.title.casefold(), t.year, t.month, t.day, t.period) for t in plan.sources
+            ((t.title or t.query).casefold(), t.year, t.month, t.day, t.period)
+            for t in plan.sources
         ]
         unique = dict(zip(targets, plan.sources, strict=True))
         results = await asyncio.gather(*(resolve(target) for target in unique.values()))
@@ -2101,6 +2132,7 @@ async def quantify(
             amounts,
             source_ids.get(record_ids.get(measure.record or 0, "")),
             titles,
+            f"{question}\n{plan.question}",
         )
         for measure in plan.measures
     ]
@@ -2126,6 +2158,7 @@ async def quantify(
                 f"Question: {plan.question}\n\n" + "\n\n".join(candidates),
                 output_format=RowChoices.model_json_schema(),
                 answer_tokens=240,
+                reasoning=True,
             )
             resolved = RowChoices.model_validate_json(result).rows
             if len(resolved) == len(chosen):

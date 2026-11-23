@@ -47,6 +47,21 @@ class QuantityTests(unittest.TestCase):
             ),
             [],
         )
+        unspecified = field.model_copy(update={"column": "Actual"})
+        self.assertEqual(
+            measure_rows(
+                unspecified, rows, 1, ["Transit Summary"], "East transportation"
+            ),
+            [2],
+        )
+        workbook = quantity_rows(
+            "Total Payroll | West / Actual | Costs!D18 | 415.00\n"
+            "Total Payroll | East / Actual | Costs!H18 | 997.00\n"
+            "Total Payroll | East / Budget | Costs!I18 | 600.00",
+            1,
+        )
+        payroll = Measure(row="East Actual Payroll", column="Actual", record=1)
+        self.assertEqual(measure_rows(payroll, workbook, 1, ["Employee Costs"]), [2])
 
     # Preserve merged worksheet headers and distinguish cached zero from a blank.
     def test_workbook_uses_group_and_row_labels(self) -> None:
