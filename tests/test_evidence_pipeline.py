@@ -39,24 +39,31 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         draft.incomplete = True
         good = CoverageReview(covered_lines=[1], missing=[])
         cases = (
-            ("List the decisions under Next Work.", good.model_dump_json(), False),
+            ("List the decisions under Next Work.", good.model_dump_json(), ""),
             (
                 "List the decisions under Next Work and give their approved cost.",
                 good.model_copy(
                     update={"missing": ["approved cost"]}
                 ).model_dump_json(),
-                True,
+                "**Could not verify**\n\n- approved cost",
             ),
             (
                 "List the decisions under Next Work.",
                 good.model_copy(update={"covered_lines": [3]}).model_dump_json(),
-                True,
+                INCOMPLETE_TEXT,
             ),
-            ("List the decisions under Next Work.", "{}", True),
+            (
+                "List the decisions under Next Work.",
+                good.model_copy(
+                    update={"missing": ["staff assignments"]}
+                ).model_dump_json(),
+                INCOMPLETE_TEXT,
+            ),
+            ("List the decisions under Next Work.", "{}", INCOMPLETE_TEXT),
         )
         async with httpx.AsyncClient() as client:
             state = RagflowSession(client)
-            for question, review, warns in cases:
+            for question, review, warning in cases:
                 with (
                     self.subTest(question=question, review=review),
                     patch.object(
@@ -68,10 +75,29 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     answer = await server.read_claims(
                         state, question, [record], [0], coverage="partial"
                     )
-                    self.assertIn(f"{decisions} [1]", answer)
-                    self.assertEqual(answer.endswith(INCOMPLETE_TEXT), warns)
+                    self.assertEqual(answer.text, f"{decisions} [1]")
+                    self.assertEqual(answer.warning(), warning)
                     self.assertEqual(generate.await_count, 2)
                     self.assertIn(question, generate.await_args_list[-1].args[2])
+
+    # Combine independent details into one warning while keeping the verified text.
+    def test_record_warning_deduplicates_missing_details(self) -> None:
+        combined = server.RecordAnswer(
+            "The pump was replaced. [1]", ("the delivery date",)
+        ).combined_with(
+            server.RecordAnswer(
+                "The outlet passed inspection. [2]",
+                ("the delivery date.", "the inspection cost"),
+            )
+        )
+        self.assertEqual(
+            combined.text,
+            "The pump was replaced. [1]\n\nThe outlet passed inspection. [2]",
+        )
+        self.assertEqual(
+            combined.warning(),
+            "**Could not verify**\n\n- the delivery date\n- the inspection cost",
+        )
 
     # A fully supported draft can be returned without a separate coverage request.
     async def test_complete_scoped_draft_needs_no_coverage_review(self) -> None:
@@ -87,7 +113,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     [0],
                     coverage="partial",
                 )
-                self.assertEqual(answer, f"{line} [1]")
+                self.assertEqual(answer, server.RecordAnswer(f"{line} [1]"))
                 generate.assert_awaited_once()
 
     # A complete draft flag cannot hide a verified gap on a specifically requested slide.
@@ -115,9 +141,11 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     [1],
                     coverage="always",
                 )
-                self.assertIn(f"{line} [2]", answer)
+                self.assertIn(f"{line} [2]", answer.text)
                 self.assertNotIn("$8,000", generate.await_args_list[-1].args[2])
-                self.assertTrue(answer.endswith(INCOMPLETE_TEXT))
+                self.assertEqual(
+                    answer.warning(), "**Could not verify**\n\n- the approved cost"
+                )
 
     # Recheck the answer after restoring a requested number from a literal passage.
     async def test_numeric_recovery_precedes_coverage_review(self) -> None:
@@ -152,8 +180,8 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 )
                 review_prompt = generate.await_args_list[-1].args[2]
                 self.assertIn(f"Line 2: > {line}", review_prompt)
-                self.assertIn(f"> {line} [1]", answer)
-                self.assertNotIn(INCOMPLETE_TEXT, answer)
+                self.assertIn(f"> {line} [1]", answer.text)
+                self.assertEqual(answer.warning(), "")
 
     # Verify that comparison facts survive an extra Agentic evidence pass.
     async def test_preserves_original_and_new_milestones_in_both_modes(self) -> None:
@@ -209,7 +237,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_multisource_answer_checks_claim_coverage_separately(self) -> None:
         question = (
             "Compare the two operations plans. What did the revised plan add to the forklift "
-            "inspection goals? How long does the onboarding seminar last?"
+            "inspection goals? How long does the onboarding seminar last and where is it held?"
         )
         input_text = [
             "Inspect 40 forklift engines before June.",
@@ -233,9 +261,10 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             sources = [server.citation(state, item.chunk) for item in evidence]
-            stub = (
+            stub = server.RecordAnswer(
                 "The revised forklift inspection goal is 60 by October. [1] [2]\n"
-                "The onboarding seminar lasts 16 hours. [3]"
+                "The onboarding seminar lasts 16 hours. [3]",
+                missing=("the location of the onboarding seminar",),
             )
             with patch.object(
                 server, "read_claims", AsyncMock(return_value=stub)
@@ -244,9 +273,10 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     state, question, evidence, sources, {}
                 )
                 model.assert_awaited_once()
-            self.assertIn("40 forklift engines before June", answer)
-            self.assertIn("60 by October", answer)
-            self.assertIn("16 hours. [3]", answer)
+            self.assertIn("40 forklift engines before June", answer.text)
+            self.assertIn("60 by October", answer.text)
+            self.assertIn("16 hours. [3]", answer.text)
+            self.assertIn("the location of the onboarding seminar", answer.warning())
 
     # A scoped comparison keeps the record opening when search ranks later text first.
     async def test_period_search_preserves_openings_and_ranked_chunks(self) -> None:
