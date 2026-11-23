@@ -92,6 +92,7 @@ from src.backend.quantitative import (
     numeric_layout,
     numeric_workbook,
     quantity_rows,
+    requested_equations,
     requested_operation,
 )
 from src.backend.ragflow import (
@@ -2013,6 +2014,8 @@ async def quantify(
     except (httpx.HTTPError, ValueError, TimeoutError):
         return None
 
+    plan.equations = requested_equations(question, plan)
+
     compound_subtraction = len(plan.measures) > 2 and bool(
         re.search(r"\b(?:minus|less)\b[^?!.]{1,90}\band\b", question, re.IGNORECASE)
     )
@@ -2229,8 +2232,6 @@ async def quantify(
             for index in equation.inputs
             if 1 <= index <= len(chosen) and (row := chosen[index - 1]) is not None
         ]
-        if operation and len(plan.equations) == 1:
-            equation = equation.model_copy(update={"operation": operation})
         if len(bound) == len(equation.inputs) and (
             result := calculate(equation.model_copy(update={"inputs": bound}), amounts)
         ):

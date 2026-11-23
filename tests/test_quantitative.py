@@ -7,17 +7,50 @@ from unittest.mock import patch
 from src.backend.quantitative import (
     Equation,
     Measure,
+    QuantityPlan,
     calculate,
     measure_rows,
     numeric_layout,
     numeric_workbook,
     quantity_rows,
+    requested_equations,
     requested_operation,
 )
 from src.backend.tabular import Worksheet
 
 
 class QuantityTests(unittest.TestCase):
+    # A malformed model equation cannot override the requested budget variance or reconciliation.
+    def test_plan_cannot_change_explicit_arithmetic(self) -> None:
+        wrong = Equation(label="Combined", operation="sum", inputs=[1, 2], precision=2)
+        plan = QuantityPlan(
+            question="Calculate payroll variance",
+            reuse_sources=False,
+            sources=[],
+            measures=[
+                Measure(row="Payroll Budget", column="", record=None),
+                Measure(row="Payroll Actual", column="", record=None),
+            ],
+            equations=[wrong],
+        )
+        chosen = requested_equations(
+            "Give payroll above budget in dollars and as a percentage of budget.", plan
+        )
+        self.assertEqual(
+            [(item.operation, item.inputs) for item in chosen],
+            [("difference", [2, 1]), ("percent_change", [2, 1])],
+        )
+        plan.measures = [
+            Measure(row=label, column="", record=None)
+            for label in ("Costs", "Revenue", "Adjustments")
+        ]
+        (remaining,) = requested_equations(
+            "Calculate revenue minus costs and adjustments.", plan
+        )
+        self.assertEqual(
+            (remaining.operation, remaining.inputs), ("remainder", [2, 1, 3])
+        )
+
     # Select the exact field and column; an unrelated amount cannot fill a missing operand.
     def test_measure_identity(self) -> None:
         rows = quantity_rows(

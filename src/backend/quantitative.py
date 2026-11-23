@@ -58,6 +58,12 @@ def requested_operation(question: str) -> str:
         return "share"
     if re.search(r"\b(?:divide|ratio)\b", question, re.IGNORECASE):
         return "ratio"
+    if re.search(
+        r"\b(?:variance|difference|how much (?:more|less|higher|lower)|subtract)\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return "difference"
     return ""
 
 
@@ -99,6 +105,78 @@ class RowChoices(BaseModel):
 
 class Equations(BaseModel):
     equations: list[Equation] = Field(max_length=5)
+
+
+# Validate model-selected arithmetic against explicit comparison language and dimensions.
+def requested_equations(question: str, plan: QuantityPlan) -> list[Equation]:
+    if len(plan.measures) == 2:
+        roles = [
+            source_terms(f"{measure.row} {measure.column}") & {"actual", "budget"}
+            for measure in plan.measures
+        ]
+        if {frozenset(role) for role in roles} == {
+            frozenset({"actual"}),
+            frozenset({"budget"}),
+        }:
+            inputs = [roles.index({"actual"}) + 1, roles.index({"budget"}) + 1]
+            decimal = Equation(
+                label="Actual minus budget",
+                operation="difference",
+                inputs=inputs,
+                precision=2,
+            )
+            if re.search(
+                r"\b(?:above|below|under|over|variance|minus|difference)\b",
+                question,
+                re.IGNORECASE,
+            ):
+                if re.search(r"\bpercent(?:age)?\b", question, re.IGNORECASE):
+                    percent = Equation(
+                        label="Variance as a percentage of budget",
+                        operation="percent_change",
+                        inputs=inputs,
+                        precision=2,
+                    )
+                    return (
+                        [decimal, percent]
+                        if re.search(
+                            r"\b(?:dollars?|amount|absolute)\b", question, re.IGNORECASE
+                        )
+                        else [percent]
+                    )
+                return [decimal]
+
+    if len(plan.measures) >= 3 and re.search(
+        r"\bminus\b[^?!.]{1,90}\band\b", question, re.IGNORECASE
+    ):
+        lowered = question.casefold()
+        positions = [
+            (lowered.find(measure.row.casefold()), index)
+            for index, measure in enumerate(plan.measures, 1)
+        ]
+        if all(position >= 0 for position, _ in positions) and len(
+            {position for position, _ in positions}
+        ) == len(positions):
+            return [
+                Equation(
+                    label="Remaining difference",
+                    operation="remainder",
+                    inputs=[index for _, index in sorted(positions)],
+                    precision=2,
+                )
+            ]
+
+    if (
+        len(plan.measures) == 2
+        and (operation := requested_operation(question))
+        and (
+            equation := next(
+                (item for item in plan.equations if len(item.inputs) == 2), None
+            )
+        )
+    ):
+        return [equation.model_copy(update={"operation": operation})]
+    return plan.equations
 
 
 @dataclass(frozen=True)
