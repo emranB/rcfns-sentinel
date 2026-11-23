@@ -5,7 +5,9 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
+from html import unescape
 from pathlib import PurePosixPath
+from typing import Literal
 
 from src.backend.current_sources import (
     TITLE_BOUNDARY,
@@ -90,6 +92,7 @@ class FileAvailability:
     year: int
     month: int | None = None
     day: int | None = None
+    period: Literal["any", "monthly", "cumulative"] = "any"
 
 
 # Identify requests for a document itself and keep its period separate from its title.
@@ -175,7 +178,7 @@ def exact_record_total(question: str, text: str) -> str:
 
 # Split filename identifiers at word, case and digit boundaries.
 def title_tokens(value: str) -> list[str]:
-    split = TITLE_BOUNDARY.sub(" ", value)
+    split = TITLE_BOUNDARY.sub(" ", unescape(value))
     split = re.sub(r"(?<=\d)(?=[^\W\d_])|(?<=[^\W\d_])(?=\d)", " ", split)
     return title_words(split)
 
