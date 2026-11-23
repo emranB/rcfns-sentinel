@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Literal
 
@@ -37,6 +37,10 @@ SNAPSHOT_METRIC = re.compile(r"\b(?:working capital|current ratio)\b", re.IGNORE
 FROM_FIRST_TO_LAST = re.compile(
     r"\b(?:from|between) (?:the )?(?:first|earliest|oldest)\b[^?.]{0,60}"
     r"\b(?:last|latest|most recent)\b",
+    re.IGNORECASE,
+)
+NESTED_PERIOD_SUBTRACTION = re.compile(
+    r"\b(?:subtract\w*|minus)\b[^?]{0,160}\b(?:from|year.to.date|ytd|cumulative)\b",
     re.IGNORECASE,
 )
 RECONCILE_SUM = re.compile(
@@ -81,7 +85,7 @@ def requested_operation(question: str) -> Literal["share", "ratio", "difference"
     ):
         return ""  # A request can ask for both the amount and percent change.
     if re.search(
-        r"\b(?:percentage|percent|share|fraction|proportion) of\b",
+        r"\b(?:percentage|percent|share|fraction|proportion) (?:of|for (?:the|that) same)\b",
         question,
         re.IGNORECASE,
     ) and not re.search(
@@ -196,6 +200,54 @@ def snapshot_calculation(
                 precision=2,
             )
         )
+    return measures, equations
+
+
+# Derive an earlier period from matching rows in a cumulative and final-month report.
+def nested_period_calculation(
+    question: str, plan: QuantityPlan, start: date, month_start: date
+) -> tuple[list[Measure], list[Equation]] | None:
+    if not NESTED_PERIOD_SUBTRACTION.search(question) or start >= month_start:
+        return None
+    question_terms = source_terms(question)
+    metrics: dict[str, Measure] = {}
+    for field in plan.measures:
+        normalized = re.sub(
+            r"\b(?:year[ -]to[ -]date|ytd|monthly|cumulative|reported)\b",
+            "",
+            field.row,
+            flags=re.IGNORECASE,
+        )
+        terms = (
+            source_terms(normalized)
+            - MONTH_HINT.keys()
+            - {"total", "for", "or", "only"}
+        )
+        label = metric_phrase(normalized)
+        if label in NET_RESULT:
+            if {"profit", "loss", "income"} & question_terms:
+                metrics["profit"] = field.model_copy(
+                    update={"row": "Net Profit or Loss"}
+                )
+        elif terms and terms <= question_terms:
+            metrics[label.removeprefix("total ")] = field
+    if not 1 <= len(metrics) <= 4:
+        return None
+    measures = [
+        field.model_copy(update={"record": record})
+        for field in metrics.values()
+        for record in (1, 2)
+    ]
+    end = month_start - timedelta(days=1)
+    equations = [
+        Equation(
+            label=f"{field.row} from {start:%Y-%m-%d} through {end:%Y-%m-%d}",
+            operation="difference",
+            inputs=[index * 2 + 2, index * 2 + 1],
+            precision=2,
+        )
+        for index, field in enumerate(metrics.values())
+    ]
     return measures, equations
 
 
@@ -461,13 +513,22 @@ def measure_rows(
         terms = source_terms(label) - ignored
         if net_result and metric_phrase(label) in NET_RESULT:
             terms = wanted
-        compatible_total = (
+        compatible_expense = (
             "expense" in wanted
             and bool(terms)
             and (wanted - {"expense"} == terms)
-            and label.casefold().startswith("total ")
+            and (
+                label.casefold().startswith("total ")
+                or bool(
+                    re.search(
+                        r"\bprofit[\s&/]*(?:and)?[\s&/]*loss\b|income statement",
+                        titles[amount.source - 1],
+                        re.IGNORECASE,
+                    )
+                )
+            )
         )
-        if not wanted or (not wanted <= terms and not compatible_total):
+        if not wanted or (not wanted <= terms and not compatible_expense):
             continue
         if (
             qualifier

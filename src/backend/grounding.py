@@ -275,6 +275,13 @@ TIME_COMMITMENT = re.compile(
     r"(?:annual |weekly |monthly )?time\b",
     re.IGNORECASE,
 )
+TIME_EXPECTATIONS = re.compile(
+    r"\btime (?:expectations?|commitments?)\b", re.IGNORECASE
+)
+LABELED_ANNUAL_HOURS = re.compile(
+    r"^[^:]{2,70}:\s*[^:]{0,30}\b\d+(?:\s*[-\u2013]\s*\d+)?\s+hours?\s+(?:per|a) year\b",
+    re.IGNORECASE,
+)
 PERMISSION_REQUEST = re.compile(
     r"\b(?:can|could|may|authorized to|allowed to)\b[^?]{0,85}?"
     r"\b(?:approve|authoriz\w*|sign|enter into|issue)\s+(?P<object>[^?.,]+)",
@@ -842,6 +849,10 @@ def field_evidence(question: str, text: str) -> str | None:
             ):
                 heading_matches.append(line)
         return "\n".join(heading_matches or exact)
+    if TIME_EXPECTATIONS.search(question):
+        return "\n".join(
+            dict.fromkeys(line for line in lines if LABELED_ANNUAL_HOURS.search(line))
+        )
     if relative := RELATIVE_DELAY.search(question):
         trigger = source_terms(relative["event"])
         return "\n".join(

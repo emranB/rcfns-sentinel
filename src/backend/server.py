@@ -43,6 +43,7 @@ from src.backend.grounding import (
     INCOMPLETE_TEXT,
     PERMISSION_REQUEST,
     THRESHOLD_REQUEST,
+    TIME_EXPECTATIONS,
     ClaimAnswer,
     CoverageReview,
     EvidenceText,
@@ -98,6 +99,7 @@ from src.backend.quantitative import (
     RowChoices,
     evaluate_equation,
     measure_rows,
+    nested_period_calculation,
     numeric_layout,
     numeric_workbook,
     period_calculation,
@@ -417,8 +419,19 @@ RECORD_RECALL_NOISE = frozenset(
 FILE_DATE_COMPARISON = re.compile(
     r"\b(?:file\s*name|title)\b.*\b(?:printed|heading|reporting|as of)\b", re.IGNORECASE
 )
+MATCH_PRINTED_PROFIT = re.compile(
+    r"\bmatch(?:es)? (?:the )?reported profit\b", re.IGNORECASE
+)
 REPORTED_PROFIT_COMPARISON = re.compile(
     r"\bprofit for the year\b.*\bmatch\b.*\b(?:profit|loss)\b", re.IGNORECASE
+)
+FIELD_COMPARISON = re.compile(
+    r"(?:^|[,;])\s*compare\s+(?P<first>[^.!?]+?)\s+(?:with|against|versus)\s+(?P<second>[^.!?]+)",
+    re.IGNORECASE,
+)
+SOURCE_INSTRUCTION = re.compile(
+    r"^(?:now\s+)?(?:use|switch to|look at|refer to|according to)\s+(?:the\s+)?(?P<source>[^?.!]+)[.?!]",
+    re.IGNORECASE,
 )
 RECORD_RECALL_END = re.compile(
     r"[,;:?!]|\s+(?:we (?:started|used|opened|looked)|what|who|how|give|calculat\w*|compare)\b",
@@ -1404,6 +1417,14 @@ def subject_aliases(name: str, originals: Iterable[tuple[str, str]]) -> list[str
 async def shared_original(
     state: RagflowSession, question: str, evidence: list[Excerpt]
 ) -> str:
+    if anchor := SOURCE_INSTRUCTION.match(question):
+        with suppress(httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+            async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                additional = [
+                    Excerpt(hit, format_excerpt(hit.content)[:2600])
+                    for hit in await retrieve(state, anchor["source"], 18)
+                ]
+                evidence = [*evidence, *additional]
     if not evidence:
         return ""
     labels = dict(indexed_originals(state))
@@ -2260,6 +2281,23 @@ async def resolve_file(
         return None
 
     ranked = sorted(candidates, key=priority)[: 3 * MAX_EXPLICIT_ORIGINALS]
+    if requested.day is not None:
+        # An exact date gives all verified matches the same date score.
+        immediate = await asyncio.gather(*(verify(key) for key, _ in ranked[:4]))
+        for found in immediate:
+            if found is not None and not auxiliary(found.source.path):
+                return True, found
+        preferred = [
+            found
+            for found in (
+                *immediate,
+                *await asyncio.gather(*(verify(key) for key, _ in ranked[4:])),
+            )
+            if found is not None
+        ]
+        return True, max(
+            preferred, key=lambda match: not auxiliary(match.source.path), default=None
+        )
     matches = [
         match
         for match in await asyncio.gather(*(verify(key) for key, _ in ranked))
@@ -2350,9 +2388,7 @@ def verified_profit_reply(
     question: str, match: VerifiedFile, mode: Literal["standard", "agentic"]
 ) -> ChatResponse | None:
     terms_asked = source_terms(question)
-    report_comparison = bool(
-        re.search(r"\bmatch(?:es)? (?:the )?reported profit\b", question, re.IGNORECASE)
-    )
+    report_comparison = bool(MATCH_PRINTED_PROFIT.search(question))
     if (
         not (CHECK_REQUEST.search(question) or report_comparison)
         or "profit" not in terms_asked
@@ -2458,6 +2494,16 @@ async def quantify(
     archive = source_history(payload)
     previous = archive[-1] if archive else None
     originals = dict(indexed_originals(state))
+    explicit = explicit_ids(question, originals.items(), filenames_only=True)
+    checked_original = None
+    if len(explicit) == 1 and (
+        CHECK_REQUEST.search(question) or MATCH_PRINTED_PROFIT.search(question)
+    ):
+        checked_original = await retained_file(state, explicit[0])
+        if checked_original and (
+            reply := verified_profit_reply(question, checked_original, payload.mode)
+        ):
+            return remember_evidence(reply, question)
     recalled = historical_original_ids(question, archive, originals)
     period_reference = PRIOR_CALCULATION_PERIOD.search(question)
     if period_reference and not recalled and previous is not None:
@@ -2573,12 +2619,9 @@ async def quantify(
         )
         return original
 
-    explicit = explicit_ids(question, originals.items(), filenames_only=True)
     named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit or recalled)
-    if len(explicit) == 1 and (original := await retained_file(state, explicit[0])):
-        named[original.document_id] = original
-        if reply := verified_profit_reply(question, original, payload.mode):
-            return remember_evidence(reply, question)
+    if checked_original is not None:
+        named[checked_original.document_id] = checked_original
     explicit_dates = {day for day, _, _ in mentioned_dates(question)}
     if (
         not named
@@ -2684,8 +2727,32 @@ async def quantify(
             )
 
     record_ids: dict[int, str] = {}
-    if 2 <= len(named) <= 5 and (
-        len(set(dates.values())) == 1 or CALCULATION_REFERENCE.search(question)
+    if len(named) == 2:
+        report_ranges = sorted(
+            (start, end, key)
+            for key, match in named.items()
+            if match is not None
+            for start, end in (verified_period(match),)
+            if start is not None and end is not None
+        )
+        if len(report_ranges) == 2:
+            start, end, cumulative_id = report_ranges[0]
+            month_start, month_end, monthly_id = report_ranges[1]
+            if (
+                end == month_end
+                and (month_start.year, month_start.month) == (end.year, end.month)
+                and (
+                    nested := nested_period_calculation(
+                        question, plan, start, month_start
+                    )
+                )
+            ):
+                plan.measures, plan.equations = nested
+                record_ids = {1: monthly_id, 2: cumulative_id}
+    if (
+        not record_ids
+        and 2 <= len(named) <= 5
+        and (len(set(dates.values())) == 1 or CALCULATION_REFERENCE.search(question))
     ):
         previously_verified = await asyncio.gather(
             *(
@@ -3724,6 +3791,10 @@ async def answer_parts(
     baseline: int | None = None,
 ) -> RecordAnswer:
     parts = requested_parts(scoped)
+    if contrast := FIELD_COMPARISON.search(scoped):
+        fields = [contrast["first"], contrast["second"]]
+        if all(field_evidence(field, "") is not None for field in fields):
+            parts = fields
     by_source: dict[str, list[int]] = {}
     for index, source in enumerate(sources):
         by_source.setdefault(source.url, []).append(index)
@@ -3995,6 +4066,12 @@ async def answer_parts(
                     chosen[index] = EvidenceText(excerpts[index].label, value)
                 if len(grounded) == 1:
                     index, value = grounded[0]
+                    if TIME_EXPECTATIONS.search(part):
+                        return RecordAnswer(
+                            "\n\n".join(
+                                f"> {line} [{index + 1}]" for line in value.splitlines()
+                            )
+                        )
                     if len(value.splitlines()) <= 2:
                         return RecordAnswer(
                             f"> {' '.join(value.splitlines())} [{index + 1}]"

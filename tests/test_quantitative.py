@@ -12,6 +12,7 @@ from src.backend.quantitative import (
     calculate,
     evaluate_equation,
     measure_rows,
+    nested_period_calculation,
     numeric_layout,
     numeric_workbook,
     period_calculation,
@@ -72,6 +73,37 @@ class QuantityTests(unittest.TestCase):
         measure = Measure(row="Reported Net Profit or Loss", column="", record=1)
         self.assertEqual(measure_rows(measure, rows, 1, ["Statement"]), [2])
         self.assertEqual(rows[1].number, Decimal("-40.13"))
+
+    # Pair like measures between overlapping periods, independent of planner equation labels.
+    def test_cumulative_subtraction_preserves_each_expense(self) -> None:
+        question = "What are the postage expense and storage expense? Subtract the month from the cumulative report."
+        plan = QuantityPlan(
+            question=question,
+            reuse_sources=True,
+            sources=[],
+            measures=[
+                Measure(row="Postage Expense", column="", record=2),
+                Measure(row="Storage Expense", column="", record=1),
+            ],
+            equations=[],
+        )
+        result = nested_period_calculation(
+            question, plan, date(2015, 1, 1), date(2015, 3, 1)
+        )
+        assert result is not None
+        fields, equations = result
+        self.assertEqual(
+            [(field.row, field.record) for field in fields],
+            [
+                ("Postage Expense", 1),
+                ("Postage Expense", 2),
+                ("Storage Expense", 1),
+                ("Storage Expense", 2),
+            ],
+        )
+        self.assertEqual([item.inputs for item in equations], [[2, 1], [4, 3]])
+        rows = quantity_rows("Postage | $20.05\nStorage | $59.25", 1)
+        self.assertEqual(measure_rows(fields[2], rows, 1, ["ProfitandLoss March"]), [2])
 
     # A model that finds one period cannot collapse a comparison across two periods.
     def test_period_change_expands_metrics_over_verified_dates(self) -> None:
