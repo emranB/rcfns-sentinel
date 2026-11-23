@@ -4,6 +4,7 @@ import unittest
 
 from src.backend.roll_call import (
     RollCallCount,
+    dated_count_scope,
     roll_call_count,
     roster_aliases,
     roster_group,
@@ -21,6 +22,23 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Resolve short headcount questions without treating attendance as membership.
+    def test_dated_counts_identify_group_and_year(self) -> None:
+        self.assertEqual(
+            dated_count_scope("How many council members in 2024?"), ("council", 2024)
+        )
+        self.assertEqual(
+            dated_count_scope("How many directors in 2023?"), ("board", 2023)
+        )
+        self.assertEqual(
+            dated_count_scope("How many trustees were on the library council in 2022?"),
+            ("library council", 2022),
+        )
+        self.assertIsNone(
+            dated_count_scope("How many council members were present in 2024?")
+        )
+        self.assertIsNone(dated_count_scope("How many directors in 2023 and 2024?"))
+
     # Accept a single historical period and a misspelled membership role.
     def test_roster_group_accepts_one_year_and_a_misspelled_role(self) -> None:
         self.assertEqual(roster_group("List all council memeberrs for 2024"), "council")
@@ -61,6 +79,15 @@ class RollCallTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.total, 5)
+
+    # Count directors whose names include an explicit role in the roll call.
+    def test_counts_members_with_role_labels(self) -> None:
+        result = roll_call_count(
+            QUESTION,
+            "Present: Mei Tan (Chair), Priya Patel (Trustee)\nRegrets: Noor Khan\nStaff: Jordan Gray",
+            source=SOURCE,
+        )
+        self.assertEqual(result, RollCallCount(present=2, absent=1))
 
     # Allow an explicit empty absence list when both labels specify members.
     def test_counts_distinct_members_with_explicit_membership_labels(self) -> None:

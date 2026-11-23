@@ -15,6 +15,13 @@ QUESTION = re.compile(
     r"(?: currently| today| right now)?[?.]?",
     re.IGNORECASE,
 )
+DATED_COUNT = re.compile(
+    rf"how many (?:(?P<group>{GROUP}) )?(?P<role>members|directors|trustees)"
+    rf"(?:(?: are| were) (?:on|in) (?:the |our )?(?P<where>{GROUP})"
+    r"| (?:(?:do|did) we have|are there|were there))?"
+    r" (?:in|for|during) (?P<year>(?:19|20)\d{2})[?.]?",
+    re.IGNORECASE,
+)
 ATTENDANCE_COUNT = re.compile(
     rf"\bhow many (?P<group>{GROUP}) (?:members|directors|trustees)\b", re.IGNORECASE
 )
@@ -105,6 +112,19 @@ class RollCallCount:
         return self.present + self.absent
 
 
+# Recognize concise year-scoped totals without capturing questions about attendance.
+def dated_count_scope(question: str) -> tuple[str, int] | None:
+    match = DATED_COUNT.fullmatch(" ".join(question.casefold().split()))
+    if match is None or (match["group"] and match["where"]):
+        return None
+    group = match["group"] or match["where"]
+    if not group and match["role"] == "directors":
+        group = "board"
+    if not group or GROUP_EXCLUSIONS.intersection(re.findall(WORD, group)):
+        return None
+    return group, int(match["year"])
+
+
 # Accept only a simple membership count whose group appears in the source path.
 def membership_group(question: str, source: str) -> set[str]:
     normalized = " ".join(question.casefold().split())
@@ -137,6 +157,10 @@ def listed_names(value: str) -> set[str] | None:
     entries: set[str] = set()
     for part in re.split(r"[,;]", normalize("NFKC", value)):
         name = " ".join(part.split())
+        if suffix := ROLE_SUFFIX.search(name):
+            role = (suffix[1] or suffix[2]).strip().casefold().removeprefix("in the ")
+            if MEMBER_ROLE.fullmatch(role.removeprefix("vice-").removeprefix("vice ")):
+                name = name[: suffix.start()].rstrip()
         if not NAME.fullmatch(name) or any(
             word.casefold() in NAME_EXCLUSIONS
             or (not word[0].isupper() and word.casefold() not in NAME_PARTICLES)

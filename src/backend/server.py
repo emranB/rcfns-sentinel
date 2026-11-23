@@ -105,6 +105,7 @@ from src.backend.record_lookup import (
 from src.backend.roll_call import (
     attendance_names,
     attendance_sections,
+    dated_count_scope,
     roll_call_count,
     roster_aliases,
     roster_group,
@@ -1364,6 +1365,45 @@ async def record_opening(
     return next(iter(await record_chunks(state, document_id, 1)), None)
 
 
+# Count the latest complete roll call for a single requested group and year.
+async def dated_membership(
+    state: RagflowSession,
+    group: str,
+    year: int,
+    mode: Literal["standard", "agentic"],
+) -> ChatResponse | None:
+    originals = dict(indexed_originals(state))
+    periods = dated_document_ids(
+        f"{group} meeting minutes in {year}", originals.items()
+    )
+    question = f"How many {group} members do we have?"
+    with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            for document_id in reversed(periods.get(year, [])):
+                if (opening := await record_opening(state, document_id)) is None:
+                    continue
+                source = citation(state, opening)
+                day = filename_date(Path(source.path).stem)
+                if day is None or day.year != year:
+                    continue
+                text = format_excerpt(opening.content)
+                if Path(source.path).suffix.casefold() == ".docx":
+                    archive = await word_archive(state, document_id)
+                    text = await asyncio.to_thread(word_body, archive) or text
+                count = roll_call_count(question, text, source=source.path)
+                if count is not None:
+                    return ChatResponse(
+                        answer=(
+                            f"The latest complete {group} roll call I found for {year}, "
+                            f"dated {day:%B} {day.day}, records **{count.total} members** "
+                            f"({count.present} present and {count.absent} absent) [1]."
+                        ),
+                        sources=[source],
+                        mode_used=mode,
+                    )
+    return None
+
+
 # Resolve file inventory entries before searching similarly named documents.
 def inventory_answer(question: str, library: Library | None) -> str:
     if library is None:
@@ -2477,11 +2517,13 @@ async def respond_to_question(
     if inventory:
         return ChatResponse(answer=inventory, sources=[], mode_used="standard")
     years = requested_years(scoped)
+    count_scope = dated_count_scope(scoped)
     if (
         years
         and min(years) > datetime.now(UTC).year
         and (
-            roster_group(scoped)
+            count_scope
+            or roster_group(scoped)
             or re.search(r"\bonly evidence\b", scoped, re.IGNORECASE)
         )
     ):
@@ -2518,6 +2560,10 @@ async def respond_to_question(
             record_question = scoped
     if records.requested:
         return await answer_records(state, record_question, payload, records)
+    if count_scope and (
+        membership := await dated_membership(state, *count_scope, payload.mode)
+    ):
+        return membership
     recent_hits = await retrieve_recent(state, scoped)
     membership = documented_membership(state, question, recent_hits)
     if membership is not None:
