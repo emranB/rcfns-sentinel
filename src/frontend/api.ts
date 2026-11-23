@@ -5,12 +5,15 @@ interface RollCallScope {
   group: string;
   year: number;
   members?: 'all' | 'present' | 'absent';
+  output?: 'count' | 'names';
+  directory?: boolean;
 }
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   roll_call?: RollCallScope;
+  period_subject?: string;
 }
 
 export interface CitationRegion {
@@ -45,6 +48,7 @@ export interface ChatResponse {
   sources: Source[];
   mode: AnswerMode;
   rollCall?: RollCallScope;
+  periodSubject?: string;
 }
 
 export const connecting: IndexStatus = {
@@ -65,7 +69,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function readRollCall(value: unknown): RollCallScope | undefined {
   if (!isObject(value)) return undefined;
-  const { document_id, group, year, members } = value;
+  const { document_id, group, year, members, output, directory } = value;
   if (typeof document_id !== 'string' || typeof group !== 'string' || typeof year !== 'number') {
     return undefined;
   }
@@ -74,6 +78,8 @@ function readRollCall(value: unknown): RollCallScope | undefined {
     group,
     year,
     members: members === 'present' || members === 'absent' ? members : 'all',
+    output: output === 'names' ? 'names' : 'count',
+    directory: directory === true,
   };
 }
 
@@ -154,5 +160,6 @@ export async function askQuestion(
     sources: Array.isArray(data.sources) ? data.sources.map(readSource) : [],
     mode: data.mode_used === 'agentic' ? 'agentic' : 'standard',
     rollCall: readRollCall(data.roll_call),
+    periodSubject: typeof data.period_subject === 'string' ? data.period_subject : undefined,
   };
 }

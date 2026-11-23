@@ -82,14 +82,14 @@ PRESENT_LABEL = re.compile(
     re.IGNORECASE,
 )
 ROSTER_QUESTION = re.compile(
-    rf"(?:please )?(?:name(?: and list)?|list) (?:all |every )?(?:the )?(?P<group>{GROUP}) "
+    rf"(?:please )?(?:name(?: and list)?|list|show|who (?:are|were)) (?:me )?(?:all |every )?(?:the |our )?(?:(?P<group>{GROUP}) )?"
     rf"(?P<role>{WORD}) (?:in |for |during )?(?:19|20)\d{{2}}"
     r"(?: (?:vs\.?|versus|and) (?:19|20)\d{2})?[?.]?",
     re.IGNORECASE,
 )
 ROSTER_PARAPHRASE = re.compile(
     rf"(?:who|which (?:people|members|individuals|directors|trustees)) "
-    rf"(?:served|was|were|sat) (?:on|in) (?:the |our )?(?P<group>{GROUP}) "
+    rf"(?:served|is|are|was|were|sat) (?:on|in) (?:the |our )?(?P<group>{GROUP}) "
     r"(?:in|for|during) (?:19|20)\d{2}[?.]?",
     re.IGNORECASE,
 )
@@ -97,6 +97,17 @@ ATTENDANCE_SECTION = re.compile(
     r"^(present|attendees|regrets(?:/absent)?|absent|apologies|staff|guests?|observers|visitors)"
     r"(?:\s*:\s*(.*))?$",
     re.IGNORECASE,
+)
+DIRECTORY_TITLE = re.compile(
+    r"\b(?:contact (?:list|directory)|roster|(?:membership|member) (?:list|directory|register))\b",
+    re.IGNORECASE,
+)
+DIRECTORY_BOUNDARY = re.compile(
+    r"^(?:(?:board|committee|council|administrative) )?(?:resources?|support|staff|guests?|advisors?|observers?)\s*:?$",
+    re.IGNORECASE,
+)
+MEMBER_PREFIX = re.compile(
+    r"^(?:(?:in the |board |committee |council |vice[- ]|past )+)", re.IGNORECASE
 )
 MEMBER_ROLE = re.compile(
     r"\b(?:chair\w*|director|member|officer|secretary|treasurer|trustee)\b",
@@ -183,14 +194,22 @@ def membership_group(question: str, source: str) -> str:
 
 
 # Parse plainly delimited names and normalize harmless differences before counting.
-def listed_names(value: str) -> dict[str, str] | None:
+def listed_names(value: str, *, roles_required: bool = False) -> dict[str, str] | None:
     entries: dict[str, str] = {}
-    for part in re.split(r"[,;]", normalize("NFKC", value)):
+    for part in re.split(r"[,;](?![^()]*\))|\s+and\s+", normalize("NFKC", value)):
         name = " ".join(part.split())
+        if not name:
+            continue
         if suffix := ROLE_SUFFIX.search(name):
-            role = (suffix[1] or suffix[2]).strip().casefold().removeprefix("in the ")
-            if MEMBER_ROLE.fullmatch(role.removeprefix("vice-").removeprefix("vice ")):
+            role = (suffix[1] or suffix[2]).strip().casefold()
+            if MEMBER_ROLE.fullmatch(MEMBER_PREFIX.sub("", role)):
                 name = name[: suffix.start()].rstrip()
+            elif roles_required and OTHER_ROLE.search(role):
+                continue
+            else:
+                return None
+        elif roles_required:
+            return None
         if not NAME.fullmatch(name) or any(
             word.casefold() in NAME_EXCLUSIONS
             or (not word[0].isupper() and word.casefold() not in NAME_PARTICLES)
@@ -206,6 +225,28 @@ def listed_names(value: str) -> dict[str, str] | None:
             name,
         )
     return entries
+
+
+# Read role-labeled attendance, including wrapped lines and separate headings.
+def role_labeled_roll_call(excerpt: str, group: str) -> RollCall | None:
+    sections = attendance_sections(excerpt)
+    present = [
+        value for key, value in sections.items() if key in (PRESENT, "attendees")
+    ]
+    absent = [
+        value for key, value in sections.items() if key in ABSENT | {"regrets/absent"}
+    ]
+    if len(present) != 1 or len(absent) != 1:
+        return None
+    attending = listed_names(present[0], roles_required=True)
+    missing = (
+        {}
+        if absent[0].casefold() in NO_ABSENCES
+        else listed_names(absent[0], roles_required=True)
+    )
+    if attending and missing is not None and not (attending.keys() & missing.keys()):
+        return RollCall(group, tuple(attending.values()), tuple(missing.values()))
+    return None
 
 
 # Read a single adjacent roll call whose labels distinguish members from visitors.
@@ -235,7 +276,7 @@ def parse_roll_call(question: str, excerpt: str, *, source: str) -> RollCall | N
         sections[key] = (index, value.strip(), bool(words & ROLES))
 
     if sections.keys() != {PRESENT, "absent"}:
-        return None
+        return role_labeled_roll_call(excerpt, group)
     present_line, present_text, present_is_members = sections[PRESENT]
     absent_line, absent_text, absent_is_members = sections["absent"]
     first, last = sorted((present_line, absent_line))
@@ -244,7 +285,7 @@ def parse_roll_call(question: str, excerpt: str, *, source: str) -> RollCall | N
     if not (present_is_members and absent_is_members) and not nonmembers.intersection(
         range(first - 1, last + 2)
     ):
-        return None
+        return role_labeled_roll_call(excerpt, group)
 
     present = listed_names(present_text)
     absent = {} if absent_text.casefold() in NO_ABSENCES else listed_names(absent_text)
@@ -277,7 +318,10 @@ def roster_group(question: str) -> str:
         and not get_close_matches(role.casefold(), ROLES, n=1, cutoff=0.85)
     ):
         return ""
-    words = re.findall(WORD, match["group"].casefold())
+    group = match["group"] or (
+        "board" if role and role.casefold() == "directors" else ""
+    )
+    words = re.findall(WORD, group.casefold())
     return "" if GROUP_EXCLUSIONS.intersection(words) else " ".join(words)
 
 
@@ -298,7 +342,7 @@ def attendance_sections(excerpt: str) -> dict[str, str]:
                 not value
                 or value.endswith((",", ";", "-"))
                 or (
-                    label == "attendees"
+                    label in ABSENT | {"attendees", "present", "regrets/absent"}
                     and (" - " in line or value.count("(") > value.count(")"))
                 )
             ):
@@ -306,6 +350,32 @@ def attendance_sections(excerpt: str) -> dict[str, str]:
             else:
                 break
     return sections
+
+
+# Read member headings in a declared contact directory, ending at the support section.
+def contact_directory(text: str) -> tuple[str, tuple[str, ...]] | None:
+    lines = text.splitlines()
+    header = next(
+        (
+            (index, line.strip())
+            for index, line in enumerate(lines[:6])
+            if DIRECTORY_TITLE.search(line)
+        ),
+        None,
+    )
+    if header is None:
+        return None
+    index, heading = header
+    members: dict[str, str] = {}
+    for line in lines[index + 1 :]:
+        if DIRECTORY_BOUNDARY.fullmatch(line.strip()):
+            break
+        name, _, role = line.split("\t", 1)[0].strip().partition(",")
+        if role and not MEMBER_ROLE.fullmatch(MEMBER_PREFIX.sub("", role.strip())):
+            continue
+        if names := listed_names(name):
+            members.update(names)
+    return (heading, tuple(members.values())) if len(members) > 1 else None
 
 
 # Keep names from member sections or names with an explicit membership role.

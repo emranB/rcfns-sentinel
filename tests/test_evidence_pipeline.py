@@ -33,6 +33,77 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Reuse the member view across a year sequence that exceeds the chat history window.
+    async def test_member_year_chain_works_on_a_different_collection(self) -> None:
+        records = {
+            year: f"other-data/Library Council/{year}/{year}1103 Minutes.txt"
+            for year in range(2011, 2017)
+        }
+        opening = {
+            str(year): server.RetrievedChunk(
+                document_id=str(year),
+                content="Present: Mei Tan\nRegrets: Noor Khan\nStaff: Jordan Gray"
+                if year % 2
+                else "Attendees\nMei Tan - Trustee, Jordan Gray - Staff\nRegrets\nAri King - Trustee",
+            )
+            for year in records
+        }
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client,
+                dataset_id="other-collection",
+                documents={str(year): path for year, path in records.items()},
+            )
+            history: list[server.ChatMessage] = []
+            with patch.object(
+                server,
+                "record_opening",
+                AsyncMock(side_effect=lambda _, key: opening[key]),
+            ):
+                for year in reversed(records):
+                    question = (
+                        "Who were the library council trustees in 2016?"
+                        if year == 2016
+                        else f"{year}?"
+                    )
+                    payload = server.Question(question=question, history=history[-6:])
+                    reply = await server.respond_to_question(state, question, payload)
+                    self.assertIn("- Mei Tan", reply.answer)
+                    self.assertIn(
+                        "- Noor Khan" if year % 2 else "- Ari King", reply.answer
+                    )
+                    self.assertNotIn("Jordan Gray", reply.answer)
+                    self.assertEqual(
+                        [source.path for source in reply.sources], [records[year]]
+                    )
+                    history.extend(
+                        [
+                            server.ChatMessage(role="user", content=question),
+                            server.ChatMessage(
+                                role="assistant",
+                                content=reply.answer,
+                                roll_call=reply.roll_call,
+                            ),
+                        ]
+                    )
+
+    # Retain a non-membership subject when the first question has left the history window.
+    def test_year_context_carries_an_unrelated_subject_without_the_first_turn(
+        self,
+    ) -> None:
+        history = [
+            server.ChatMessage(role="user", content="And 2019?"),
+            server.ChatMessage(
+                role="assistant",
+                content="A finding from the archive.",
+                period_subject="What were the insurance premiums",
+            ),
+        ]
+        self.assertEqual(
+            server.scoped_question("2018?", history),
+            "What were the insurance premiums for 2018",
+        )
+
     # Keep the exact cited record while a later turn changes the requested view.
     async def test_roll_call_follow_up_reuses_the_original_record(self) -> None:
         scope = server.RollCallScope(document_id="original", group="council", year=2025)
@@ -70,7 +141,8 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Mei Tan", response.answer)
         self.assertEqual(response.sources, [original])
         self.assertEqual(
-            response.roll_call, scope.model_copy(update={"members": "absent"})
+            response.roll_call,
+            scope.model_copy(update={"members": "absent", "output": "names"}),
         )
         load.assert_awaited_once_with(state, scope)
 

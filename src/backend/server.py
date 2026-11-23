@@ -96,6 +96,7 @@ from src.backend.ragflow import (
     request,
 )
 from src.backend.record_lookup import (
+    MAX_EXPLICIT_ORIGINALS,
     dated_references,
     explicit_ids,
     has_record_date,
@@ -103,9 +104,11 @@ from src.backend.record_lookup import (
     title_tokens,
 )
 from src.backend.roll_call import (
+    DIRECTORY_TITLE,
     RollCall,
     attendance_names,
     attendance_sections,
+    contact_directory,
     dated_count_scope,
     named_attendance_section,
     parse_roll_call,
@@ -380,6 +383,8 @@ class RollCallScope(BaseModel):
     group: str = Field(min_length=1, max_length=100)
     year: int = Field(ge=1900, le=2099)
     members: RollCallMembers = "all"
+    output: Literal["count", "names"] = "count"
+    directory: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -387,6 +392,7 @@ class ChatResponse(BaseModel):
     sources: list[Citation]
     mode_used: Literal["standard", "agentic"]
     roll_call: RollCallScope | None = None
+    period_subject: str | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -413,6 +419,7 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=8000)
     roll_call: RollCallScope | None = None
+    period_subject: str | None = Field(default=None, max_length=4000)
 
 
 class Question(BaseModel):
@@ -449,6 +456,14 @@ class RollCallRecord:
     day: date
     source: Citation
     call: RollCall
+
+
+@dataclass(frozen=True)
+class MembershipDirectory:
+    scope: RollCallScope
+    heading: str
+    source: Citation
+    names: tuple[str, ...]
 
 
 @dataclass
@@ -1158,13 +1173,31 @@ def requests_collection_overview(words: set[str]) -> bool:
 def year_follow_up(year: str, history: list[ChatMessage]) -> str | None:
     for message in reversed(history):
         previous = message.content.strip()
-        if message.role != "user" or YEAR_FOLLOW_UP.fullmatch(previous):
+        if message.role == "assistant":
+            if (subject := message.period_subject) and not YEAR.search(subject):
+                return f"{subject} for {year}"
+            continue
+        if YEAR_FOLLOW_UP.fullmatch(previous):
             continue
         subject = YEAR_QUALIFIER.sub("", previous).rstrip("?.! ")
         if YEAR.search(subject) or not question_words(subject) - UNSCOPED_WORDS:
             return None
         return f"{subject} for {year}"
     return None
+
+
+# Store only a reusable single-year subject, leaving named files and other dates intact.
+def single_year_subject(question: str | None) -> str | None:
+    if question is None or not YEAR_QUALIFIER.search(question):
+        return None
+    subject = YEAR_QUALIFIER.sub("", question).rstrip("?.! ")
+    if (
+        not subject
+        or YEAR.search(subject)
+        or not question_words(subject) - UNSCOPED_WORDS
+    ):
+        return None
+    return subject
 
 
 # Resolve a bare date or summary request from the user's last message with a subject.
@@ -1437,6 +1470,24 @@ async def record_opening(
     return next(iter(await record_chunks(state, document_id, 1)), None)
 
 
+# Prefer the original text and layout when indexed excerpts split roster entries.
+async def membership_text(
+    state: RagflowSession, opening: RetrievedChunk, source: Citation
+) -> str:
+    document_id = opening.document_id
+    text = format_excerpt(opening.content)
+    match Path(source.path).suffix.casefold():
+        case ".docx":
+            archive = await word_archive(state, document_id)
+            return await asyncio.to_thread(word_body, archive) or text
+        case ".pdf":
+            archive = await original_archive(
+                state, document_id, suffix=".pdf", limit=PDF_TEXT_ARCHIVE_LIMIT
+            )
+            return await asyncio.to_thread(pdf_text, archive) or text
+    return text
+
+
 # Reopen a cited roll call and verify its year, group and attendance sections.
 async def load_roll_call(
     state: RagflowSession, scope: RollCallScope
@@ -1448,10 +1499,7 @@ async def load_roll_call(
     day = filename_date(Path(source.path).stem)
     if day is None or day.year != scope.year:
         return None
-    text = format_excerpt(opening.content)
-    if Path(source.path).suffix.casefold() == ".docx":
-        archive = await word_archive(state, document_id)
-        text = await asyncio.to_thread(word_body, archive) or text
+    text = await membership_text(state, opening, source)
     question = f"How many {scope.group} members do we have?"
     call = parse_roll_call(question, text, source=source.path)
     return RollCallRecord(scope, day, source, call) if call is not None else None
@@ -1470,6 +1518,49 @@ async def dated_roll_call(
                 scope = RollCallScope(document_id=document_id, group=group, year=year)
                 if record := await load_roll_call(state, scope):
                     return record
+    return None
+
+
+# Verify that an original is a membership directory for the requested group and year.
+async def load_membership_directory(
+    state: RagflowSession, scope: RollCallScope
+) -> MembershipDirectory | None:
+    if (opening := await record_opening(state, scope.document_id)) is None:
+        return None
+    source = citation(state, opening)
+    if not DIRECTORY_TITLE.search(source.name) or str(scope.year) not in YEAR.findall(
+        source.path
+    ):
+        return None
+    if not set(scope.group.split()) <= source_terms(source.name):
+        return None
+    if result := contact_directory(await membership_text(state, opening, source)):
+        heading, names = result
+        return MembershipDirectory(scope, heading, source, names)
+    return None
+
+
+# Fall back to explicitly identified membership directories when attendance is ambiguous.
+async def dated_membership_record(
+    state: RagflowSession, group: str, year: int
+) -> RollCallRecord | MembershipDirectory | None:
+    if record := await dated_roll_call(state, group, year):
+        return record
+    candidates = sorted(
+        (str(year) not in YEAR.findall(Path(path).name), path, key)
+        for key, path in indexed_originals(state)
+        if DIRECTORY_TITLE.search(Path(path).name)
+        and set(group.split()) <= source_terms(Path(path).name)
+        and str(year) in YEAR.findall(path)
+    )
+    with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            for _, _, key in candidates[:MAX_EXPLICIT_ORIGINALS]:
+                scope = RollCallScope(
+                    document_id=key, group=group, year=year, directory=True
+                )
+                if directory := await load_membership_directory(state, scope):
+                    return directory
     return None
 
 
@@ -1510,7 +1601,31 @@ def roll_call_reply(
         answer=answer,
         sources=[record.source],
         mode_used=mode,
-        roll_call=record.scope.model_copy(update={"members": members}),
+        roll_call=record.scope.model_copy(
+            update={"members": members, "output": view.output if view else "count"}
+        ),
+    )
+
+
+# Answer from the verified original with the precision its format supports.
+def membership_reply(
+    record: RollCallRecord | MembershipDirectory,
+    mode: Literal["standard", "agentic"],
+    view: RollCallView,
+) -> ChatResponse:
+    if isinstance(record, RollCallRecord):
+        return roll_call_reply(record, mode, view)
+    output = "count" if view.output == "count" else "names"
+    head = f'The directory titled **{record.heading}** lists **{len(record.names)} members** [1].'
+    if view.members in ("present", "absent"):
+        head += "\n\n**Could not verify**\n\n- Attendance for this group"
+    elif output == "names":
+        head += "\n\n" + "\n".join(f"- {name}" for name in record.names)
+    return ChatResponse(
+        answer=head,
+        sources=[record.source],
+        mode_used=mode,
+        roll_call=record.scope.model_copy(update={"output": output}),
     )
 
 
@@ -1572,11 +1687,12 @@ async def roll_call_follow_up(
             view = RollCallView.model_validate_json(raw)
             if view.output == "other":
                 return None
-            record = (
-                await load_roll_call(state, scope)
-                if scope is not None
-                else await dated_roll_call(state, group, year)
-            )
+            if scope is None:
+                record = await dated_membership_record(state, group, year)
+            elif scope.directory:
+                record = await load_membership_directory(state, scope)
+            else:
+                record = await load_roll_call(state, scope)
     if record is None or view is None:
         return None
     if view.output == "record":
@@ -1589,7 +1705,7 @@ async def roll_call_follow_up(
         return answer.model_copy(update={"roll_call": record.scope})
     if members := named_attendance_section(question):
         view = view.model_copy(update={"members": members})
-    return roll_call_reply(record, mode, view)
+    return membership_reply(record, mode, view)
 
 
 # Resolve file inventory entries before searching similarly named documents.
@@ -2699,8 +2815,7 @@ def documented_roster(
     return "\n\n".join(sections)
 
 
-# Use the same answer path in both modes. Agentic can resolve a follow-up and
-# add evidence from independent searches without displacing the standard results.
+# Keep the resolved request available when later turns change only the period.
 async def respond_to_question(
     state: RagflowSession,
     question: str,
@@ -2708,6 +2823,56 @@ async def respond_to_question(
     library: Library | None = None,
 ) -> ChatResponse:
     scoped = scoped_question(question, payload.history)
+    if (
+        (period := YEAR_FOLLOW_UP.fullmatch(question.strip()))
+        and payload.history
+        and payload.history[-1].role == "assistant"
+        and (prior := payload.history[-1].roll_call)
+    ):
+        return await membership_in_year(
+            state,
+            prior.group,
+            int(period["year"]),
+            payload.mode,
+            RollCallView(output=prior.output, members=prior.members),
+        )
+    response = await answer_question(state, question, scoped, payload, library)
+    subject = single_year_subject(scoped)
+    if subject and len(subject) <= 4000:
+        return response.model_copy(update={"period_subject": subject})
+    return response
+
+
+# Give the same verified membership evidence for names and counts in a specified year.
+async def membership_in_year(
+    state: RagflowSession,
+    group: str,
+    year: int,
+    mode: Literal["standard", "agentic"],
+    view: RollCallView,
+) -> ChatResponse:
+    if record := await dated_membership_record(state, group, year):
+        return membership_reply(record, mode, view)
+    return ChatResponse(
+        answer=f"I could not verify a complete {group} roster for {year} in the indexed records.",
+        sources=[],
+        mode_used=mode,
+        period_subject=(
+            f"How many {group} members"
+            if view.output == "count"
+            else f"List {group} members"
+        ),
+    )
+
+
+# Use the same answer path in both modes, with extra retrieval in Agentic.
+async def answer_question(
+    state: RagflowSession,
+    question: str,
+    scoped: str | None,
+    payload: Question,
+    library: Library | None,
+) -> ChatResponse:
     if scoped is None and len(state.source_paths) == 1:
         scoped = f"{question}\nDocument: {next(iter(state.source_paths.values()))}"
     words = question_words(question)
@@ -2738,12 +2903,13 @@ async def respond_to_question(
         return ChatResponse(answer=inventory, sources=[], mode_used="standard")
     years = requested_years(scoped)
     count_scope = dated_count_scope(scoped)
+    group = roster_group(scoped)
     if (
         years
         and min(years) > datetime.now(UTC).year
         and (
             count_scope
-            or roster_group(scoped)
+            or group
             or re.search(r"\bonly evidence\b", scoped, re.IGNORECASE)
         )
     ):
@@ -2786,8 +2952,21 @@ async def respond_to_question(
             record_question = scoped
     if records.requested:
         return await answer_records(state, record_question, payload, records)
-    if count_scope and (record := await dated_roll_call(state, *count_scope)):
-        return roll_call_reply(record, payload.mode)
+    if count_scope:
+        return await membership_in_year(
+            state,
+            *count_scope,
+            payload.mode,
+            RollCallView(output="count", members="all"),
+        )
+    if group and len(roster_years := YEAR.findall(scoped)) == 1:
+        return await membership_in_year(
+            state,
+            group,
+            int(roster_years[0]),
+            payload.mode,
+            RollCallView(output="names", members="all"),
+        )
     if membership := await roll_call_follow_up(
         state, question, payload.history, payload.mode
     ):

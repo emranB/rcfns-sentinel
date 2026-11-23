@@ -4,6 +4,7 @@ import unittest
 
 from src.backend.roll_call import (
     RollCallCount,
+    contact_directory,
     dated_count_scope,
     named_attendance_section,
     parse_roll_call,
@@ -24,6 +25,18 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Extract membership from a declared directory without returning support contacts.
+    def test_contact_directory_keeps_members_and_stops_at_support(self) -> None:
+        result = contact_directory(
+            "2016 Library Council Membership List\n"
+            "Mei Tan, Vice Chair\tSuite 3\n"
+            "Noor Khan\tSuite 4\n"
+            "Council Support\nJordan Gray\tSuite 5"
+        )
+        self.assertEqual(
+            result, ("2016 Library Council Membership List", ("Mei Tan", "Noor Khan"))
+        )
+
     # Document section labels apply only when a single unnegated status is named.
     def test_named_attendance_sections_are_unambiguous(self) -> None:
         self.assertEqual(named_attendance_section("Who sent apologies?"), "absent")
