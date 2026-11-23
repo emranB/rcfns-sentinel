@@ -11,7 +11,9 @@ from pydantic import BaseModel, Field
 from src.backend.current_sources import source_terms
 from src.backend.record_lookup import DATE, mentioned_dates, title_tokens
 
-NUMBER = re.compile(r"(?<![\w])([$])?([-+]?\d+(?:,\d{3})*(?:\.\d+)?)([KMBkmb])?")
+NUMBER = re.compile(
+    r"(?<![\w])([$£€][ \t\u00a0]*)?([-+]?\d+(?:,\d{3})*(?:\.\d+)?)(?:[ \t\u00a0]*([KMBkmb])\b)?"
+)
 SCALE = {"k": 1000, "m": 1000000, "b": 1000000000}
 WORD = re.compile(r"[^\W\d_]{3,}")
 ROLE_CHANGES = (
@@ -209,7 +211,9 @@ TALLY_VALUE = re.compile(
 )
 VOTE_DIRECTIONS = ("against|opposed", "abstentions?|abstained", "in favou?r")
 CURRENCY_VALUE = re.compile(
-    r"[$£€]\s*\d|\b\d[\d,.]*\s+(?:dollars|euros|pounds)\b", re.IGNORECASE
+    r"[$£€][ \t\u00a0]*\d[\d,]*(?:\.\d+)?(?:[ \t]*[KMB]\b)?"
+    r"|\b\d[\d,.]*\s+(?:dollars|euros|pounds)\b",
+    re.IGNORECASE,
 )
 ROLE_ACCEPTANCE = re.compile(
     r"\bwho accepted\s+(.+?)(?=\s+(?:at|in|on|during|according to)\b|$)",
@@ -233,13 +237,13 @@ UNIT_FIELD = re.compile(
     re.IGNORECASE,
 )
 FREQUENCY = re.compile(
-    r"\b(?:daily|weekly|fortnightly|monthly|quarterly|annually|yearly|"
+    r"\b(?:daily|weekly|fortnightly|monthly|quarterly|annual(?:ly)?|yearly|"
     rf"(?:once|twice|every|each)\s+(?:a\s+|{TALLY_NUMBER}\s+)?(?:days?|weeks?|months?|quarters?|years?))\b",
     re.IGNORECASE,
 )
 CADENCE_FIELD = re.compile(
     r"\b(?P<label>reporting|review|meeting) (?:cadence|frequency|interval)\b"
-    r"|\bhow often\b[^?]*\b(?P<verb>report|review|meet)\w*\b",
+    r"|\bhow often\b(?P<subject>[^?]*?)\b(?P<verb>report|review|meet)\w*\b",
     re.IGNORECASE,
 )
 DURATION_FIELD = re.compile(r"\b(?P<subject>[\w-]+) duration\b", re.IGNORECASE)
@@ -247,9 +251,15 @@ DURATION_VALUE = re.compile(
     rf"\b{TALLY_NUMBER}[- ]+(?:days?|weeks?|months?|years?|hours?)\b", re.IGNORECASE
 )
 APPROVAL_AUTHORITY = re.compile(
-    r"\bwho\b[^?]{0,100}\b(?:approv\w*|authoriz\w*)\b", re.IGNORECASE
+    r"\bwho\s+(?:(?:gives?|provides?)\s+(?:the\s+)?(?:final\s+)?)?"
+    r"(?P<action>approv\w*|authoriz\w*|reviews?)\s+(?P<subject>[^?]+)",
+    re.IGNORECASE,
 )
-APPROVAL_WORD = re.compile(r"\b(?:approv\w*|authoriz\w*)\b", re.IGNORECASE)
+APPROVAL_WORD = re.compile(r"\b(?:approv\w*|authoriz\w*|review\w*)\b", re.IGNORECASE)
+VALUE_REQUEST = re.compile(
+    r"\bwhat\s+(?P<field>value|price|cost|rate)\b[^?]{0,65}\bfor\s+(?P<item>[^?]+)",
+    re.IGNORECASE,
+)
 THRESHOLD_SIDE = (
     re.compile(r"\b(?:over|above|more than|greater than)\b", re.IGNORECASE),
     re.compile(r"\b(?:under|below|less than)\b", re.IGNORECASE),
@@ -444,12 +454,32 @@ def field_evidence(question: str, text: str) -> str | None:
     if cadence := CADENCE_FIELD.search(question):
         activity = (cadence["label"] or cadence["verb"]).casefold().removesuffix("ing")
         event = r"(?:updates?|report\w*)" if activity == "report" else rf"{activity}\w*"
-        return "\n".join(
+        subjects = (
+            source_terms(cadence["subject"] or "")
+            - STOP
+            - FIELD_TERMS
+            - {
+                "itself",
+                "are",
+                "has",
+                "have",
+                "be",
+            }
+        )
+        matches = [
             line
             for line in lines
             if FREQUENCY.search(line)
             and re.search(rf"\b{event}\b", line, re.IGNORECASE)
-        )
+        ]
+        if activity == "review" and subjects:
+            matches = [
+                line
+                for line in matches
+                if focus_matches(frozenset(source_terms(line)), subjects)
+                == len(subjects)
+            ]
+        return "\n".join(matches)
     if duration := DURATION_FIELD.search(question):
         terms = source_terms(duration["subject"])
         return "\n".join(
@@ -537,18 +567,52 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
-    if APPROVAL_AUTHORITY.search(question) and (thresholds := values(question)):
-        side = next((term for term in THRESHOLD_SIDE if term.search(question)), None)
-        approvals = {
+    if authority := APPROVAL_AUTHORITY.search(question):
+        subject = re.split(
+            r"\s+(?:in|according to|under the)\s+",
+            authority["subject"],
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        thresholds = values(" ".join(m[0] for m in CURRENCY_VALUE.finditer(subject)))
+        side = next((term for term in THRESHOLD_SIDE if term.search(subject)), None)
+        topics = {
+            term
+            for term in source_terms(subject)
+            - STOP
+            - FIELD_TERMS
+            - {"under", "over", "above", "below"}
+            if len(term) >= 3 and not term.isdecimal()
+        }
+        candidates: dict[str, int] = {}
+        for line in text.splitlines():
+            if len(line) > 480 or not (
+                APPROVAL_WORD.search(line) or (thresholds and ":" in line)
+            ):
+                continue
+            if thresholds and (
+                not thresholds <= values(line) or (side and not side.search(line))
+            ):
+                continue
+            score = focus_matches(frozenset(source_terms(line)), topics)
+            if score >= (1 if thresholds else min(2, len(topics))) and topics:
+                candidates[line.strip()] = score
+        if candidates:
+            ranked = sorted(candidates, key=candidates.__getitem__, reverse=True)
+            if len(ranked) == 1 or candidates[ranked[0]] > candidates[ranked[1]]:
+                return ranked[0]
+    if requested_value := VALUE_REQUEST.search(question):
+        item = source_terms(requested_value["item"]) - STOP - FIELD_TERMS
+        amounts = {
             line.strip()
             for line in text.splitlines()
-            if len(line) <= 480
-            and APPROVAL_WORD.search(line)
-            and thresholds <= values(line)
-            and (side is None or side.search(line))
+            if len(line) <= 180
+            and has_quantity(line)
+            and requested_value["field"].casefold() in source_terms(line)
+            and item <= source_terms(line)
         }
-        if len(approvals) == 1:
-            return next(iter(approvals))
+        if item and len(amounts) == 1:
+            return next(iter(amounts))
     if acceptance := ROLE_ACCEPTANCE.search(question):
         role = (
             source_terms(acceptance[1])
@@ -686,7 +750,7 @@ def values(text: str) -> set[Decimal]:
         Decimal(match[2].replace(",", ""))
         * (
             SCALE[match[3].lower()]
-            if match[3] and (match[1] or match[3].isupper())
+            if match[3] and (match[1] or match[3].isupper() or match[3].lower() == "k")
             else 1
         )
         for match in NUMBER.finditer(text)

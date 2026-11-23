@@ -38,6 +38,7 @@ from src.backend.current_sources import (
 )
 from src.backend.evidence import format_excerpt
 from src.backend.grounding import (
+    APPROVAL_AUTHORITY,
     INCOMPLETE_TEXT,
     ClaimAnswer,
     CoverageReview,
@@ -76,7 +77,7 @@ from src.backend.office_text_recovery import (
     slide_items,
     word_body,
 )
-from src.backend.pdf_recovery import normalize_pdf
+from src.backend.pdf_recovery import normalize_pdf, pdf_text
 from src.backend.ragflow import (
     CHAT_MODEL,
     EMBEDDING_REFERENCE,
@@ -208,6 +209,7 @@ RECENT_EVIDENCE_BUDGET = 6000
 PLANNING_SAMPLE_SIZE = 750
 WORD_OUTLINE_LIMIT = 1024 * 1024
 PRESENTATION_ARCHIVE_LIMIT = 16 * 1024 * 1024
+PDF_TEXT_ARCHIVE_LIMIT = 8 * 1024 * 1024
 QUESTION_WORD = re.compile(r"[^\W_]+")
 SUMMARY_WORDS = frozenset(
     QUESTION_WORD.findall(
@@ -2039,16 +2041,32 @@ async def answer_parts(
             excerpts[first] = EvidenceText(text[first].label, slide)
             indices = [first]
         original_text = ""
-        if (
-            len(urls) == 1
-            and file_type == ".docx"
-            and any(field_evidence(part, "") is not None for part in fields)
-        ):
+        typed = any(field_evidence(part, "") is not None for part in fields)
+        if len(urls) == 1 and file_type == ".docx" and typed:
             with suppress(httpx.HTTPError, OSError, TimeoutError):
                 async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
                     original_text = await asyncio.to_thread(
                         word_body, await word_archive(state, original)
                     )
+        elif (
+            len(urls) == 1
+            and file_type == ".pdf"
+            and (typed or APPROVAL_AUTHORITY.search(question))
+        ):
+            with suppress(httpx.HTTPError, OSError, TimeoutError):
+                async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                    payload = await original_archive(
+                        state, original, suffix=".pdf", limit=PDF_TEXT_ARCHIVE_LIMIT
+                    )
+                    original_text = await asyncio.to_thread(pdf_text, payload)
+
+        # A quote from the original PDF gets a document link when its page location is unknown.
+        def original_reference(passage: str) -> int:
+            if file_type != ".pdf":
+                return first
+            sources.append(sources[first].model_copy(update={"regions": []}))
+            text.append(EvidenceText(text[first].label, passage))
+            return len(sources) - 1
 
         # Validate each requested value against its own supporting passage.
         async def find_field(part: str) -> RecordAnswer:
@@ -2077,14 +2095,15 @@ async def answer_parts(
                     state, part, excerpts, indices, coverage="always"
                 )
             if field_evidence(part, "") is not None:
-                proof = (
-                    [(first, field_evidence(part, original_text))]
-                    if original_text
-                    else [
+                proof: list[tuple[int, str | None]]
+                if original_text:
+                    value = field_evidence(part, original_text)
+                    proof = [(original_reference(value), value)] if value else []
+                else:
+                    proof = [
                         (index, field_evidence(part, excerpts[index].content))
                         for index in indices
                     ]
-                )
                 grounded = [(index, value) for index, value in proof if value]
                 if not grounded:
                     return RecordAnswer(missing=(part,))
@@ -2110,6 +2129,8 @@ async def answer_parts(
                 )
 
             field = ""
+            if original_text and (caption := labeled_passage(part, original_text)):
+                return RecordAnswer(f"> {caption} [{original_reference(caption) + 1}]")
             for index in indices:
                 if names := table_person_names(part, excerpts[index].content):
                     return RecordAnswer(f"{', '.join(names)} [{index + 1}].")

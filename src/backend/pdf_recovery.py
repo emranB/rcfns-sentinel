@@ -4,12 +4,13 @@ import re
 import subprocess
 from os import SEEK_END
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 
 from src.backend.source_recovery import recovery_folder
 
 PDF_TAIL_BYTES = 64 * 1024
 PDF_XREF_BYTES = 1024 * 1024
+PDF_TEXT_BYTES = 128 * 1024
 MAX_XREF_REVISIONS = 16
 PDF_LINE_END = rb"(?:\r\n|\r|\n)"
 PDF_HEADER = re.compile(rb"\A%PDF-[0-9]\.[0-9][ \t]*" + PDF_LINE_END)
@@ -199,3 +200,26 @@ def normalize_pdf(source: Path, cache: Path) -> Path:
         temporary.replace(output)
 
     return output
+
+
+# Read bounded native text from the unchanged original, preserving its line structure.
+def pdf_text(payload: bytes) -> str:
+    if not payload:
+        return ""
+    with TemporaryFile() as output:
+        try:
+            process = subprocess.run(
+                ["pdftotext", "-layout", "-enc", "UTF-8", "-", "-"],
+                input=payload,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if process.returncode:
+            return ""
+        output.seek(0)
+        text = output.read(PDF_TEXT_BYTES + 1)
+    return text.decode("utf-8", errors="replace") if len(text) <= PDF_TEXT_BYTES else ""

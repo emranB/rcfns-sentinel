@@ -22,6 +22,41 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Approval evidence must match the action's object and any explicit threshold.
+    def test_authority_uses_the_requested_action_and_money_boundary(self) -> None:
+        recommendation = "The panel approves the facility recommendations."
+        self.assertEqual(
+            labeled_passage(
+                "Who approves the facility recommendations in the 2021 handbook?",
+                f"The 2021 handbook is approved by the trustees.\n{recommendation}",
+            ),
+            recommendation,
+        )
+        lower = "Purchases under $3,500: Services Committee"
+        self.assertEqual(
+            labeled_passage(
+                "Who reviews purchases under $3,500 in the handbook?",
+                "Purchases over $3,500: Finance Committee approval.\n" + lower,
+            ),
+            lower,
+        )
+
+    # Recognize shorthand amounts and preserve the requested cadence subject.
+    def test_spaced_values_and_annual_review_are_grounded(self) -> None:
+        line = "Premium value of 2.5 k"
+        self.assertEqual(values(line), values("$2,500"))
+        self.assertEqual(
+            labeled_passage("What value is listed for Premium?", line), line
+        )
+        cadence = "Annual review of external suppliers."
+        self.assertEqual(
+            field_evidence(
+                "How often are external suppliers reviewed?",
+                f"Quarterly review of the procurement policy.\n{cadence}",
+            ),
+            cadence,
+        )
+
     # Match a duration to its unit and keep financial phases separate.
     def test_field_evidence_binds_requested_units_and_payment_status(self) -> None:
         self.assertEqual(
