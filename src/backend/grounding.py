@@ -646,6 +646,25 @@ def primary_passages(detail: str, text: str, context: str = "") -> str:
     )[:4600]
 
 
+# Use a unique start clause linked to the preceding subject and retain its qualifiers.
+def start_passage(detail: str, text: str, context: str) -> str:
+    if not context or not START_REQUEST.search(detail):
+        return ""
+    subjects = (
+        source_terms(context) - STOP - PART_NOISE - FIELD_TERMS - {"initial", "amount"}
+    )
+    if not subjects:
+        return ""
+    passages = {
+        sentence.strip()
+        for line in primary_passages(detail, text, context).splitlines()
+        for sentence in re.split(r"(?<=[.!?])\s+", line)
+        if START_PROOF.search(sentence)
+        and focus_matches(frozenset(source_terms(sentence)), subjects) == len(subjects)
+    }
+    return next(iter(passages)) if len(passages) == 1 else ""
+
+
 # Recover a single printed monetary threshold, retaining its original condition.
 def threshold_passage(question: str, text: str) -> str:
     if not THRESHOLD_REQUEST.search(question):

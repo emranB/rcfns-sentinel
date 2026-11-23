@@ -15,6 +15,7 @@ from src.backend.grounding import (
     EvidenceText,
 )
 from src.backend.library_overview import build_overview
+from src.backend.quantitative import OperandSource
 from src.backend.ragflow import IndexProgress, RagflowSession
 from src.backend.roll_call import RollCall
 
@@ -511,6 +512,65 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             server.subject_aliases("Northern Community Arts Society", originals),
             ["program"],
+        )
+
+    # A related letter can reveal the formal name of the governing agreement.
+    async def test_shared_name_finds_authoritative_acronym_original(self) -> None:
+        question = "What is the minimum balance before the coastal arts fund can make grants? Who does it serve?"
+        title = "Coastal Community Arts Fund"
+        paths = {
+            "letter": "Campaign/Open Letter.docx",
+            "agreement": "Agreements/CCAF Fund Agreement.docx",
+        }
+        mention = server.RetrievedChunk(
+            document_id="letter", content=f"Introducing the {title}."
+        )
+        agreement = server.RetrievedChunk(document_id="agreement", content=title)
+        text = f"{title}\nOnce the $4,000 threshold is met, grants may be made.\nThe fund serves students."
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client, dataset_id="library", documents=paths)
+            with (
+                patch.object(
+                    server, "record_opening", AsyncMock(return_value=agreement)
+                ),
+                patch.object(
+                    server, "original_record_text", AsyncMock(return_value=text)
+                ),
+                patch.object(server, "generate", AsyncMock(side_effect=AssertionError)),
+            ):
+                self.assertEqual(
+                    await server.shared_original(
+                        state, question, [server.Excerpt(mention, mention.content)]
+                    ),
+                    "agreement",
+                )
+
+    # Use the printed range to distinguish reports with the same end date.
+    def test_retained_operands_distinguish_month_and_full_year(self) -> None:
+        source = server.Citation(
+            name="Report.pdf", path="Accounting/Report.pdf", url="/sources/file"
+        )
+        day = date(2012, 12, 31)
+        monthly = server.VerifiedFile(
+            "month", source, day, "Income Statement\nDecember 2012"
+        )
+        annual = server.VerifiedFile(
+            "year", source, day, "Income Statement\nJanuary - December 2012"
+        )
+        target = OperandSource(
+            title="Income Statement",
+            year=2012,
+            month=12,
+            day=31,
+            period="monthly",
+            query="Reported income",
+        )
+        self.assertEqual(server.retained_operand(target, [annual, monthly]), monthly)
+        self.assertEqual(
+            server.retained_operand(
+                target.model_copy(update={"period": "cumulative"}), [annual, monthly]
+            ),
+            annual,
         )
 
     # Clear a draft warning only after checking the actual requested details.

@@ -1,6 +1,7 @@
 '''Exercise calculations grounded in independently scoped original values.'''
 
 import unittest
+from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from src.backend.quantitative import (
     measure_rows,
     numeric_layout,
     numeric_workbook,
+    period_calculation,
     quantity_rows,
     requested_equations,
     requested_operation,
@@ -20,6 +22,49 @@ from src.backend.tabular import Worksheet
 
 
 class QuantityTests(unittest.TestCase):
+    # A model that finds one period cannot collapse a comparison across two periods.
+    def test_period_change_expands_metrics_over_verified_dates(self) -> None:
+        days = [date(2014, 10, 15), date(2017, 10, 15)]
+        plan = QuantityPlan(
+            question="Calculate changes",
+            reuse_sources=True,
+            sources=[],
+            measures=[
+                Measure(row="Total Tickets", column="", record=1),
+                Measure(row="Overtime", column="", record=1),
+            ],
+            equations=[],
+        )
+        result = period_calculation(
+            "Calculate the year-over-year change in total tickets and the change in overtime.",
+            days,
+            plan,
+        )
+        assert result is not None
+        measures, equations = result
+        self.assertEqual([measure.record for measure in measures], [1, 2, 1, 2])
+        self.assertEqual([item.inputs for item in equations], [[2, 1], [4, 3]])
+
+    # Reconcile the requested components against the total separately in each dated record.
+    def test_period_reconciliation_checks_both_originals(self) -> None:
+        plan = QuantityPlan(
+            question="Reconcile the records",
+            reuse_sources=True,
+            sources=[],
+            measures=[Measure(row="Total Participants", column="", record=1)],
+            equations=[],
+        )
+        result = period_calculation(
+            "Do adults plus children reconcile to total participants on both dates?",
+            [date(2014, 10, 15), date(2017, 10, 15)],
+            plan,
+        )
+        assert result is not None
+        measures, equations = result
+        self.assertEqual([measure.record for measure in measures], [1, 1, 1, 2, 2, 2])
+        self.assertEqual([item.inputs for item in equations], [[1, 2, 3], [4, 5, 6]])
+        self.assertEqual(measures[0].row, "Total participants")
+
     # A malformed model equation cannot override the requested budget variance or reconciliation.
     def test_plan_cannot_change_explicit_arithmetic(self) -> None:
         wrong = Equation(label="Combined", operation="sum", inputs=[1, 2], precision=2)

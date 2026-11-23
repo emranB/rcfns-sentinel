@@ -16,6 +16,7 @@ from src.backend.grounding import (
     requested_fields,
     requested_part_score,
     requested_parts,
+    start_passage,
     threshold_passage,
     values,
     verified_answer,
@@ -92,6 +93,10 @@ class RecordEvidenceTests(unittest.TestCase):
         self.assertIn(
             "beginning in 2016 at £400 per award, subject to budget approval.",
             primary_passages(detail, headings, context),
+        )
+        self.assertEqual(
+            start_passage(detail, headings, context),
+            "One pilot award annually, beginning in 2016 at £400 per award, subject to budget approval.",
         )
 
     # Approval evidence must address the requested subject, even beside similar clauses.

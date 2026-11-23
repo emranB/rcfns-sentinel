@@ -59,6 +59,7 @@ from src.backend.grounding import (
     requested_part_score,
     requested_parts,
     single_focus,
+    start_passage,
     threshold_passage,
     timeline_passages,
     verified_answer,
@@ -88,6 +89,7 @@ from src.backend.pdf_recovery import normalize_pdf, pdf_text
 from src.backend.quantitative import (
     CALCULATION_REFERENCE,
     CALCULATION_REQUEST,
+    PRIOR_CALCULATION_PERIOD,
     Equations,
     OperandSource,
     QuantityPlan,
@@ -96,6 +98,7 @@ from src.backend.quantitative import (
     measure_rows,
     numeric_layout,
     numeric_workbook,
+    period_calculation,
     quantity_rows,
     requested_equations,
     requested_operation,
@@ -158,6 +161,7 @@ from src.backend.source_recovery import (
 )
 from src.backend.sources import SourceCollection, resolve_sources
 from src.backend.statement_checks import (
+    CHECK_REQUEST,
     REQUIRED_TOTALS,
     Statement,
     parse_statement,
@@ -341,6 +345,9 @@ SOURCE_PRONOUN = re.compile(
 PRIOR_SUBJECT = re.compile(
     r"\b(?:that|this) (?:group|team|committee|panel|program|initiative|fund|project)\b",
     re.IGNORECASE,
+)
+FORMAL_NAME = re.compile(
+    r"\b[A-Z][a-z]{2,}(?:(?: (?:of|for|and|the))? [A-Z][a-z]{2,}){2,9}\b"
 )
 RECORD_FOLLOW_UP = re.compile(
     r"^\s*(?:and|also|what about|how about)\b|\b(?:that|this|the same|the earlier|the other) "
@@ -1343,11 +1350,35 @@ async def shared_original(
 ) -> str:
     if not evidence:
         return ""
+    labels = dict(indexed_originals(state))
+    names: dict[str, int] = {}
+    requested = source_terms(question)
+    for item in evidence:
+        path = labels.get(item.chunk.document_id, "")
+        sample = f"{path}\n{item.text}"
+        for occurrence in FORMAL_NAME.finditer(sample):
+            words = occurrence[0].split()
+            for length in range(3, min(len(words), 8) + 1):
+                for offset in range(len(words) - length + 1):
+                    name = " ".join(words[offset : offset + length])
+                    overlap = len(source_terms(name) & requested)
+                    if overlap >= 2:
+                        names[name] = overlap
+    for name in sorted(
+        names, key=lambda value: (names[value], len(value)), reverse=True
+    )[:14]:
+        aliases = subject_aliases(name, labels.items())
+        if aliases:
+            with suppress(TimeoutError):
+                async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+                    if key := await operative_original(
+                        state, name, question, aliases, labels
+                    ):
+                        return key
     # Include independent source introductions, not just the largest chunk.
     documents: dict[str, str] = {}
     for item in evidence:
         documents.setdefault(item.chunk.document_id, item.text[:1100])
-    labels = dict(indexed_originals(state))
     samples = list(documents.items())[:8]
     snippets = "\n\n".join(
         f"[{index}] {labels[key]}\n{sample}"
@@ -2162,6 +2193,83 @@ async def quantity_evidence(
     return (key, source, text[:4000]) if text else None
 
 
+# Inspect a retained calculation original's printed reporting range.
+def verified_period(match: VerifiedFile) -> tuple[date | None, date | None]:
+    return statement_period(
+        [line for line in match.text.splitlines() if line.strip()][:8]
+    )
+
+
+# Prefer a planned filename or verified reporting range within the user's chosen originals.
+def retained_operand(
+    target: OperandSource, originals: Iterable[VerifiedFile]
+) -> VerifiedFile | None:
+    candidates = list(originals)
+    exact = explicit_ids(
+        target.title,
+        ((match.document_id, match.source.path) for match in candidates),
+        filenames_only=True,
+    )
+    if len(exact) == 1:
+        return next(match for match in candidates if match.document_id == exact[0])
+    matched = []
+    for match in candidates:
+        start, end = verified_period(match)
+        day = end or match.day
+        if day is None or (
+            target.year not in (None, day.year)
+            or target.month not in (None, day.month)
+            or target.day not in (None, day.day)
+        ):
+            continue
+        if target.period != "any":
+            if start is None or end is None:
+                continue
+            monthly = (start.year, start.month) == (end.year, end.month)
+            if monthly != (target.period == "monthly"):
+                continue
+        matched.append(match)
+    return matched[0] if len(matched) == 1 else None
+
+
+# Reconcile net profit from the original's signed accounting components.
+def verified_profit_reply(
+    question: str, match: VerifiedFile, mode: Literal["standard", "agentic"]
+) -> ChatResponse | None:
+    if not CHECK_REQUEST.search(question) or "profit" not in question.casefold():
+        return None
+    statement = parse_statement(match.text)
+    if (
+        statement is None
+        or REQUIRED_TOTALS - statement.rows.keys()
+        or statement.conflicts
+        or not {"other_income", "other_expenses"} <= statement.rows.keys()
+        or not {"income", "expense"} <= source_terms(question)
+    ):
+        return None
+    rows = statement.rows
+    terms = [
+        f"Total income ${rows['income']:,.2f}",
+        f"minus total expenses ${rows['expenses']:,.2f}",
+        f"plus other income ${rows['other_income']:,.2f}",
+        f"minus other expenses ${rows['other_expenses']:,.2f}",
+    ]
+    if "cost" in rows:
+        terms.insert(1, f"minus cost of sales ${rows['cost']:,.2f}")
+    difference = statement.differences().get("net", Decimal(0))
+    computed = rows["net"] - difference
+    comparison = (
+        f"Reported profit differs by ${difference:+,.2f}."
+        if difference
+        else "This matches the reported profit."
+    )
+    return ChatResponse(
+        answer=f"{', '.join(terms)} gives **${computed:,.2f}**. {comparison} [1]",
+        sources=[match.source],
+        mode_used=mode,
+    )
+
+
 # Plan operations before retrieving figures, then bind each measure to an original row.
 async def quantify(
     state: RagflowSession, question: str, payload: Question
@@ -2273,10 +2381,15 @@ async def quantify(
     explicit = explicit_ids(question, originals.items(), filenames_only=True)
     named: dict[str, VerifiedFile | None] = dict.fromkeys(explicit)
     explicit_dates = {day for day, _, _ in mentioned_dates(question)}
+    period_reference = PRIOR_CALCULATION_PERIOD.search(question)
     if (
         not named
         and previous
-        and (plan.reuse_sources or CALCULATION_REFERENCE.search(question))
+        and (
+            plan.reuse_sources
+            or CALCULATION_REFERENCE.search(question)
+            or period_reference
+        )
     ):
         previous_dates = {day for day, _, _ in mentioned_dates(previous.question)}
         if explicit_dates <= previous_dates and set(YEAR.findall(question)) <= set(
@@ -2285,31 +2398,103 @@ async def quantify(
             named.update(
                 dict.fromkeys(key for key in previous.document_ids if key in originals)
             )
+    if len(named) > 1 or (named and period_reference):
+        retained = await asyncio.gather(*(retained_file(state, key) for key in named))
+        named.update(
+            (match.document_id, match) for match in retained if match is not None
+        )
+        if period_reference:
+            cumulative = period_reference["period"].casefold() not in {
+                "monthly",
+                "month-only",
+            }
+            selected = [
+                match
+                for match in retained
+                if match is not None
+                and (period := verified_period(match))[0] is not None
+                and period[1] is not None
+                and (
+                    (
+                        (period[1].year - period[0].year) * 12
+                        + period[1].month
+                        - period[0].month
+                    )
+                    > 0
+                )
+                == cumulative
+            ]
+            if len(selected) == 1:
+                period_match = selected[0]
+                if reply := verified_profit_reply(question, period_match, payload.mode):
+                    return remember_evidence(reply, question)
+                named = {period_match.document_id: period_match}
 
     dates = {
         reference.day: reference.kind
         for reference in dated_references(question, originals.items())
     }
-    if not named and len(dates) == 1 and len(plan.sources) <= 1:
-        day, kind = next(iter(dates.items()))
-        if " " in kind:
-            _, named_original = await resolve_file(
-                state, FileAvailability(kind, day.year, day.month, day.day)
+    if not named and dates and all(" " in kind for kind in dates.values()):
+        located = await asyncio.gather(
+            *(
+                resolve_file(
+                    state, FileAvailability(kind, day.year, day.month, day.day)
+                )
+                for day, kind in dates.items()
             )
-            if named_original is not None:
-                named[named_original.document_id] = named_original
+        )
+        named.update(
+            (match.document_id, match) for _, match in located if match is not None
+        )
+        if named and len(named) != len(dates):
+            missing = set(dates) - {match.day for match in named.values() if match}
+            return ChatResponse(
+                answer="I could not verify the requested originals dated "
+                + ", ".join(day.isoformat() for day in sorted(missing))
+                + ".",
+                sources=[],
+                mode_used=payload.mode,
+            )
 
     record_ids: dict[int, str] = {}
-    if len(named) == 1:
+    if len(named) == 2 and (
+        len(set(dates.values())) == 1 or CALCULATION_REFERENCE.search(question)
+    ):
+        previously_verified = await asyncio.gather(
+            *(
+                asyncio.sleep(0, result=match)
+                if match is not None
+                else retained_file(state, key)
+                for key, match in named.items()
+            )
+        )
+        dated = sorted(
+            (match.day, match.document_id, match)
+            for match in previously_verified
+            if match is not None and match.day is not None
+        )
+        if change := period_calculation(question, [day for day, _, _ in dated], plan):
+            plan.measures, plan.equations = change
+            record_ids = {index: key for index, (_, key, _) in enumerate(dated, 1)}
+            named.update((key, match) for _, key, match in dated)
+    if not record_ids and len(named) == 1:
         record_ids = dict.fromkeys(range(1, len(plan.sources) + 1), next(iter(named)))
-    else:
+    elif not record_ids:
         fixed = set(named)
         targets = [
             ((t.title or t.query).casefold(), t.year, t.month, t.day, t.period)
             for t in plan.sources
         ]
         unique = dict(zip(targets, plan.sources, strict=True))
-        results = await asyncio.gather(*(resolve(target) for target in unique.values()))
+        verified = [match for match in named.values() if match is not None]
+
+        # Bind printed periods before falling back to the library for unresolved records.
+        async def resolve_operand(target: OperandSource) -> VerifiedFile | None:
+            return retained_operand(target, verified) or await resolve(target)
+
+        results = await asyncio.gather(
+            *(resolve_operand(target) for target in unique.values())
+        )
         resolutions = dict(zip(unique, results, strict=True))
         for index, (target, key) in enumerate(
             zip(plan.sources, targets, strict=True), 1
@@ -2319,14 +2504,12 @@ async def quantify(
                 record_ids[index] = match.document_id
                 named[match.document_id] = match
             elif target.title and target.year and not fixed:
-                period = (
+                period_label_text = (
                     f"{date(target.year, target.month, 1):%B %Y}"
                     if target.month
                     else str(target.year)
                 )
-                answer = (
-                    f"I could not verify the original for {target.title} ({period})."
-                )
+                answer = f"I could not verify the original for {target.title} ({period_label_text})."
                 return ChatResponse(answer=answer, sources=[], mode_used=payload.mode)
 
     if not named:
@@ -3601,6 +3784,8 @@ async def answer_parts(
                     "\n\n".join(value for value in (quantity, field) if value)
                 )
             context = field_context(scoped, part)
+            if original_text and (start := start_passage(part, original_text, context)):
+                return RecordAnswer(f"> {start} [{original_reference(start) + 1}]")
             prompt = (
                 f"{part}\nSubject from the preceding request: {context}"
                 if context
@@ -3740,7 +3925,15 @@ async def answer_records(
     else:
         evidence = precise_evidence(scoped, selection.evidence)
         baseline = len(evidence)
-        if evidence and payload.mode == "agentic":
+        fields = [
+            field
+            for part in requested_parts(scoped)
+            for field in requested_fields(part)
+        ]
+        has_typed_fields = bool(fields) and all(
+            field_evidence(field, "") is not None for field in fields
+        )
+        if evidence and payload.mode == "agentic" and not has_typed_fields:
             try:
                 async with asyncio.timeout(AGENTIC_TIMEOUT_SECONDS):
                     ids = list(
@@ -3755,6 +3948,8 @@ async def answer_records(
                 LOGGER.warning(
                     "Scoped follow-up failed; using resolved records", exc_info=True
                 )
+        elif evidence and has_typed_fields:
+            mode = payload.mode
         sources = [citation(state, item.chunk) for item in evidence]
         record = (
             await record_claims(
@@ -4240,16 +4435,18 @@ async def answer_question(
                     2200,
                     baseline,
                 )
-    parts = requested_parts(scoped)
+    parts = requested_parts(raw_scope)
     if (
         len(years) < 2
         and len(parts) > 1
-        and (THRESHOLD_REQUEST.search(scoped) or PERMISSION_REQUEST.search(scoped))
-        and (key := await shared_original(state, scoped, baseline))
+        and (
+            THRESHOLD_REQUEST.search(raw_scope) or PERMISSION_REQUEST.search(raw_scope)
+        )
+        and (key := await shared_original(state, raw_scope, baseline))
     ):
-        selection = await select_records(state, scoped, pinned=(key,))
+        selection = await select_records(state, raw_scope, pinned=(key,))
         if selection.evidence:
-            return await answer_records(state, scoped, payload, selection)
+            return await answer_records(state, raw_scope, payload, selection)
     dialogue = conversation(payload.history)
     evidence = baseline
     follow_up_context = ""

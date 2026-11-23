@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Literal
 
@@ -20,6 +21,21 @@ CALCULATION_REQUEST = re.compile(
 )
 CALCULATION_REFERENCE = re.compile(
     r"\b(?:same|that|this|those)\s+(?:\w+\s+){0,2}(?:reports?|sheets?|workbooks?|files?|documents?)\b",
+    re.IGNORECASE,
+)
+PRIOR_CALCULATION_PERIOD = re.compile(
+    r"\bthe (?P<period>full.year|annual|monthly|month.only|year.to.date|cumulative) "
+    r"(?:report|statement|sheet|original)\b",
+    re.IGNORECASE,
+)
+PERIOD_CHANGE = re.compile(
+    r"\b(?:year.over.year|change in|difference in|how much (?:did|has) .{1,90}"
+    r"(?:increas\w*|decreas\w*|chang\w*))\b",
+    re.IGNORECASE,
+)
+RECONCILE_SUM = re.compile(
+    r"\b(?:do|does)\s+(?P<terms>[^?]+?\s+plus\s+[^?]+?)\s+"
+    r"(?:reconcile to|equal|match)\s+(?P<total>[^?.]+?)(?=\s+(?:on|for|in)\s+(?:both|each|all)\b|[?.]|$)",
     re.IGNORECASE,
 )
 NUMBER = re.compile(
@@ -105,6 +121,76 @@ class RowChoices(BaseModel):
 
 class Equations(BaseModel):
     equations: list[Equation] = Field(max_length=5)
+
+
+# Build each dated comparison from the same metric in each verified original.
+def period_calculation(
+    question: str, days: list[date], plan: QuantityPlan
+) -> tuple[list[Measure], list[Equation]] | None:
+    if len(days) != 2 or days[0] == days[1]:
+        return None
+    if reconciliation := RECONCILE_SUM.search(question):
+        addends = re.split(r"\s+plus\s+", reconciliation["terms"], flags=re.IGNORECASE)
+        terms = [reconciliation["total"], *addends]
+        if len(terms) > 6:
+            return None
+        fields = [f"Total {term.removeprefix('total ').strip()}" for term in terms]
+        measures = [
+            Measure(row=field, column="", record=record)
+            for record in (1, 2)
+            for field in fields
+        ]
+        equations = [
+            Equation(
+                label=f"Reconciliation difference on {day:%Y-%m-%d}",
+                operation="remainder",
+                inputs=list(
+                    range(index * len(fields) + 1, (index + 1) * len(fields) + 1)
+                ),
+                precision=2,
+            )
+            for index, day in enumerate(days)
+        ]
+        return measures, equations
+    if not PERIOD_CHANGE.search(question):
+        return None
+    unique = {
+        (
+            metric_phrase(field.row).removeprefix("total "),
+            field.column.casefold(),
+        ): field
+        for field in plan.measures
+        if metric_phrase(field.row).removeprefix("total ") in metric_phrase(question)
+    }
+    if not 1 <= len(unique) <= 3:
+        return None
+    measures = [
+        field.model_copy(update={"record": record})
+        for field in unique.values()
+        for record in (1, 2)
+    ]
+    equations = [
+        Equation(
+            label=f"Change in {field.row} from {days[0]:%Y-%m-%d} to {days[1]:%Y-%m-%d}",
+            operation="difference",
+            inputs=[index + 2, index + 1],
+            precision=2,
+        )
+        for index, field in zip(
+            range(0, len(measures), 2), unique.values(), strict=True
+        )
+    ]
+    if re.search(r"\bpercent(?:age)?\b", question, re.IGNORECASE):
+        percent = [
+            item.model_copy(
+                update={"operation": "percent_change", "label": f"{item.label} (%)"}
+            )
+            for item in equations
+        ]
+        if not re.search(r"\b(?:dollars?|amount|absolute)\b", question, re.IGNORECASE):
+            return measures, percent
+        equations = [*equations, *percent]
+    return measures, equations
 
 
 # Validate model-selected arithmetic against explicit comparison language and dimensions.
