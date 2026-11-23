@@ -874,6 +874,30 @@ class EvidenceRankingTests(unittest.TestCase):
         self.assertEqual(used, [sources[2], sources[0]])
         self.assertEqual(server.cited_answer("No supported finding.", sources)[1], [])
 
+    # Merge matching quotes across fields while preserving distinct source references.
+    def test_repeated_passages_merge_before_citation_numbering(self) -> None:
+        sources = [
+            server.Citation(name=name, path=name, url=url)
+            for name, url in (
+                ("Schedule.docx", "/sources/schedule"),
+                ("Schedule.docx", "/sources/schedule"),
+                ("Minutes.docx", "/sources/minutes"),
+            )
+        ]
+        passage = "Training is quarterly, with up to ten hours per participant."
+        answer, used = server.cited_answer(
+            f"> {passage} [1]\n\nA separate condition applies. [1]\n\n"
+            f"> {passage} [2, 3]\n\n> Training hours vary by role. [3]",
+            sources,
+        )
+        self.assertEqual(answer.count(passage), 1)
+        self.assertEqual(
+            answer,
+            f"> {passage} [1] [2]\n\nA separate condition applies. [1]\n\n"
+            "> Training hours vary by role. [2]",
+        )
+        self.assertEqual(used, [sources[0], sources[2]])
+
     # Keep both subjects of a standalone cross-folder question.
     def test_cross_folder_prompt_preserves_both_requested_subjects(self) -> None:
         question = (

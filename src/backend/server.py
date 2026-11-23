@@ -279,6 +279,7 @@ WORD_LIMIT = re.compile(r"\b\d+[\s-]*(?=(?:lines?|sentences?|words?)\b)")
 ONE_LINE = re.compile(r"\b(?:1|one)[\s-]+(?:lines?|sentences?)\b", re.IGNORECASE)
 CITATION_MARKER = re.compile(r"\[(\d{1,3})\]")
 GROUPED_CITATION = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})+)\]")
+QUOTE_CITATIONS = re.compile(r"(?:[ \t]+\[\d{1,3}\])+$")
 REFERENTIAL_QUESTION = re.compile(
     r"\b(?:the (?:earlier|prior|previous|same) (?:figure|total|value|amount|date)|"
     r"how much did (?:it|that|this) change|what about (?:it|that|the previous))\b",
@@ -1147,6 +1148,35 @@ def earlier_record_scope(state: RagflowSession, history: list[ChatMessage]) -> s
     return ""
 
 
+# Merge repeated stand-alone quotes and carry all their proof references forward.
+def merge_quoted_passages(answer: str) -> str:
+    blocks = answer.split("\n\n")
+    kept: list[str] = []
+    positions: dict[str, int] = {}
+    for block in blocks:
+        if not block or not all(line.startswith(">") for line in block.splitlines()):
+            kept.append(block)
+            continue
+        # Keep quotes introduced by a heading with that heading.
+        if kept and re.fullmatch(r"(?:#{1,6} .+|\*\*[^*\n]+\*\*)", kept[-1]):
+            kept.append(block)
+            continue
+        block = block.rstrip()
+        quote = QUOTE_CITATIONS.sub("", block)
+        key = normalized_evidence(re.sub(r"(?m)^> ?", "", quote))
+        if key not in positions:
+            positions[key] = len(kept)
+            kept.append(block)
+            continue
+        index = positions[key]
+        first = QUOTE_CITATIONS.sub("", kept[index])
+        references = dict.fromkeys(
+            CITATION_MARKER.findall(kept[index][len(first) :] + block[len(quote) :])
+        )
+        kept[index] = first + "".join(f" [{ref}]" for ref in references)
+    return "\n\n".join(kept)
+
+
 # Keep only the sources used in the answer and align their visible citation numbers.
 def cited_answer(answer: str, sources: list[Citation]) -> tuple[str, list[Citation]]:
     numbers: dict[int, int] = {}
@@ -1179,7 +1209,7 @@ def cited_answer(answer: str, sources: list[Citation]) -> tuple[str, list[Citati
         lambda match: " ".join(f"[{item.strip()}]" for item in match[1].split(",")),
         answer,
     )
-    replaced = CITATION_MARKER.sub(number, expanded)
+    replaced = CITATION_MARKER.sub(number, merge_quoted_passages(expanded))
     return re.sub(r"(\[\d+\])(?: +\1)+", r"\1", replaced), used
 
 
