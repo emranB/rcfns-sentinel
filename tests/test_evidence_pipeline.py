@@ -1,4 +1,4 @@
-'''Check the shared evidence pipeline when follow-up search helps or fails.'''
+"""Check the shared evidence pipeline when follow-up search helps or fails."""
 
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -12,6 +12,42 @@ from src.backend.ragflow import IndexProgress, RagflowSession
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # A scoped comparison keeps the record opening when search ranks later text first.
+    async def test_period_search_preserves_openings_and_ranked_chunks(self) -> None:
+        opening = server.RetrievedChunk(
+            id="opening", document_id="early", content="Opening inventory counts."
+        )
+        ranked = server.RetrievedChunk(
+            id="ranked", document_id="early", content="An inventory correction."
+        )
+        later = server.RetrievedChunk(
+            id="later", document_id="late", content="Later inventory counts."
+        )
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client)
+            with (
+                patch.object(
+                    server, "record_opening", AsyncMock(side_effect=[later, opening])
+                ),
+                patch.object(
+                    server, "retrieve", AsyncMock(side_effect=[[later], [ranked]])
+                ) as retrieve,
+            ):
+                evidence = await server.comparison_evidence(
+                    state,
+                    "Compare inventory in 2024 vs 2022",
+                    {2024: ["late"], 2022: ["early"]},
+                    180,
+                )
+        self.assertEqual(
+            [(item.period, item.chunk.id) for item in evidence],
+            [(2024, "later"), (2022, "opening"), (2022, "ranked")],
+        )
+        self.assertEqual(
+            [call.kwargs["document_ids"] for call in retrieve.await_args_list],
+            [["late"], ["early"]],
+        )
+
     # Count a clear roll call from the dated original in either requested mode.
     async def test_membership_total_uses_both_roll_call_groups(self) -> None:
         question = "How many council members do we have?"

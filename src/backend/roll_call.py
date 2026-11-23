@@ -1,7 +1,9 @@
-'''Count members accounted for by an unambiguous roll call.'''
+"""Count members accounted for by an unambiguous roll call."""
 
 import re
+from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from unicodedata import normalize
 
 WORD = r"[^\W\d_]+"
@@ -60,6 +62,27 @@ ABSENT = frozenset({"absent", "apologies", "regrets"})
 ROLES = frozenset({"directors", "members", "trustees"})
 NONMEMBERS = frozenset({"staff", "guest", "guests", "observers", "visitors"})
 NO_ABSENCES = frozenset({"none", "nil", "no absences", "no apologies", "no regrets"})
+ROSTER_QUESTION = re.compile(
+    rf"(?:please )?(?:name(?: and list)?|list) (?:all |every )?(?:the )?(?P<group>{GROUP}) "
+    r"(?:members|directors|trustees) (?:in |for )?(?:19|20)\d{2} "
+    r"(?:vs\.?|versus|and) (?:19|20)\d{2}[?.]?",
+    re.IGNORECASE,
+)
+ATTENDANCE_SECTION = re.compile(
+    r"^(present|attendees|regrets(?:/absent)?|absent|apologies|staff|guests?|observers|visitors)"
+    r"(?:\s*:\s*(.*))?$",
+    re.IGNORECASE,
+)
+MEMBER_ROLE = re.compile(
+    r"\b(?:chair\w*|director|member|officer|secretary|treasurer|trustee)\b",
+    re.IGNORECASE,
+)
+OTHER_ROLE = re.compile(
+    r"\b(?:admin\w*|candidate|consultant|ed|executive director|guest|incoming|nominee|observer|staff|visitor)\b",
+    re.IGNORECASE,
+)
+ROLE_SUFFIX = re.compile(r"\s*\(([^()]*)\)\s*$|\s+-\s+(.+)$")
+HONORIFIC = re.compile(r"^(?:dr|miss|mr|mrs|ms|prof)\.?\s+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -158,3 +181,106 @@ def roll_call_count(
     if not present or absent is None or present & absent:
         return None
     return RollCallCount(present=len(present), absent=len(absent))
+
+
+# Find straightforward requests for a membership list across two dated periods.
+def roster_group(question: str) -> str:
+    match = ROSTER_QUESTION.fullmatch(" ".join(question.split()))
+    if match is None:
+        return ""
+    words = re.findall(WORD, match["group"].casefold())
+    return "" if GROUP_EXCLUSIONS.intersection(words) else " ".join(words)
+
+
+# Read the opening attendance block and preserve wrapped entries under their label.
+def attendance_sections(excerpt: str) -> dict[str, str]:
+    lines = [line.strip() for line in excerpt.splitlines() if line.strip()]
+    sections: dict[str, str] = {}
+    label = ""
+    for line in lines[:24]:
+        if match := ATTENDANCE_SECTION.fullmatch(line):
+            label = match[1].casefold()
+            if label in sections:
+                break
+            sections[label] = match[2] or ""
+        elif label:
+            value = sections[label]
+            if (
+                not value
+                or value.endswith((",", ";", "-"))
+                or (
+                    label == "attendees"
+                    and (" - " in line or value.count("(") > value.count(")"))
+                )
+            ):
+                sections[label] = f"{value} {line}".lstrip()
+            else:
+                break
+    return sections
+
+
+# Keep names from member sections or names with an explicit membership role.
+def roster_names(excerpt: str, group: str, source: str) -> list[str]:
+    source_words = " ".join(re.findall(WORD, source.casefold()))
+    if f" {group} " not in f" {source_words} ":
+        return []
+    sections = attendance_sections(excerpt)
+    has_explicit_sections = (
+        PRESENT in sections
+        and bool(sections.keys() & (ABSENT | {"regrets/absent"}))
+        and bool(sections.keys() & NONMEMBERS)
+    )
+    names = []
+    for status, value in sections.items():
+        if status in NONMEMBERS:
+            continue
+        for entry in re.split(r"[,;](?![^()]*\))|\s+and\s+", value):
+            name = entry.strip().removesuffix(" NO QUORUM").strip()
+            suffix = ROLE_SUFFIX.search(name)
+            if suffix:
+                role = suffix[1] or suffix[2]
+                if not MEMBER_ROLE.search(role) or OTHER_ROLE.search(role):
+                    continue
+                name = name[: suffix.start()].strip()
+            elif not has_explicit_sections or status == "attendees":
+                continue
+            name = HONORIFIC.sub("", name)
+            if listed_names(name):
+                names.append(name)
+    return names
+
+
+# Reconcile supported spelling variants that never occur together in a roll call.
+def roster_aliases(roll_calls: list[list[str]]) -> dict[str, str]:
+    frequency = Counter(name for call in roll_calls for name in set(call))
+    calls_by_name: dict[str, set[int]] = {}
+    for index, call in enumerate(roll_calls):
+        for name in call:
+            calls_by_name.setdefault(name, set()).add(index)
+
+    # Keep full names ahead of shortened forms and repeated spellings ahead of typos.
+    def preference(name: str) -> tuple[int, int, str]:
+        return -len(re.findall(WORD, name)), -frequency[name], name.casefold()
+
+    aliases: dict[str, str] = {}
+    for name in sorted(frequency, key=preference):
+        key = " ".join(re.findall(WORD, name.casefold()))
+        for other, canonical in aliases.items():
+            if calls_by_name[name] & calls_by_name[canonical]:
+                continue
+            candidate = " ".join(re.findall(WORD, other.casefold()))
+            if (
+                candidate.startswith(f"{key} ")
+                or candidate == key
+                or (
+                    candidate.split()[0] == key.split()[0]
+                    and abs(len(candidate) - len(key)) <= 1
+                    and SequenceMatcher(None, candidate, key).ratio() >= 0.94
+                )
+            ):
+                aliases[name] = canonical
+                calls_by_name[canonical].update(calls_by_name[name])
+                break
+        else:
+            aliases[name] = name
+    return aliases

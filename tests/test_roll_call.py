@@ -1,8 +1,13 @@
-'''Check that roll calls produce only well-supported membership counts.'''
+"""Check that roll calls produce only well-supported membership counts."""
 
 import unittest
 
-from src.backend.roll_call import RollCallCount, roll_call_count
+from src.backend.roll_call import (
+    RollCallCount,
+    roll_call_count,
+    roster_aliases,
+    roster_names,
+)
 
 SOURCE = "Planning Committee/Meeting Minutes.docx"
 QUESTION = "How many planning committee members do we have?"
@@ -15,6 +20,34 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Recover wrapped names and preserve the distinction between members and attendees.
+    def test_roster_includes_regrets_and_excludes_attendees_with_other_roles(
+        self,
+    ) -> None:
+        excerpt = (
+            "Meeting minutes\nAttendees\nAlex Wood - ED, Reba\n"
+            "Torres Mendez - Trustee, Jamie Du - Chair\nRegrets\nEllis Smith - Trustee\n"
+            "Agenda approval\nChris Banks - Trustee\n"
+        )
+        self.assertEqual(
+            roster_names(excerpt, "planning committee", SOURCE),
+            ["Reba Torres Mendez", "Jamie Du", "Ellis Smith"],
+        )
+        self.assertEqual(roster_names(excerpt, "finance committee", SOURCE), [])
+
+    # Preserve separately listed people even when their recorded names are similar.
+    def test_roster_aliases_require_compatible_roll_calls(self) -> None:
+        names = roster_aliases(
+            [
+                ["Leona Martinez", "Ravi Shah", "Antonio Del Toro"],
+                ["Leona Martnez", "Ravi Shah", "Ravi Shah Jr", "Antonio Del Toro"],
+                ["Leona Martinez", "Antonio Del"],
+            ]
+        )
+        self.assertEqual(names["Leona Martnez"], "Leona Martinez")
+        self.assertEqual(names["Antonio Del"], "Antonio Del Toro")
+        self.assertEqual(names["Ravi Shah"], "Ravi Shah")
+
     # Count both member sections and exclude staff and guests.
     def test_counts_members_in_a_named_group(self) -> None:
         result = roll_call_count(QUESTION, ROLL_CALL, source=SOURCE)

@@ -1,4 +1,4 @@
-'''Serve the browser chat and coordinate document startup and retrieval.'''
+"""Serve the browser chat and coordinate document startup and retrieval."""
 
 from __future__ import annotations
 
@@ -54,7 +54,12 @@ from src.backend.ragflow import (
     prepare_models,
     request,
 )
-from src.backend.roll_call import roll_call_count
+from src.backend.roll_call import (
+    roll_call_count,
+    roster_aliases,
+    roster_group,
+    roster_names,
+)
 from src.backend.source_recovery import (
     InventoryEntry,
     PreparedFiles,
@@ -127,6 +132,19 @@ AGENTIC_TIMEOUT_SECONDS = 75
 CHAT_TIMEOUT_SECONDS = 240
 RECENT_SEARCH_TIMEOUT_SECONDS = 15
 EXCERPT_BUDGET = 10000
+COMPARISON_EVIDENCE_BUDGET = 16000
+COMPARISON_ANSWER_INSTRUCTIONS = (
+    "Give one clearly labeled section for each requested period in the question's order. "
+    "Cite one or two supporting excerpts per finding using separate markers, such as [1] [2]. "
+    "Use the original wording for entries, preserving complete proper names across line breaks. "
+    "Unify short forms and clear spelling variants for the same entry. For a list, write a concise "
+    "list of the verified entries without describing each entry's history or repeating it. "
+    "For a membership list, use full names from the roll calls and confirmed appointments. "
+    "Attendees can include people outside the group. Exclude anyone labeled only as an executive "
+    "director, ED, staff, administrator, guest, or nominee. An incoming member counts once "
+    "confirmed by a dated record. Never fill gaps with initials or partial names when a full form "
+    "appears elsewhere. Keep support for each period in its own citations."
+)
 SUPPLEMENT_BUDGET = 4500
 RECENT_EVIDENCE_BUDGET = 6000
 PLANNING_SAMPLE_SIZE = 750
@@ -267,6 +285,7 @@ class RetrievedChunk(BaseModel):
     id: str = ""
     document_id: str
     content: str
+    available: bool = True
     positions: list[tuple[int, float, float, float, float]] | None = None
 
 
@@ -308,6 +327,7 @@ class Investigation:
 class Excerpt:
     chunk: RetrievedChunk
     text: str
+    period: int | None = None
 
 
 # Link a retrieved chunk to the exact indexed original.
@@ -883,6 +903,7 @@ async def generate(
     prompt: str,
     *,
     output_format: dict[str, object] | None = None,
+    answer_tokens: int = 768,
 ) -> str:
     response = await state.client.post(
         f"{OLLAMA_URL}/api/chat",
@@ -895,7 +916,7 @@ async def generate(
                 "temperature": 0,
                 "presence_penalty": 0,
                 "num_ctx": 8192,
-                "num_predict": 384 if output_format else 768,
+                "num_predict": 384 if output_format else answer_tokens,
                 **({"num_thread": OLLAMA_THREADS} if OLLAMA_THREADS else {}),
             },
             "messages": [
@@ -1063,36 +1084,138 @@ def select_evidence(
     return selected
 
 
-# Search each year independently and reserve evidence space for every period and file.
+# Read a record's first indexed chunk to keep its heading and opening context.
+async def record_opening(
+    state: RagflowSession, document_id: str
+) -> RetrievedChunk | None:
+    if (original := state.locate_document(document_id)) is None:
+        return None
+    dataset, _ = original
+    response = await request(
+        state,
+        "GET",
+        f"/datasets/{dataset}/documents/{quote(document_id, safe='')}/chunks",
+        params={"page_size": 1},
+    )
+    chunks = RetrievalResult.model_validate(response).chunks or []
+    return next(
+        (
+            chunk
+            for chunk in chunks
+            if chunk.available and chunk.document_id == document_id
+        ),
+        None,
+    )
+
+
+# Search each year independently with space for introductions and semantic hits.
 async def comparison_evidence(
     state: RagflowSession, question: str, periods: dict[int, list[str]], budget: int
 ) -> list[Excerpt]:
     subject = YEAR.sub(" ", question)
 
-    # Pick the strongest excerpt from each representative original in chronological order.
+    # Keep each representative original even if its best match is the opening chunk.
     async def search(year: int, document_ids: list[str]) -> list[Excerpt]:
         query = f"{subject}\nPeriod: {year}"
         try:
             async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
                 if not document_ids:
-                    return select_evidence(await retrieve(state, query), budget)
-                hits = await retrieve(state, query, 64, document_ids=document_ids)
-                by_document: dict[str, RetrievedChunk] = {}
-                for hit in hits:
-                    by_document.setdefault(hit.document_id, hit)
-                limit = budget // max(1, len(document_ids))
-                return [
-                    Excerpt(selected, text[:limit])
-                    for document_id in document_ids
-                    if (selected := by_document.get(document_id)) is not None
-                    and (text := format_excerpt(selected.content))
-                ]
+                    return [
+                        Excerpt(item.chunk, item.text, year)
+                        for item in select_evidence(
+                            await retrieve(state, query), budget
+                        )
+                    ]
+                ranked, *openings = await asyncio.gather(
+                    retrieve(state, query, 64, document_ids=document_ids),
+                    *(
+                        record_opening(state, document_id)
+                        for document_id in document_ids
+                    ),
+                    return_exceptions=True,
+                )
         except (httpx.HTTPError, TimeoutError, ValueError, RuntimeError) as error:
             LOGGER.warning("Period search for %s failed: %s", year, error)
             return []
+        by_document: dict[str, RetrievedChunk] = {}
+        if isinstance(ranked, list):
+            for hit in ranked:
+                by_document.setdefault(hit.document_id, hit)
+        elif isinstance(ranked, BaseException):
+            LOGGER.warning("Ranked period search for %s failed: %s", year, ranked)
+        selected = []
+        limit = budget // len(document_ids)
+        for document_id, opening in zip(document_ids, openings, strict=True):
+            if isinstance(opening, BaseException):
+                LOGGER.warning(
+                    "Could not read record opening for %s: %s", document_id, opening
+                )
+            best = by_document.get(document_id)
+            if not isinstance(opening, RetrievedChunk):
+                opening, best = best, None
+            if opening is None:
+                continue
+            if best is not None and best.id == opening.id:
+                best = None
+            opening_text = format_excerpt(opening.content)
+            size = min(len(opening_text), limit * 2 // 3 if best else limit)
+            if opening_text:
+                selected.append(Excerpt(opening, opening_text[:size], year))
+            if best and (text := format_excerpt(best.content)):
+                selected.append(Excerpt(best, text[: limit - size], year))
+        return selected
 
     groups = await asyncio.gather(*(search(year, ids) for year, ids in periods.items()))
     return [item for group in groups for item in group]
+
+
+# Assemble a cited roster when both periods contain clearly labeled membership records.
+def documented_roster(
+    question: str,
+    evidence: list[Excerpt],
+    sources: list[Citation],
+    periods: dict[int, list[str]],
+) -> str:
+    group = roster_group(question)
+    if not group or not all(periods.values()):
+        return ""
+    years = {document_id: year for year, ids in periods.items() for document_id in ids}
+    calls: dict[int, dict[int, list[str]]] = {year: {} for year in periods}
+    processed: set[str] = set()
+    for index, (item, source) in enumerate(zip(evidence, sources, strict=True), 1):
+        document_id = item.chunk.document_id
+        if document_id in processed or document_id not in years:
+            continue
+        names = roster_names(item.text, group, source.path)
+        if names:
+            processed.add(document_id)
+            calls[years[document_id]][index] = names
+    if not all(calls.values()):
+        return ""
+
+    aliases = roster_aliases(
+        [names for records in calls.values() for names in records.values()]
+    )
+    sections = []
+    for year, records in calls.items():
+        entries: dict[str, tuple[str, int]] = {}
+        for index, names in records.items():
+            for name in names:
+                canonical = aliases[name]
+                previous, _ = entries.get(canonical, ("", 0))
+                if canonical == name or (
+                    previous != canonical and len(name) >= len(previous)
+                ):
+                    entries[canonical] = (name, index)
+        bullets = []
+        for name in sorted(entries, key=str.casefold):
+            recorded, index = entries[name]
+            variant = f" (listed as {recorded})" if recorded != name else ""
+            bullets.append(f"- {name}{variant} [{index}]")
+        sections.append(
+            f"### {year} ({len(entries)} documented)\n\n" + "\n".join(bullets)
+        )
+    return "\n\n".join(sections)
 
 
 # Use the same answer path in both modes. Agentic can resolve a follow-up and
@@ -1142,7 +1265,9 @@ async def respond_to_question(
     if periods:
         named_hits, dated_evidence = await asyncio.gather(
             retrieve_named(state, scoped),
-            comparison_evidence(state, scoped, periods, EXCERPT_BUDGET // len(periods)),
+            comparison_evidence(
+                state, scoped, periods, COMPARISON_EVIDENCE_BUDGET // len(periods)
+            ),
         )
         baseline = [*dated_evidence, *select_evidence(named_hits, 2500, dated_evidence)]
         if not baseline:
@@ -1193,18 +1318,38 @@ async def respond_to_question(
     answer = "I could not find that in the searchable files."
     sources = [citation(state, item.chunk) for item in evidence]
     if sources:
-        paths = "\n".join(
-            f"[{index}] {source.path}" for index, source in enumerate(sources, 1)
+        roster = (
+            documented_roster(scoped, evidence, sources, periods) if periods else ""
         )
-        excerpts = "\n\n".join(
-            f"[{index}]\n{item.text}" for index, item in enumerate(evidence, 1)
-        )
-        generated = await generate(
-            state,
-            ANSWER_INSTRUCTIONS,
-            f"Recent conversation:\n{dialogue}{follow_up_context}\n\nSource paths:\n{paths}\n\n"
-            f"Document text:\n{excerpts}\n\nQuestion:\n{scoped}",
-        )
+        if roster:
+            generated = roster
+        elif periods:
+            excerpts = "\n\n".join(
+                f"[{index}] {f'Period {item.period}: ' if item.period else ''}{source.name}\n{item.text}"
+                for index, (item, source) in enumerate(
+                    zip(evidence, sources, strict=True), 1
+                )
+            )
+            generated = await generate(
+                state,
+                f"{ANSWER_INSTRUCTIONS} {COMPARISON_ANSWER_INSTRUCTIONS}",
+                f"Question: {scoped}{follow_up_context}\n\nDocument excerpts:\n{excerpts}\n\n"
+                f"Question: {scoped}",
+                answer_tokens=1600,
+            )
+        else:
+            paths = "\n".join(
+                f"[{index}] {source.path}" for index, source in enumerate(sources, 1)
+            )
+            excerpts = "\n\n".join(
+                f"[{index}]\n{item.text}" for index, item in enumerate(evidence, 1)
+            )
+            generated = await generate(
+                state,
+                ANSWER_INSTRUCTIONS,
+                f"Recent conversation:\n{dialogue}{follow_up_context}\n\nSource paths:\n{paths}\n\n"
+                f"Document text:\n{excerpts}\n\nQuestion:\n{scoped}",
+            )
         answer, sources = cited_answer(generated.strip() or answer, sources)
     return ChatResponse(answer=answer, sources=sources, mode_used=mode)
 
