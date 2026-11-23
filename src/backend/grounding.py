@@ -168,6 +168,7 @@ FIELD_JOIN = re.compile(
     r"(?:[,;]\s+(?:and\s+)?|\s+and\s+)(?=(?:(?:say|state|explain)\s+)?(?:what|when|where|who|how|whether|did|does|were|(?:above|below|over|under) what)\b"
     r"|(?:the\s+)?(?:(?:actual|approved|exact|recorded|specific|annual)\s+)?"
     r"(?:dates?|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|salary|stipend|vote (?:count|tally)"
+    r"|(?:a\s+)?(?:maximum|minimum)\s+(?:[\w-]+\s+){0,4}(?:amount|value|payment|cost|fee)"
     r"|hours? (?:cap|limit)|reporting (?:cadence|frequency)|review interval)\b)",
     re.IGNORECASE,
 )
@@ -325,6 +326,35 @@ LIMIT_FIELD = re.compile(
     r"|\bwhat dollar amount\s+is\s+(?:the\s+)?(?P<limit>combined [^?]+? limit)\b"
     r"|\bwhat dollar amount\b[^?]*\b(?P<bound>minimum|maximum)\s+(?:size|value|amount)\s+of\s+(?P<subject>[^?]+)",
     re.IGNORECASE,
+)
+MONEY_BOUND = re.compile(
+    r"\b(?P<bound>minimum|maximum)\s+(?:(?P<before>[\w-]+(?:\s+[\w-]+){0,4}?)\s+)?"
+    r"(?:amount|value|payment|cost|fee)\b(?:\s+(?:per|for|of)\s+(?P<after>[^?,.]+))?",
+    re.IGNORECASE,
+)
+PRINTED_BOUND = {
+    "maximum": re.compile(
+        r"\b(?:maximum|cap(?:ped)?|ceiling|up to|no more than|must not exceed)\b",
+        re.IGNORECASE,
+    ),
+    "minimum": re.compile(
+        r"\b(?:minimum|floor|at least|no less than)\b", re.IGNORECASE
+    ),
+}
+NO_BOUND = {
+    "maximum": re.compile(
+        r"\b(?:no (?:stated )?(?:maximum|cap|limit|ceiling)|unlimited)\b", re.IGNORECASE
+    ),
+    "minimum": re.compile(r"\bno (?:stated )?(?:minimum|floor)\b", re.IGNORECASE),
+}
+DEADLINE_FIELD = re.compile(
+    r"\b(?:what (?:is|was) (?:the )?|(?:specify|give|list)\s+(?:(?:an?|the)\s+)?)"
+    r"(?:(?P<before>[\w-]+(?:\s+[\w-]+){0,4}?)\s+)?deadline"
+    r"(?:\s+for\s+(?P<after>[^?,.]+))?\b",
+    re.IGNORECASE,
+)
+DEADLINE_PROOF = re.compile(
+    r"\b(?:deadline|due|no later than|by|within)\b", re.IGNORECASE
 )
 STATED_COMPENSATION = re.compile(
     r"^(?:what\s+(?:(?:annual|per[- ]\w+)\s+)?|(?:annual\s+)?)(salary|stipend)\b",
@@ -972,6 +1002,45 @@ def field_evidence(question: str, text: str) -> str | None:
             terms.add(limit["bound"].casefold())
             terms.discard("eligible")
         return matching_measure(lines, CURRENCY_VALUE, terms)
+    if bound := MONEY_BOUND.search(question):
+        bound_terms = (
+            source_terms(bound["before"] or bound["after"] or "")
+            - STOP
+            - FIELD_TERMS
+            - {"per"}
+        )
+        kind = bound["bound"].casefold()
+        proof = PRINTED_BOUND[kind]
+        no_bound = NO_BOUND[kind]
+        matches = [
+            line
+            for line in lines
+            if (
+                (proof.search(line) and CURRENCY_VALUE.search(line))
+                or no_bound.search(line)
+            )
+            and focus_matches(frozenset(source_terms(line)), bound_terms)
+            == len(bound_terms)
+        ]
+        return "\n".join(dict.fromkeys(matches))
+    if deadline := DEADLINE_FIELD.search(question):
+        subjects = (
+            source_terms(deadline["before"] or deadline["after"] or "")
+            - STOP
+            - FIELD_TERMS
+        )
+        if not subjects:
+            return None
+        return "\n".join(
+            dict.fromkeys(
+                line
+                for line in lines
+                if DEADLINE_PROOF.search(line)
+                and (DATE.search(line) or DURATION_VALUE.search(line))
+                and focus_matches(frozenset(source_terms(line)), subjects)
+                == len(subjects)
+            )
+        ) or labeled_passage(question, text)
     if compensation := STATED_COMPENSATION.search(question):
         return matching_measure(lines, CURRENCY_VALUE, {compensation[1].casefold()})
     if CONTACT_FIELD.search(question):

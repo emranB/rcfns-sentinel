@@ -80,6 +80,39 @@ class RecordEvidenceTests(unittest.TestCase):
         self.assertEqual(labeled_passage(q, f"{income}\n{schedule}"), schedule)
         self.assertEqual(labeled_passage(q, income), "")
 
+    # Reimbursement eligibility never fills the missing dollar cap.
+    def test_missing_bound_stays_missing_when_other_facts_are_present(self) -> None:
+        q = "What maximum travel reimbursement amount is listed?"
+        policy = (
+            "Travel reimbursement is available.\nSoftware purchases are capped at $200."
+        )
+        self.assertEqual(field_evidence(q, policy), "")
+        self.assertEqual(
+            field_evidence(q, f"{policy}\nTravel reimbursement is capped at $80."),
+            "Travel reimbursement is capped at $80.",
+        )
+        self.assertEqual(
+            field_evidence(q, "There is no cap for travel reimbursement."),
+            "There is no cap for travel reimbursement.",
+        )
+
+    # Distinguish a requested due date from the separate ceiling on each payment.
+    def test_coordinated_deadline_and_amount_each_get_a_verification(self) -> None:
+        fields = requested_fields(
+            "Does the policy specify an application deadline and a maximum amount per grant?"
+        )
+        self.assertEqual(len(fields), 2)
+        original = (
+            "The application deadline is August 15, 2019.\nA grant can be up to $350."
+        )
+        self.assertEqual(
+            [field_evidence(field, original) for field in fields], original.splitlines()
+        )
+        self.assertEqual(
+            [field_evidence(field, "Grants are available.") for field in fields],
+            ["", ""],
+        )
+
     # A start date inherits the subject rather than choosing a different application milestone.
     def test_start_date_passage_preserves_the_continuation(self) -> None:
         question = "What is the pilot award amount, when does it start?"
