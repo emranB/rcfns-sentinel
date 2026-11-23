@@ -17,6 +17,7 @@ WORD_BODY = "word/document.xml"
 WORD_MARGINS = re.compile(r"word/(?:header|footer)[^/]*\.xml")
 SHEETS = re.compile(r"xl/worksheets/[^/]+\.xml")
 SLIDES = re.compile(r"ppt/slides/slide[0-9]+\.xml")
+SLIDE_REFERENCE = re.compile(r"\bslide\b", re.IGNORECASE)
 MEDIA_DIRS = ("word/media/", "xl/media/", "ppt/media/")
 EMBEDDED_DIRS = ("word/embeddings/", "xl/embeddings/", "ppt/embeddings/")
 
@@ -216,6 +217,49 @@ def word_body(payload: bytes) -> str:
         for element in root.iter()
         if tag_name(element) == "p" and (text := paragraph_text(element))
     )
+
+
+# Keep a uniquely named slide intact so adjacent slides cannot supply its details.
+def named_slide(payload: bytes, question: str) -> str:
+    references = re.split(r"[\s\"'\u2018\u2019\u201c\u201d]+", question.casefold())
+    # Compare title words immediately before each mention of a slide.
+    names = {
+        " ".join(references[start:index])
+        for index, word in enumerate(references)
+        if word.rstrip(".,?!:;") == "slide"
+        for start in range(max(0, index - 12), index)
+    }
+    if not names:
+        return ""
+    try:
+        with ZipFile(BytesIO(payload)) as archive:
+            roots = read_parts(
+                archive,
+                [name for name in archive.namelist() if SLIDES.fullmatch(name)],
+            )
+    except (BadZipFile, KeyError, OSError, ParseError, RuntimeError, ValueError):
+        return ""
+    matches = []
+    for root in roots:
+        groups = [
+            paragraphs
+            for shape in root.iter()
+            if tag_name(shape) in {"sp", "graphicFrame"}
+            and (
+                paragraphs := [
+                    text
+                    for element in shape.iter()
+                    if tag_name(element) == "p" and (text := paragraph_text(element))
+                ]
+            )
+        ]
+        if any(
+            " ".join(line.casefold().split()) in names
+            for group in groups
+            for line in group
+        ):
+            matches.append("\n\n".join("\n".join(group) for group in groups))
+    return matches[0] if len(matches) == 1 else ""
 
 
 # Require real worksheets and rule out formulas, values, comments, and visual content.

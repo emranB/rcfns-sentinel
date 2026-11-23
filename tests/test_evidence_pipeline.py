@@ -7,7 +7,12 @@ import httpx
 
 from src.backend import server
 from src.backend.evidence import format_excerpt
-from src.backend.grounding import ClaimAnswer
+from src.backend.grounding import (
+    INCOMPLETE_TEXT,
+    ClaimAnswer,
+    CoverageReview,
+    EvidenceText,
+)
 from src.backend.library_overview import build_overview
 from src.backend.ragflow import IndexProgress, RagflowSession
 
@@ -26,6 +31,98 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Clear a draft warning only after checking the actual requested details.
+    async def test_scoped_coverage_preserves_genuine_gaps(self) -> None:
+        decisions = "Replace the aging pump and inspect the outlet valve."
+        record = EvidenceText("Maintenance briefing", f"Next Work\n{decisions}")
+        draft = ClaimAnswer.model_validate_json(literal_claims(decisions))
+        draft.incomplete = True
+        good = CoverageReview(
+            covered=["Replace the aging pump", "inspect the outlet valve"], missing=[]
+        )
+        cases = (
+            ("List the decisions under Next Work.", good.model_dump_json(), False),
+            (
+                "List the decisions under Next Work and give their approved cost.",
+                good.model_copy(
+                    update={"missing": ["approved cost"]}
+                ).model_dump_json(),
+                True,
+            ),
+            (
+                "List the decisions under Next Work.",
+                good.model_copy(
+                    update={"covered": ["Buy a new valve"]}
+                ).model_dump_json(),
+                True,
+            ),
+            ("List the decisions under Next Work.", "{}", True),
+        )
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(client)
+            for question, review, warns in cases:
+                with (
+                    self.subTest(question=question, review=review),
+                    patch.object(
+                        server,
+                        "generate",
+                        AsyncMock(side_effect=[draft.model_dump_json(), review]),
+                    ) as generate,
+                ):
+                    answer = await server.read_claims(
+                        state, question, [record], [0], coverage="partial"
+                    )
+                    self.assertIn(f"{decisions} [1]", answer)
+                    self.assertEqual(answer.endswith(INCOMPLETE_TEXT), warns)
+                    self.assertEqual(generate.await_count, 2)
+                    self.assertIn(question, generate.await_args_list[-1].args[2])
+
+    # A fully supported draft can be returned without a separate coverage request.
+    async def test_complete_scoped_draft_needs_no_coverage_review(self) -> None:
+        line = "The delivery arrived on Friday."
+        async with httpx.AsyncClient() as client:
+            with patch.object(
+                server, "generate", AsyncMock(return_value=literal_claims(line))
+            ) as generate:
+                answer = await server.read_claims(
+                    RagflowSession(client),
+                    "When did the delivery arrive?",
+                    [EvidenceText("Delivery log", line)],
+                    [0],
+                    coverage="partial",
+                )
+                self.assertEqual(answer, f"{line} [1]")
+                generate.assert_awaited_once()
+
+    # A complete draft flag cannot hide a verified gap on a specifically requested slide.
+    async def test_named_slide_review_catches_a_silent_omission(self) -> None:
+        question = "Give the decisions and the approved cost on the Next Work slide."
+        line = "Inspect the outlet valve."
+        check = CoverageReview(covered=[line], missing=["the approved cost"])
+        draft = ClaimAnswer.model_validate_json(literal_claims(line))
+        draft.claims[0].proofs[0].source = 2
+        async with httpx.AsyncClient() as client:
+            with patch.object(
+                server,
+                "generate",
+                AsyncMock(
+                    side_effect=[draft.model_dump_json(), check.model_dump_json()]
+                ),
+            ) as generate:
+                answer = await server.read_claims(
+                    RagflowSession(client),
+                    question,
+                    [
+                        EvidenceText("Earlier slides", "Approved cost: $8,000."),
+                        EvidenceText("Next Work", line),
+                    ],
+                    [1],
+                    coverage="always",
+                )
+                self.assertIn(f"{line} [2]", answer)
+                self.assertNotIn("$8,000", generate.await_args_list[-1].args[2])
+                self.assertTrue(answer.endswith(INCOMPLETE_TEXT))
+
     # Verify that comparison facts survive an extra Agentic evidence pass.
     async def test_preserves_original_and_new_milestones_in_both_modes(self) -> None:
         question = (

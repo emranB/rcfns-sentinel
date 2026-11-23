@@ -186,6 +186,11 @@ class ClaimAnswer(BaseModel):
     incomplete: bool
 
 
+class CoverageReview(BaseModel):
+    covered: list[str] = Field(max_length=24)
+    missing: list[str] = Field(max_length=24)
+
+
 @dataclass(frozen=True)
 class EvidenceText:
     label: str

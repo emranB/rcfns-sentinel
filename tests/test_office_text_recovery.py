@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 from zipfile import ZipFile
 
-from src.backend.office_text_recovery import recover_office_text, restore_word_outline
+from src.backend.office_text_recovery import (
+    named_slide,
+    recover_office_text,
+    restore_word_outline,
+)
 
 
 # Create a minimal test package without depending on an Office application.
@@ -17,6 +21,32 @@ def make_package(path: Path, parts: dict[str, str]) -> Path:
 
 
 class OfficeTextRecoveryTests(unittest.TestCase):
+    # A question about a named slide cannot borrow figures from its neighbors.
+    def test_named_slide_reads_only_the_unique_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "briefing.pptx"
+            first = (
+                "<sld><sp><p><r><t>Planned Work</t></r></p></sp>"
+                "<sp><p><r><t>Inspect the valve</t></r></p></sp></sld>"
+            )
+            other = (
+                "<sld><sp><p><r><t>Spending</t></r></p></sp>"
+                "<sp><p><r><t>$8,000</t></r></p></sp></sld>"
+            )
+            parts = {
+                "ppt/slides/slide1.xml": first,
+                "ppt/slides/slide2.xml": other,
+            }
+            question = 'What is on the "Planned Work" slide?'
+            self.assertEqual(
+                named_slide(make_package(path, parts).read_bytes(), question),
+                "Planned Work\n\nInspect the valve",
+            )
+            parts["ppt/slides/slide3.xml"] = first
+            self.assertEqual(
+                named_slide(make_package(path, parts).read_bytes(), question), ""
+            )
+
     # Recover body, header, and footer in reading order without duplicating a text box.
     def test_word_text_is_literal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
