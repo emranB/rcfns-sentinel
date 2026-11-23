@@ -486,6 +486,33 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 )
         select.assert_awaited_once_with(state, question, pinned=("recent", "new"))
 
+    # Bind an unambiguous subject reference and keep explicit source switches separate.
+    def test_follow_up_uses_a_single_prior_subject_only_until_switch(self) -> None:
+        originals = [
+            ("work", "Operations/Working Group Charter.pdf"),
+            ("staff", "Personnel/Staff Charter.pdf"),
+            ("program", "Programs/NCAS Fund Agreement.docx"),
+        ]
+        previous = server.EvidenceContext(
+            question="Who chairs the working group?", document_ids=["work"]
+        )
+        self.assertEqual(
+            server.retained_original_ids(
+                "How often does that group meet?", previous, originals
+            ),
+            ("work",),
+        )
+        self.assertEqual(
+            server.retained_original_ids(
+                "Does it differ from Staff Charter.pdf?", previous, originals
+            ),
+            (),
+        )
+        self.assertEqual(
+            server.subject_aliases("Northern Community Arts Society", originals),
+            ["program"],
+        )
+
     # Clear a draft warning only after checking the actual requested details.
     async def test_scoped_coverage_preserves_genuine_gaps(self) -> None:
         decisions = "Replace the aging pump and inspect the outlet valve."

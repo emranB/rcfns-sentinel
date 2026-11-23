@@ -41,6 +41,7 @@ from src.backend.evidence import format_excerpt
 from src.backend.grounding import (
     APPROVAL_AUTHORITY,
     INCOMPLETE_TEXT,
+    PERMISSION_REQUEST,
     THRESHOLD_REQUEST,
     ClaimAnswer,
     CoverageReview,
@@ -333,7 +334,12 @@ REFERENTIAL_QUESTION = re.compile(
     re.IGNORECASE,
 )
 SOURCE_PRONOUN = re.compile(
-    r"\b(?:its|this (?:file|document|record|report)|that (?:file|document|record|report))\b",
+    r"\b(?:its|(?:does|did|can|could|will|would) it|"
+    r"(?:this|that) (?:file|document|record|report))\b",
+    re.IGNORECASE,
+)
+PRIOR_SUBJECT = re.compile(
+    r"\b(?:that|this) (?:group|team|committee|panel|program|initiative|fund|project)\b",
     re.IGNORECASE,
 )
 RECORD_FOLLOW_UP = re.compile(
@@ -504,6 +510,11 @@ class SearchPlan(BaseModel):
     reuse_sources: bool
     file_title: str = Field(max_length=160)
     open_file: bool
+
+
+class SubjectName(BaseModel):
+    name: str = Field(max_length=160)
+    source: int = Field(ge=0)
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1326,147 @@ async def semantic_plan(
     return fallback
 
 
+# Match a verified public name and its initials against indexed titles.
+def subject_aliases(name: str, originals: Iterable[tuple[str, str]]) -> list[str]:
+    words = title_tokens(name)
+    initials = "".join(word[0] for word in words if word not in TITLE_STOP_WORDS)
+    if len(initials) < 3 or not initials.isalpha():
+        return []
+    return [
+        key for key, path in originals if initials in title_tokens(Path(path).stem)
+    ][:MAX_EXPLICIT_ORIGINALS]
+
+
+# Confirm a shared subject's formal name before widening a search to related originals.
+async def shared_original(
+    state: RagflowSession, question: str, evidence: list[Excerpt]
+) -> str:
+    if not evidence:
+        return ""
+    # Include independent source introductions, not just the largest chunk.
+    documents: dict[str, str] = {}
+    for item in evidence:
+        documents.setdefault(item.chunk.document_id, item.text[:1100])
+    labels = dict(indexed_originals(state))
+    samples = list(documents.items())[:8]
+    snippets = "\n\n".join(
+        f"[{index}] {labels[key]}\n{sample}"
+        for index, (key, sample) in enumerate(samples, 1)
+        if key in labels
+    )
+    with suppress(httpx.HTTPError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            result = SubjectName.model_validate_json(
+                await generate(
+                    state,
+                    "Find the single named subject shared by all parts of the question. "
+                    "Identify the formal name of that specific entity, group, program or agreement "
+                    "as a contiguous quotation from one excerpt. Use no other person's or program's name. "
+                    "Give the excerpt number. If no exact relevant name is shown or the question asks "
+                    "about different subjects, return empty name and source zero.",
+                    f"Question: {question}\n\n{snippets}",
+                    output_format=SubjectName.model_json_schema(),
+                    answer_tokens=128,
+                )
+            )
+            if not result.name.strip() or not 1 <= result.source <= len(samples):
+                return ""
+            key, snippet = samples[result.source - 1]
+            name = f" {' '.join(title_tokens(result.name))} "
+            if name not in f" {' '.join(title_tokens(snippet))} ":
+                return ""
+            fields = [
+                field
+                for part in requested_parts(question)
+                for field in requested_fields(part)
+            ]
+            hits = await asyncio.gather(
+                *(retrieve(state, f"{result.name} {field}", 9) for field in fields[:4]),
+                return_exceptions=True,
+            )
+            matching_titles = named_document_ids(result.name, labels.items())
+            candidates = dict.fromkeys(
+                (
+                    *subject_aliases(result.name, labels.items()),
+                    *matching_titles,
+                    *(
+                        hit.document_id
+                        for hit in spread_results(
+                            item
+                            for batch in hits
+                            if isinstance(batch, list)
+                            for item in batch
+                        )
+                    ),
+                    key,
+                )
+            )
+            return await operative_original(
+                state, result.name, question, candidates, labels
+            )
+    return ""
+
+
+# Prefer related originals with literal evidence for the distinguishing question.
+async def operative_original(
+    state: RagflowSession,
+    name: str,
+    question: str,
+    candidates: Iterable[str],
+    labels: dict[str, str],
+) -> str:
+    parts = requested_parts(question)
+    fields = [field for part in parts for field in requested_fields(part)]
+    name_terms = source_terms(name) - TITLE_STOP_WORDS
+    if not name_terms:
+        return ""
+    shortlist = [
+        key
+        for key in candidates
+        if Path(labels.get(key, "")).suffix.casefold() in {".docx", ".pdf"}
+    ][:9]
+
+    # A threshold or authorization must come from the actual operative text.
+    async def inspect(key: str) -> tuple[int, str]:
+        path = labels[key]
+        filename = Path(path).stem
+        title = set(title_tokens(filename))
+        if title & {"draft", "wip", "template", "proposal"}:
+            return 0, key
+        try:
+            opening = await record_opening(state, key)
+            if opening is None:
+                return 0, key
+            text = await original_record_text(state, opening, citation(state, opening))
+        except (httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
+            return 0, key
+        if not name_terms <= source_terms(f"{filename}\n{text}"):
+            return 0, key
+        literals = sum(
+            bool(
+                threshold_passage(part, text)
+                or (PERMISSION_REQUEST.search(part) and labeled_passage(part, text))
+            )
+            for part in fields
+        )
+        if not literals:
+            return 0, key
+        relevance = sum(bool(primary_passages(part, text)) for part in fields)
+        score = (
+            10 * literals
+            + relevance
+            + 3 * bool(title & {"approved", "signed", "executed"})
+        )
+        return score, key
+
+    ranked = await asyncio.gather(*(inspect(key) for key in shortlist))
+    return (
+        max(ranked, key=lambda item: item[0], default=(0, ""))[1]
+        if any(score for score, _ in ranked)
+        else ""
+    )
+
+
 # Identify search terms without mistaking a length instruction for a subject.
 def question_words(question: str) -> set[str]:
     return set(QUESTION_WORD.findall(WORD_LIMIT.sub("", question.casefold())))
@@ -1433,6 +1585,13 @@ def retained_original_ids(
     paths = dict(originals)
     previous = tuple(key for key in prior.document_ids if key in paths)
     if len(previous) > 1 and PRIOR_RECORDS.search(question):
+        return previous
+    if (
+        len(previous) == 1
+        and (PRIOR_SUBJECT.search(question) or SOURCE_PRONOUN.search(question))
+        and not YEAR.search(question)
+        and not explicit_ids(question, paths.items(), filenames_only=True)
+    ):
         return previous
     if reference := PRIOR_RECORD_YEAR.search(question):
         requested = reference["year"]
@@ -3288,7 +3447,13 @@ async def answer_parts(
         elif (
             len(urls) == 1
             and file_type == ".pdf"
-            and (typed or APPROVAL_AUTHORITY.search(question))
+            and (
+                typed
+                or APPROVAL_AUTHORITY.search(question)
+                or PERMISSION_REQUEST.search(question)
+                or THRESHOLD_REQUEST.search(question)
+                or len(parts) > 1
+            )
         ):
             with suppress(httpx.HTTPError, OSError, TimeoutError):
                 async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
@@ -3792,6 +3957,18 @@ async def answer_verified_file(
     )
 
 
+# Reopen the exact cited original, including its reporting date and literal totals.
+async def retained_file(state: RagflowSession, document_id: str) -> VerifiedFile | None:
+    with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
+        async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
+            if opening := await record_opening(state, document_id):
+                source = citation(state, opening).model_copy(update={"regions": []})
+                text = await original_record_text(state, opening, source)
+                day = document_period(Path(source.name).stem, text[:1300])
+                return VerifiedFile(document_id, source, day, text)
+    return None
+
+
 # Give the same verified membership evidence for names and counts in a specified year.
 async def membership_in_year(
     state: RagflowSession,
@@ -3887,11 +4064,15 @@ async def answer_question(
         None,
     )
     record_question = question
+    retained_match = None
     async with asyncio.timeout(25):
         record_scope = question
         pinned: tuple[str, ...] = ()
         if prior is not None and (
-            PRIOR_RECORDS.search(question) or PRIOR_RECORD_YEAR.search(question)
+            PRIOR_RECORDS.search(question)
+            or PRIOR_RECORD_YEAR.search(question)
+            or PRIOR_SUBJECT.search(question)
+            or SOURCE_PRONOUN.search(question)
         ):
             originals = list(indexed_originals(state))
             if retained := retained_original_ids(question, prior, originals):
@@ -3899,6 +4080,8 @@ async def answer_question(
                 pinned = tuple(dict.fromkeys((*retained, *named)))[
                     :MAX_EXPLICIT_ORIGINALS
                 ]
+                if len(pinned) == 1:
+                    retained_match = await retained_file(state, pinned[0])
         if not pinned and payload.history and SAME_RECORD.search(question):
             originals = list(indexed_originals(state))
             if (
@@ -3910,8 +4093,8 @@ async def answer_question(
                 pinned = referenced_originals(question, earlier, originals)
         records = (
             await select_records(state, record_scope, pinned=pinned)
-            if pinned
-            else await select_records(state, record_scope)
+            if retained_match is None
+            else RecordSelection(requested=True)
         )
         if (
             not records.requested
@@ -3927,6 +4110,8 @@ async def answer_question(
         if not records.requested and scoped != question:
             records = await select_records(state, scoped)
             record_question = scoped
+    if retained_match is not None:
+        return await answer_verified_file(state, question, payload, retained_match)
     if records.requested:
         return await answer_records(state, record_question, payload, records)
     if count_scope:
@@ -3963,30 +4148,17 @@ async def answer_question(
         and (checked := await reconcile_statements(state, resolved_years, payload.mode))
     ):
         return checked
-    if prior is not None and (
-        plan.reuse_sources or (not years and SOURCE_PRONOUN.search(scoped))
-    ):
+    if prior is not None and plan.reuse_sources:
         documents = tuple(
             key for key in prior.document_ids if state.locate_document(key) is not None
         )
         if documents:
-            if len(documents) == 1:
-                original = None
-                with suppress(
-                    httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError
-                ):
-                    async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
-                        if opening := await record_opening(state, documents[0]):
-                            source = citation(state, opening).model_copy(
-                                update={"regions": []}
-                            )
-                            text = await original_record_text(state, opening, source)
-                            day = document_period(Path(source.name).stem, text[:1300])
-                            original = VerifiedFile(documents[0], source, day, text)
-                if original is not None:
-                    return await answer_verified_file(
-                        state, plan.question, payload, original
-                    )
+            if len(documents) == 1 and (
+                original := await retained_file(state, documents[0])
+            ):
+                return await answer_verified_file(
+                    state, plan.question, payload, original
+                )
             selection = await select_records(state, plan.question, pinned=documents)
             if selection.evidence:
                 return remember_evidence(
@@ -4068,6 +4240,16 @@ async def answer_question(
                     2200,
                     baseline,
                 )
+    parts = requested_parts(scoped)
+    if (
+        len(years) < 2
+        and len(parts) > 1
+        and (THRESHOLD_REQUEST.search(scoped) or PERMISSION_REQUEST.search(scoped))
+        and (key := await shared_original(state, scoped, baseline))
+    ):
+        selection = await select_records(state, scoped, pinned=(key,))
+        if selection.evidence:
+            return await answer_records(state, scoped, payload, selection)
     dialogue = conversation(payload.history)
     evidence = baseline
     follow_up_context = ""

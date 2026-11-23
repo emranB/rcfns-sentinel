@@ -264,9 +264,43 @@ UNIT_FIELD = re.compile(
     re.IGNORECASE,
 )
 COORDINATED_UNITS = re.compile(
-    r"^(.+?)\s+for\s+(.+?)\s+and\s+for\s+(.+)$", re.IGNORECASE
+    r"^(.+?)\s+for\s+([^,?]+(?:,\s*[^,?]+){0,4})"
+    r"(?:,?\s+and\s+(?:for\s+)?([^,?]+))$",
+    re.IGNORECASE,
 )
 UNIT_SUBJECT = re.compile(r"\bfor\s+([^?]+)$", re.IGNORECASE)
+TIME_COMMITMENT = re.compile(
+    r"^how much (?:annual |weekly |monthly )?time\b", re.IGNORECASE
+)
+PERMISSION_REQUEST = re.compile(
+    r"\b(?:can|could|may|authorized to|allowed to)\b[^?]{0,85}?"
+    r"\b(?:approve|authoriz\w*|sign|enter into|issue)\s+(?P<object>[^?.,]+)",
+    re.IGNORECASE,
+)
+PERMISSION_PROOF = re.compile(
+    r"\b(?:authority to|(?:not )?authoriz\w* to|(?:not )?allowed to|(?:may|can) (?:not )?)"
+    r"\s*(?:approve|authoriz\w*|sign|enter into|issue)\b|"
+    r"\b(?:cannot|may not|must not)\s+(?:approve|authoriz\w*|sign|enter into|issue)\b",
+    re.IGNORECASE,
+)
+START_REQUEST = re.compile(
+    r"^when (?:does|did|will) (?:it|that) (?:start|begin|commence)\b",
+    re.IGNORECASE,
+)
+START_PROOF = re.compile(
+    r"\b(?:start|begin|commenc|launch|effectiv)\w*\b[^.!?]{0,70}\b(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+PAYOUT_DATE_REQUEST = re.compile(
+    r"\b(?:calendar day|date)\s+(?:for|of|when)\s+"
+    r"(?:pay\w*|disburs\w*|distribut\w*|award\w*)\b",
+    re.IGNORECASE,
+)
+PAYOUT_DATE_LABEL = re.compile(
+    r"^.{0,80}\b(?:payment|payout|funds awarded|disbursement|distribution date)\b"
+    r".{0,50}\b(?:recipient|account|payment|disbursement)\b",
+    re.IGNORECASE,
+)
 WHEN_EVENT = re.compile(
     r"^when\s+(?:was|were|is|are|did)\b[^?]{0,125}"
     r"\b(?P<phase>complet|submit|start|sign|approv)\w*\b",
@@ -499,7 +533,7 @@ def focus_matches(terms: frozenset[str], focus: set[str]) -> int:
 def requested_parts(question: str) -> list[str]:
     parts: list[str] = []
     for line in re.split(r"(?<=[.?!])\s+", question.strip()):
-        if not PART_REQUEST.search(line):
+        if not line.endswith("?") and not PART_REQUEST.search(line):
             continue
         if parts and RECIPIENT_QUESTION.fullmatch(line.strip()):
             fields = requested_fields(parts[-1])
@@ -533,8 +567,18 @@ def requested_fields(part: str) -> list[str]:
             piece.strip().rstrip(" ?,.;"),
             flags=re.IGNORECASE,
         )
-        if UNIT_FIELD.search(text) and (parallel := COORDINATED_UNITS.match(text)):
-            fields.extend(f"{parallel[1]} for {parallel[index]}" for index in (2, 3))
+        if (UNIT_FIELD.search(text) or TIME_COMMITMENT.search(text)) and (
+            parallel := COORDINATED_UNITS.match(text)
+        ):
+            head = (
+                "How many hours are expected"
+                if TIME_COMMITMENT.search(text)
+                else parallel[1]
+            )
+            fields.extend(
+                f"{head} for {topic.strip()}"
+                for topic in (*parallel[2].split(","), parallel[3])
+            )
         else:
             fields.append(text)
     return fields
@@ -582,7 +626,8 @@ def primary_passages(detail: str, text: str, context: str = "") -> str:
     if not subjects and not related:
         return ""
     ranked: list[tuple[int, int, str]] = []
-    for line in dict.fromkeys(text.splitlines()):
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
@@ -590,8 +635,15 @@ def primary_passages(detail: str, text: str, context: str = "") -> str:
         direct = focus_matches(terms, subjects)
         supporting = focus_matches(terms, related)
         if direct or supporting:
-            ranked.append((3 * direct + 2 * supporting, -len(line), line))
-    return "\n".join(line for _, _, line in sorted(ranked, reverse=True)[:7])[:4600]
+            timing = (
+                5 if START_REQUEST.search(detail) and START_PROOF.search(line) else 0
+            )
+            if timing and not line.endswith((".", "!", "?")) and index + 1 < len(lines):
+                line = f"{line} {lines[index + 1].strip()}"
+            ranked.append((3 * direct + 2 * supporting + timing, -len(line), line))
+    return "\n".join(
+        dict.fromkeys(line for _, _, line in sorted(ranked, reverse=True)[:7])
+    )[:4600]
 
 
 # Recover a single printed monetary threshold, retaining its original condition.
@@ -720,12 +772,25 @@ def field_evidence(question: str, text: str) -> str | None:
         measurement = re.compile(rf"\b{TALLY_NUMBER}[- ]+{label}s?\b", re.IGNORECASE)
         subject = UNIT_SUBJECT.search(question)
         topics = source_terms(subject[1]) - STOP - FIELD_TERMS if subject else set()
-        return "\n".join(
-            line
-            for line in lines
-            if measurement.search(line)
-            and focus_matches(frozenset(source_terms(line)), topics) == len(topics)
-        )
+        exact: list[str] = []
+        heading_matches: list[str] = []
+        for line in lines:
+            if not measurement.search(line):
+                continue
+            line_terms = frozenset(source_terms(line))
+            if focus_matches(line_terms, topics) == len(topics):
+                exact.append(line)
+            if (
+                ":" in line
+                and (
+                    heading := source_terms(line.partition(":")[0])
+                    - STOP
+                    - {"one", "hours"}
+                )
+                and heading <= topics
+            ):
+                heading_matches.append(line)
+        return "\n".join(heading_matches or exact)
     if relative := RELATIVE_DELAY.search(question):
         trigger = source_terms(relative["event"])
         return "\n".join(
@@ -941,6 +1006,27 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if PAYOUT_DATE_REQUEST.search(question):
+        schedules = [
+            line
+            for line in lines
+            if PAYOUT_DATE_LABEL.search(line) and DATE.search(line)
+        ]
+        if len(schedules) == 1:
+            return schedules[0]
+    if permission := PERMISSION_REQUEST.search(question):
+        permission_object = source_terms(permission["object"]) - STOP - FIELD_TERMS
+        permission_rules = dict.fromkeys(
+            line
+            for line in lines
+            if len(line) <= 550
+            and PERMISSION_PROOF.search(line)
+            and permission_object
+            and focus_matches(frozenset(source_terms(line)), permission_object)
+            == len(permission_object)
+        )
+        if len(permission_rules) == 1:
+            return next(iter(permission_rules))
     if relationship := RELATIONSHIP_REQUEST.match(question):
         topics = source_terms(relationship["topic"]) - STOP - FIELD_TERMS
         contacts = {

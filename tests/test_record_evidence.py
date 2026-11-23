@@ -50,6 +50,50 @@ class RecordEvidenceTests(unittest.TestCase):
             ).startswith("Termination takes effect")
         )
 
+    # Each requested time estimate must stay with its own activity.
+    def test_time_commitment_list_preserves_qualified_totals(self) -> None:
+        fields = requested_fields(
+            "How much annual time is expected for touring, rehearsals, and overall?"
+        )
+        record = "Touring: 20 hours.\nRehearsals: 7-9 hours.\nOverall: 31 hours."
+        self.assertEqual(
+            [field_evidence(field, record) for field in fields], record.splitlines()
+        )
+
+    # A recommendation and an unrelated permission are not proof of authority.
+    def test_permission_preserves_negative_and_requested_object(self) -> None:
+        question = "Could the panel sign service contracts?"
+        rule = "The panel has no delegated authority to approve service contracts."
+        proposal = "The panel can recommend approval of service contracts."
+        unrelated = "The panel can sign travel forms."
+        self.assertEqual(
+            labeled_passage(question, f"{proposal}\n{unrelated}\n{rule}"), rule
+        )
+        self.assertEqual(labeled_passage(question, f"{proposal}\n{unrelated}"), "")
+
+    # A dated payout schedule is distinct from the due date for distributing income.
+    def test_payout_date_keeps_actual_schedule_label(self) -> None:
+        q = "Is there a calendar day for paying individual recipients?"
+        schedule = "Funds awarded to recipient's account: Nov 23, 2019"
+        income = "Fund income must be distributed by December 10 of each year."
+        self.assertEqual(labeled_passage(q, f"{income}\n{schedule}"), schedule)
+        self.assertEqual(labeled_passage(q, income), "")
+
+    # A start date inherits the subject rather than choosing a different application milestone.
+    def test_start_date_passage_preserves_the_continuation(self) -> None:
+        question = "What is the pilot award amount, when does it start?"
+        detail = "when does it start"
+        context = field_context(question, detail)
+        headings = (
+            "Applications open October 1, 2015.\n"
+            "One pilot award annually, beginning in 2016 at £400 per\n"
+            "award, subject to budget approval."
+        )
+        self.assertIn(
+            "beginning in 2016 at £400 per award, subject to budget approval.",
+            primary_passages(detail, headings, context),
+        )
+
     # Approval evidence must address the requested subject, even beside similar clauses.
     def test_approval_evidence_requires_the_actual_subject(self) -> None:
         note = "The work group can recommend schedule changes for approval."
