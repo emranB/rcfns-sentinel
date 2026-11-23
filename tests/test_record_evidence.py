@@ -22,6 +22,48 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Each named duration must use its own amount and its own evidence.
+    def test_coordinated_time_fields_are_verified_separately(self) -> None:
+        first, second = requested_fields(
+            "How many hours does the handbook allow for installation and for inspection?"
+        )
+        instructions = (
+            "Installation: 20 hours.\nInspection: 4-6 hours.\nTotal: 26 hours."
+        )
+        self.assertEqual(field_evidence(first, instructions), "Installation: 20 hours.")
+        self.assertEqual(field_evidence(second, instructions), "Inspection: 4-6 hours.")
+
+    # Preserve the event, method, and number written in a scoped original.
+    def test_workflow_and_count_passages(self) -> None:
+        record = (
+            "When auditions close\nDisable the registration form and send a confirmation.\n"
+            "Once performers are selected through a panel vote, notify staff.\n"
+            "At least 3 independent recommendations are recorded."
+        )
+        self.assertEqual(
+            labeled_passage(
+                "What happens to the registration form when auditions close?", record
+            ),
+            "When auditions close\nDisable the registration form and send a confirmation.",
+        )
+        self.assertEqual(
+            labeled_passage("How are performers selected?", record),
+            "Once performers are selected through a panel vote, notify staff.",
+        )
+        self.assertEqual(
+            field_evidence(
+                "How many independent recommendations are required?", record
+            ),
+            "At least 3 independent recommendations are recorded.",
+        )
+        self.assertEqual(
+            field_evidence(
+                "When was the form completed?",
+                "Start time: Oct 1, 2025\nCompletion time: Oct 2, 2025",
+            ),
+            "Completion time: Oct 2, 2025",
+        )
+
     # Approval evidence must match the action's object and any explicit threshold.
     def test_authority_uses_the_requested_action_and_money_boundary(self) -> None:
         recommendation = "The panel approves the facility recommendations."

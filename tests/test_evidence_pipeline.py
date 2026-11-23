@@ -53,16 +53,23 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
     # Carry the last cited originals across multiple user turns and ignore draft answer claims.
     async def test_record_follow_up_keeps_only_the_latest_request(self) -> None:
         subject = "Use Maintenance Handbook.docx. How long are service records kept?"
-        part = "And what is the effective date for that same policy?"
+        part = "And what does that same policy say about Northern Trails Society?"
         history = [
             server.ChatMessage(role="user", content=subject),
             server.ChatMessage(role="assistant", content="Use Employee Manual.docx."),
-            server.ChatMessage(role="user", content="What about the review interval?"),
+            server.ChatMessage(
+                role="user",
+                content="And what does that same policy require for Northern Trails Society?",
+            ),
             server.ChatMessage(role="assistant", content="The date was August 21."),
         ]
         async with httpx.AsyncClient() as client:
             state = RagflowSession(
-                client, documents={"maintenance": "Maintenance Handbook.docx"}
+                client,
+                documents={
+                    "maintenance": "Maintenance Handbook.docx",
+                    "unrelated": "Northern Trails Society.pdf",
+                },
             )
             with (
                 patch.object(
@@ -70,7 +77,6 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     "select_records",
                     AsyncMock(
                         side_effect=[
-                            server.RecordSelection(),
                             server.RecordSelection(requested=True),
                         ]
                     ),
@@ -88,9 +94,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 await server.respond_to_question(
                     state, part, server.Question(question=part, history=history)
                 )
-        self.assertEqual(
-            [call.args[1] for call in select.await_args_list], [part, subject]
-        )
+        self.assertEqual([call.args[1] for call in select.await_args_list], [subject])
         self.assertEqual(answer.await_args_list[0].args[1], part)
 
     # Clear a draft warning only after checking the actual requested details.

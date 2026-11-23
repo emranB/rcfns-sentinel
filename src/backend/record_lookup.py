@@ -53,7 +53,9 @@ def title_tokens(value: str) -> list[str]:
 
 
 # Match filenames and identifiers written as a contiguous phrase in a question.
-def explicit_ids(question: str, originals: Iterable[tuple[str, str]]) -> list[str]:
+def explicit_ids(
+    question: str, originals: Iterable[tuple[str, str]], *, filenames_only: bool = False
+) -> list[str]:
     split_words = " " + " ".join(title_tokens(question)) + " "
     without_dates = " " + " ".join(title_tokens(DATE.sub(" ", question))) + " "
     matches = []
@@ -64,6 +66,8 @@ def explicit_ids(question: str, originals: Iterable[tuple[str, str]]) -> list[st
         phrase = " ".join(split)
         full_name = f" {phrase} {extension} "
         with_extension = bool(extension and full_name in split_words)
+        if filenames_only and not with_extension:
+            continue
         significant = [word for word in split if word not in TITLE_STOP_WORDS]
         if without_dates.find(f" {phrase} ") < 0 and not with_extension:
             clean = title_tokens(re.sub(r"\s*\([0-9]+\)$", "", name.stem))

@@ -292,6 +292,11 @@ RECORD_FOLLOW_UP = re.compile(
     r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
     re.IGNORECASE,
 )
+SAME_RECORD = re.compile(
+    r"\b(?:that|this|the|those) same\b|\b(?:that|this) "
+    r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
+    re.IGNORECASE,
+)
 COMPARISON_PART = re.compile(
     r"\b(?:compare|changed?|versus|difference)\b", re.IGNORECASE
 )
@@ -1143,7 +1148,11 @@ def earlier_record_scope(state: RagflowSession, history: list[ChatMessage]) -> s
     originals = list(indexed_originals(state))
     for message in reversed(history):
         if message.role == "user" and (
-            explicit_ids(message.content, originals)
+            explicit_ids(
+                message.content,
+                originals,
+                filenames_only=bool(SAME_RECORD.search(message.content)),
+            )
             or dated_references(message.content, originals)
         ):
             return message.content
@@ -2130,12 +2139,14 @@ async def answer_parts(
 
             field = ""
             if original_text and (caption := labeled_passage(part, original_text)):
-                return RecordAnswer(f"> {caption} [{original_reference(caption) + 1}]")
+                quote = "\n".join(f"> {line}" for line in caption.splitlines())
+                return RecordAnswer(f"{quote} [{original_reference(caption) + 1}]")
             for index in indices:
                 if names := table_person_names(part, excerpts[index].content):
                     return RecordAnswer(f"{', '.join(names)} [{index + 1}].")
                 if caption := labeled_passage(part, excerpts[index].content):
-                    field = f"> {caption} [{index + 1}]"
+                    quote = "\n".join(f"> {line}" for line in caption.splitlines())
+                    field = f"{quote} [{index + 1}]"
             quantities = [
                 (match[0], index, match[1])
                 for index in indices
@@ -2481,9 +2492,19 @@ async def respond_to_question(
         )
     record_question = question
     async with asyncio.timeout(25):
-        records = await select_records(state, question)
+        record_scope = question
+        if payload.history and SAME_RECORD.search(question):
+            originals = list(indexed_originals(state))
+            if (
+                not explicit_ids(question, originals, filenames_only=True)
+                and not dated_references(question, originals)
+                and (earlier := earlier_record_scope(state, payload.history))
+            ):
+                record_scope = earlier
+        records = await select_records(state, record_scope)
         if (
             not records.requested
+            and record_scope == question
             and payload.history
             and (
                 RECORD_FOLLOW_UP.search(question)

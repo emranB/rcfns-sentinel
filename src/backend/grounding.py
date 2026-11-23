@@ -236,6 +236,44 @@ UNIT_FIELD = re.compile(
     r"\b(?:how many\s+(?P<count>hours?|days?)|(?:annual\s+)?(?P<limit>hours?)\s+(?:cap|limit))\b",
     re.IGNORECASE,
 )
+COORDINATED_UNITS = re.compile(
+    r"^(.+?)\s+for\s+(.+?)\s+and\s+for\s+(.+)$", re.IGNORECASE
+)
+UNIT_SUBJECT = re.compile(r"\bfor\s+([^?]+)$", re.IGNORECASE)
+WHEN_EVENT = re.compile(
+    r"^when\s+(?:was|were|is|are|did)\b[^?]{0,125}"
+    r"\b(?P<phase>complet|submit|start|sign|approv)\w*\b",
+    re.IGNORECASE,
+)
+RELATIVE_DELAY = re.compile(
+    r"\b(?:what\s+(?:(?:usual|typical)\s+)?delay|how long)\s+(?P<direction>after|before)\s+(?P<event>[\w-]+)",
+    re.IGNORECASE,
+)
+COUNT_REQUIREMENT = re.compile(
+    r"\bhow many\s+(?P<item>[\w-]+(?:\s+[\w-]+){0,4}?)\s+(?:are|were)\s+(?:required|needed|expected)\b",
+    re.IGNORECASE,
+)
+MONEY_RANGE_FIELD = re.compile(
+    r"\b(?:what|which)\s+range\s+of\s+[^?]{0,65}\b(?:amounts?|costs?|prices?|payments?)\b",
+    re.IGNORECASE,
+)
+SELECTION_METHOD = re.compile(
+    r"\bhow\s+(?:are|were|is|was)\s+(?P<object>[\w\s-]+?)\s+(?:chosen|selected|assigned|appointed)\b",
+    re.IGNORECASE,
+)
+SELECTION_PROOF = re.compile(
+    r"\b(?:chosen|selected|assigned|appointed)\s+(?:by|through|via|using)\b",
+    re.IGNORECASE,
+)
+CONDITIONAL_ACTION = re.compile(
+    r"\bwhat happens to\s+(?P<object>[^?]+?)\s+when\s+(?P<event>[^?]+)",
+    re.IGNORECASE,
+)
+CATEGORY_REQUEST = re.compile(
+    r"\b(?:which|what)\s+(?:(?:two|three|four|\d+)\s+)?(?:types|kinds|categories)\s+of\s+"
+    r"(?P<subject>[^?]+?)(?=\s+(?:does|do|are|is|were|must)\b|$)",
+    re.IGNORECASE,
+)
 FREQUENCY = re.compile(
     r"\b(?:daily|weekly|fortnightly|monthly|quarterly|annual(?:ly)?|yearly|"
     rf"(?:once|twice|every|each)\s+(?:a\s+|{TALLY_NUMBER}\s+)?(?:days?|weeks?|months?|quarters?|years?))\b",
@@ -251,11 +289,14 @@ DURATION_VALUE = re.compile(
     rf"\b{TALLY_NUMBER}[- ]+(?:days?|weeks?|months?|years?|hours?)\b", re.IGNORECASE
 )
 APPROVAL_AUTHORITY = re.compile(
-    r"\bwho\s+(?:(?:gives?|provides?)\s+(?:the\s+)?(?:final\s+)?)?"
-    r"(?P<action>approv\w*|authoriz\w*|reviews?)\s+(?P<subject>[^?]+)",
+    r"\bwho\s+(?:(?:would|will|can|must|should)\s+)?"
+    r"(?:(?:gives?|provides?)\s+(?:the\s+)?(?:final\s+)?)?"
+    r"(?P<action>approv\w*|authoriz\w*|reviews?|selects?)\s+(?P<subject>[^?]+)",
     re.IGNORECASE,
 )
-APPROVAL_WORD = re.compile(r"\b(?:approv\w*|authoriz\w*|review\w*)\b", re.IGNORECASE)
+APPROVAL_WORD = re.compile(
+    r"\b(?:approv\w*|authoriz\w*|review\w*|select\w*)\b", re.IGNORECASE
+)
 VALUE_REQUEST = re.compile(
     r"\bwhat\s+(?P<field>value|price|cost|rate)\b[^?]{0,65}\bfor\s+(?P<item>[^?]+)",
     re.IGNORECASE,
@@ -383,20 +424,31 @@ def requested_parts(question: str) -> list[str]:
 
 # Keep an explicitly coordinated factual request separate from its neighbor.
 def requested_fields(part: str) -> list[str]:
-    return [
-        re.sub(
+    fields: list[str] = []
+    for piece in FIELD_JOIN.split(part):
+        text = re.sub(
             r"^(?:give|report|list|and|also)\s+(?=(?:who|what|when|where|how)\b)",
             "",
             piece.strip().rstrip(" ?,.;"),
             flags=re.IGNORECASE,
         )
-        for piece in FIELD_JOIN.split(part)
-    ]
+        if UNIT_FIELD.search(text) and (parallel := COORDINATED_UNITS.match(text)):
+            fields.extend(f"{parallel[1]} for {parallel[index]}" for index in (2, 3))
+        else:
+            fields.append(text)
+    return fields
 
 
 # Match the event and value together before exposing a date, amount, or count to generation.
 def field_evidence(question: str, text: str) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if timestamp := WHEN_EVENT.search(question):
+        phase = timestamp["phase"].casefold()
+        time_label = re.compile(rf"\b{phase}\w*\s+(?:time|date)\s*:", re.IGNORECASE)
+        dated = [
+            line for line in lines if DATE.search(line) and time_label.search(line)
+        ]
+        return "\n".join(dict.fromkeys(dated))
     if match := EVENT_DATE_FIELD.match(question):
         tail = question[match.end() :].casefold()
         event = (
@@ -450,7 +502,46 @@ def field_evidence(question: str, text: str) -> str | None:
     if unit := UNIT_FIELD.search(question):
         label = (unit["count"] or unit["limit"]).casefold().rstrip("s")
         measurement = re.compile(rf"\b{TALLY_NUMBER}[- ]+{label}s?\b", re.IGNORECASE)
-        return "\n".join(line for line in lines if measurement.search(line))
+        subject = UNIT_SUBJECT.search(question)
+        topics = source_terms(subject[1]) - STOP - FIELD_TERMS if subject else set()
+        return "\n".join(
+            line
+            for line in lines
+            if measurement.search(line)
+            and focus_matches(frozenset(source_terms(line)), topics) == len(topics)
+        )
+    if relative := RELATIVE_DELAY.search(question):
+        trigger = source_terms(relative["event"])
+        return "\n".join(
+            line
+            for line in lines
+            if DURATION_VALUE.search(line)
+            and relative["direction"].casefold() in source_terms(line)
+            and focus_matches(frozenset(source_terms(line)), trigger) == len(trigger)
+        )
+    if count := COUNT_REQUIREMENT.search(question):
+        terms = source_terms(count["item"]) - FIELD_TERMS
+        last = count["item"].split()[-1]
+        amount = re.compile(
+            rf"\b{TALLY_NUMBER}\s+(?:[\w-]+\s+){{0,4}}{re.escape(last)}\b",
+            re.IGNORECASE,
+        )
+        return "\n".join(
+            line
+            for line in lines
+            if amount.search(line) and terms <= source_terms(line)
+        )
+    if MONEY_RANGE_FIELD.search(question):
+        ranged = []
+        for line in lines:
+            amounts = list(CURRENCY_VALUE.finditer(line))
+            if len(amounts) == 2 and re.search(
+                r"\b(?:to|and)\b|[-\u2013\u2014]",
+                line[amounts[0].end() : amounts[1].start()],
+                flags=re.IGNORECASE,
+            ):
+                ranged.append(line)
+        return "\n".join(ranged)
     if cadence := CADENCE_FIELD.search(question):
         activity = (cadence["label"] or cadence["verb"]).casefold().removesuffix("ing")
         event = r"(?:updates?|report\w*)" if activity == "report" else rf"{activity}\w*"
@@ -567,6 +658,38 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if method := SELECTION_METHOD.search(question):
+        subjects = source_terms(method["object"]) - STOP - FIELD_TERMS
+        matches = {
+            line
+            for line in lines
+            if SELECTION_PROOF.search(line) and subjects <= source_terms(line)
+        }
+        if subjects and len(matches) == 1:
+            return next(iter(matches))
+    if action := CONDITIONAL_ACTION.search(question):
+        subjects = source_terms(action["object"]) - STOP - FIELD_TERMS
+        for heading, line in pairwise(lines):
+            if (
+                len(heading) <= 100
+                and normalized(heading).startswith("when ")
+                and normalized(action["event"]) in normalized(heading)
+                and subjects & source_terms(line)
+                and subjects <= source_terms(f"{heading} {line}")
+            ):
+                return f"{heading}\n{line}"
+    if category := CATEGORY_REQUEST.search(question):
+        subjects = source_terms(category["subject"]) - STOP - FIELD_TERMS
+        lists = {
+            line
+            for line in lines
+            if 10 <= len(line) <= 340
+            and subjects <= source_terms(line)
+            and re.search(r"\([^)]*(?:,|\band\b|\s&\s)[^)]*\)", line)
+        }
+        if subjects and len(lists) == 1:
+            return next(iter(lists))
     if authority := APPROVAL_AUTHORITY.search(question):
         subject = re.split(
             r"\s+(?:in|according to|under the)\s+",
@@ -631,7 +754,6 @@ def labeled_passage(question: str, text: str) -> str:
     if not (match := REQUESTED_LABEL.search(question)):
         return ""
     label = match[0].casefold()
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
     if label == "deadline":
         requested = source_terms(question)
         fields = sorted(
