@@ -187,7 +187,7 @@ class ClaimAnswer(BaseModel):
 
 
 class CoverageReview(BaseModel):
-    covered: list[str] = Field(max_length=24)
+    covered_lines: list[int] = Field(max_length=24)
     missing: list[str] = Field(max_length=24)
 
 

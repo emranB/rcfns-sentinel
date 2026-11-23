@@ -37,9 +37,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         record = EvidenceText("Maintenance briefing", f"Next Work\n{decisions}")
         draft = ClaimAnswer.model_validate_json(literal_claims(decisions))
         draft.incomplete = True
-        good = CoverageReview(
-            covered=["Replace the aging pump", "inspect the outlet valve"], missing=[]
-        )
+        good = CoverageReview(covered_lines=[1], missing=[])
         cases = (
             ("List the decisions under Next Work.", good.model_dump_json(), False),
             (
@@ -51,9 +49,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
             ),
             (
                 "List the decisions under Next Work.",
-                good.model_copy(
-                    update={"covered": ["Buy a new valve"]}
-                ).model_dump_json(),
+                good.model_copy(update={"covered_lines": [3]}).model_dump_json(),
                 True,
             ),
             ("List the decisions under Next Work.", "{}", True),
@@ -98,7 +94,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_named_slide_review_catches_a_silent_omission(self) -> None:
         question = "Give the decisions and the approved cost on the Next Work slide."
         line = "Inspect the outlet valve."
-        check = CoverageReview(covered=[line], missing=["the approved cost"])
+        check = CoverageReview(covered_lines=[1], missing=["the approved cost"])
         draft = ClaimAnswer.model_validate_json(literal_claims(line))
         draft.claims[0].proofs[0].source = 2
         async with httpx.AsyncClient() as client:
@@ -122,6 +118,42 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(f"{line} [2]", answer)
                 self.assertNotIn("$8,000", generate.await_args_list[-1].args[2])
                 self.assertTrue(answer.endswith(INCOMPLETE_TEXT))
+
+    # Recheck the answer after restoring a requested number from a literal passage.
+    async def test_numeric_recovery_precedes_coverage_review(self) -> None:
+        line = "A $6,000 disbursement will buy 24 new safety guards."
+        draft = ClaimAnswer.model_validate(
+            {
+                "claims": [
+                    {
+                        "text": "The disbursement will buy 24 new safety guards.",
+                        "proofs": [{"source": 1, "quote": line}],
+                    }
+                ],
+                "incomplete": True,
+            }
+        )
+        review = CoverageReview(covered_lines=[2], missing=[])
+        async with httpx.AsyncClient() as client:
+            with patch.object(
+                server,
+                "generate",
+                AsyncMock(
+                    side_effect=[draft.model_dump_json(), review.model_dump_json()]
+                ),
+            ) as generate:
+                answer = await server.read_claims(
+                    RagflowSession(client),
+                    "Report the disbursement amount and number of safety guards.",
+                    [EvidenceText("Purchase record", line)],
+                    [0],
+                    coverage="partial",
+                    literal_passage=f"> {line} [1]",
+                )
+                review_prompt = generate.await_args_list[-1].args[2]
+                self.assertIn(f"Line 2: > {line}", review_prompt)
+                self.assertIn(f"> {line} [1]", answer)
+                self.assertNotIn(INCOMPLETE_TEXT, answer)
 
     # Verify that comparison facts survive an extra Agentic evidence pass.
     async def test_preserves_original_and_new_milestones_in_both_modes(self) -> None:
