@@ -33,6 +33,13 @@ MONTH_FIRST_DATE = re.compile(
     r"(?<!\d)(\d{1,2})[._-](\d{1,2})[._-]((?:19|20)\d{2})(?!\d)"
 )
 YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+YEAR_QUALIFIER = re.compile(
+    r"\s+(?:in|for|during)\s+(?:19|20)\d{2}[?.!]*$", re.IGNORECASE
+)
+YEAR_FOLLOW_UP = re.compile(
+    r"(?:(?:and|what about|how about)\s+)?(?:(?:in|for|during)\s+)?(?P<year>(?:19|20)\d{2})[?.!]*",
+    re.IGNORECASE,
+)
 RECORD_KIND = re.compile(
     r"minutes|report|roster|register|statement|ledger|summary", re.IGNORECASE
 )
@@ -190,9 +197,11 @@ def latest_document_ids(
     return list(selected)
 
 
-# Preserve the requested order and bound the number of independent year searches.
-def comparison_years(question: str) -> tuple[int, ...]:
+# Identify explicit year scopes without interpreting incidental dates in file titles.
+def requested_years(question: str) -> tuple[int, ...]:
     years = tuple(dict.fromkeys(int(match[0]) for match in YEAR.finditer(question)))
+    if len(years) == 1 and YEAR_QUALIFIER.search(question.rstrip()):
+        return years
     return years if 2 <= len(years) <= MAX_COMPARISON_YEARS else ()
 
 
@@ -209,10 +218,10 @@ def source_series(path: str, year: int) -> tuple[str, ...]:
 
 
 # Keep a comparable record series when available and cover each year's timeline.
-def comparison_document_ids(
+def dated_document_ids(
     question: str, documents: Iterable[tuple[str, str]], *, today: date | None = None
 ) -> dict[int, list[str]]:
-    years = comparison_years(question)
+    years = requested_years(question)
     if not years:
         return {}
     topics = source_terms(question) - QUESTION_STOP_WORDS

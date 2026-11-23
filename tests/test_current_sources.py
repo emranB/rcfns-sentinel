@@ -3,7 +3,7 @@
 import unittest
 from datetime import date
 
-from src.backend.current_sources import comparison_document_ids, latest_document_ids
+from src.backend.current_sources import dated_document_ids, latest_document_ids
 
 
 class CurrentSourceTests(unittest.TestCase):
@@ -18,12 +18,18 @@ class CurrentSourceTests(unittest.TestCase):
             ("template", "Warehouse/Inventory/2024/20240601InventoryTemplate.docx"),
             ("unrelated", "Contacts/2024/20240109AdvisoryReport.docx"),
         ]
-        result = comparison_document_ids(
+        result = dated_document_ids(
             "List inventory totals in 2025 vs 2024", documents, today=date(2026, 1, 1)
         )
         self.assertEqual(list(result), [2025, 2024])
         self.assertEqual(
             result, {2025: ["early", "recent"], 2024: ["older", "previous"]}
+        )
+        self.assertEqual(
+            dated_document_ids(
+                "List inventory totals for 2024", documents, today=date(2026, 1, 1)
+            ),
+            {2024: ["older", "previous"]},
         )
 
     # Match the meeting folder when the filename uses an abbreviation.

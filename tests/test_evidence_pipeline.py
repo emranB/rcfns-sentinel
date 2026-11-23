@@ -33,7 +33,7 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
                     server, "retrieve", AsyncMock(side_effect=[[later], [ranked]])
                 ) as retrieve,
             ):
-                evidence = await server.comparison_evidence(
+                evidence = await server.period_evidence(
                     state,
                     "Compare inventory in 2024 vs 2022",
                     {2024: ["late"], 2022: ["early"]},
@@ -455,6 +455,22 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EvidenceRankingTests(unittest.TestCase):
+    # Resolve a year-only follow-up from the user's wording and ignore prior answers.
+    def test_year_follow_up_carries_subject_into_requested_year(self) -> None:
+        history = [
+            server.ChatMessage(
+                role="user", content="List all council memebers for 2024"
+            ),
+            server.ChatMessage(
+                role="assistant", content="Here are nominees from 2021."
+            ),
+        ]
+        self.assertEqual(
+            server.scoped_question("and for 2022?", history),
+            "List all council memebers for 2022",
+        )
+        self.assertIsNone(server.scoped_question("and for 2022?", []))
+
     # Retain only sources the answer cites and preserve repeated links when renumbering.
     def test_display_citations_follow_the_order_of_first_use(self) -> None:
         sources = [

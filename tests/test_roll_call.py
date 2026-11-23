@@ -6,6 +6,7 @@ from src.backend.roll_call import (
     RollCallCount,
     roll_call_count,
     roster_aliases,
+    roster_group,
     roster_names,
 )
 
@@ -20,6 +21,11 @@ ROLL_CALL = (
 
 
 class RollCallTests(unittest.TestCase):
+    # Accept a single historical period and a misspelled membership role.
+    def test_roster_group_accepts_one_year_and_a_misspelled_role(self) -> None:
+        self.assertEqual(roster_group("List all council memeberrs for 2024"), "council")
+        self.assertEqual(roster_group("List all council expenses for 2024"), "")
+
     # Recover wrapped names and preserve the distinction between members and attendees.
     def test_roster_includes_regrets_and_excludes_attendees_with_other_roles(
         self,

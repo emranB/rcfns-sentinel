@@ -3,7 +3,7 @@
 import re
 from collections import Counter
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 from unicodedata import normalize
 
 WORD = r"[^\W\d_]+"
@@ -64,8 +64,8 @@ NONMEMBERS = frozenset({"staff", "guest", "guests", "observers", "visitors"})
 NO_ABSENCES = frozenset({"none", "nil", "no absences", "no apologies", "no regrets"})
 ROSTER_QUESTION = re.compile(
     rf"(?:please )?(?:name(?: and list)?|list) (?:all |every )?(?:the )?(?P<group>{GROUP}) "
-    r"(?:members|directors|trustees) (?:in |for )?(?:19|20)\d{2} "
-    r"(?:vs\.?|versus|and) (?:19|20)\d{2}[?.]?",
+    rf"(?P<role>{WORD}) (?:in |for |during )?(?:19|20)\d{{2}}"
+    r"(?: (?:vs\.?|versus|and) (?:19|20)\d{2})?[?.]?",
     re.IGNORECASE,
 )
 ATTENDANCE_SECTION = re.compile(
@@ -183,10 +183,13 @@ def roll_call_count(
     return RollCallCount(present=len(present), absent=len(absent))
 
 
-# Find straightforward requests for a membership list across two dated periods.
+# Find dated membership list requests, tolerating minor spelling errors in the role.
 def roster_group(question: str) -> str:
     match = ROSTER_QUESTION.fullmatch(" ".join(question.split()))
     if match is None:
+        return ""
+    role = match["role"].casefold()
+    if role not in ROLES and not get_close_matches(role, ROLES, n=1, cutoff=0.85):
         return ""
     words = re.findall(WORD, match["group"].casefold())
     return "" if GROUP_EXCLUSIONS.intersection(words) else " ".join(words)

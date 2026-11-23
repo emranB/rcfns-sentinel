@@ -26,10 +26,12 @@ from starlette.background import BackgroundTask
 
 from src.backend.current_sources import (
     YEAR,
-    comparison_document_ids,
-    comparison_years,
+    YEAR_FOLLOW_UP,
+    YEAR_QUALIFIER,
+    dated_document_ids,
     filename_date,
     latest_document_ids,
+    requested_years,
 )
 from src.backend.evidence import format_excerpt
 from src.backend.index_cache import IndexCache, prepare_index_cache
@@ -132,9 +134,11 @@ AGENTIC_TIMEOUT_SECONDS = 75
 CHAT_TIMEOUT_SECONDS = 240
 RECENT_SEARCH_TIMEOUT_SECONDS = 15
 EXCERPT_BUDGET = 10000
-COMPARISON_EVIDENCE_BUDGET = 16000
-COMPARISON_ANSWER_INSTRUCTIONS = (
+PERIOD_EVIDENCE_BUDGET = 16000
+PERIOD_ANSWER_INSTRUCTIONS = (
     "Give one clearly labeled section for each requested period in the question's order. "
+    "Establish that a fact applies to the requested period from the excerpt or its document title. "
+    "Records of nominations or recruitment cannot establish appointments or membership. "
     "Cite one or two supporting excerpts per finding using separate markers, such as [1] [2]. "
     "Use the original wording for entries, preserving complete proper names across line breaks. "
     "Unify short forms and clear spelling variants for the same entry. For a list, write a concise "
@@ -946,8 +950,23 @@ def requests_collection_overview(words: set[str]) -> bool:
     return bool(words & COLLECTION_WORDS) and words <= COLLECTION_SCOPE
 
 
-# Resolve a bare summary request from the user's last message with a subject.
+# Carry the user's subject into a follow-up that changes only the period.
+def year_follow_up(year: str, history: list[ChatMessage]) -> str | None:
+    for message in reversed(history):
+        previous = message.content.strip()
+        if message.role != "user" or YEAR_FOLLOW_UP.fullmatch(previous):
+            continue
+        subject = YEAR_QUALIFIER.sub("", previous).rstrip("?.! ")
+        if YEAR.search(subject) or not question_words(subject) - UNSCOPED_WORDS:
+            return None
+        return f"{subject} for {year}"
+    return None
+
+
+# Resolve a bare date or summary request from the user's last message with a subject.
 def scoped_question(question: str, history: list[ChatMessage]) -> str | None:
+    if period := YEAR_FOLLOW_UP.fullmatch(question.strip()):
+        return year_follow_up(period["year"], history)
     words = question_words(question)
     if not words & SUMMARY_WORDS or words - UNSCOPED_WORDS:
         return question
@@ -1011,12 +1030,14 @@ async def investigate(
 
     # Keep year-specific follow-ups inside the applicable record set when available.
     async def search(query: str) -> list[RetrievedChunk]:
-        requested_years = {int(match[0]) for match in YEAR.finditer(query)}
+        query_years = {int(match[0]) for match in YEAR.finditer(query)}
         scopes = periods or {}
+        if scopes and query_years and not query_years.intersection(scopes):
+            return []
         ids = [
             doc
             for year, group in scopes.items()
-            if not requested_years or year in requested_years
+            if not query_years or year in query_years
             for doc in group
         ]
         return (
@@ -1109,7 +1130,7 @@ async def record_opening(
 
 
 # Search each year independently with space for introductions and semantic hits.
-async def comparison_evidence(
+async def period_evidence(
     state: RagflowSession, question: str, periods: dict[int, list[str]], budget: int
 ) -> list[Excerpt]:
     subject = YEAR.sub(" ", question)
@@ -1169,7 +1190,7 @@ async def comparison_evidence(
     return [item for group in groups for item in group]
 
 
-# Assemble a cited roster when both periods contain clearly labeled membership records.
+# Assemble a cited roster when each period contains clearly labeled membership records.
 def documented_roster(
     question: str,
     evidence: list[Excerpt],
@@ -1258,15 +1279,18 @@ async def respond_to_question(
         return membership
     baseline = select_evidence(recent_hits, RECENT_EVIDENCE_BUDGET)
     periods = (
-        comparison_document_ids(scoped, indexed_originals(state))
-        if comparison_years(scoped)
+        dated_document_ids(scoped, indexed_originals(state))
+        if requested_years(scoped)
         else {}
     )
     if periods:
         named_hits, dated_evidence = await asyncio.gather(
             retrieve_named(state, scoped),
-            comparison_evidence(
-                state, scoped, periods, COMPARISON_EVIDENCE_BUDGET // len(periods)
+            period_evidence(
+                state,
+                scoped,
+                periods,
+                min(EXCERPT_BUDGET, PERIOD_EVIDENCE_BUDGET // len(periods)),
             ),
         )
         baseline = [*dated_evidence, *select_evidence(named_hits, 2500, dated_evidence)]
@@ -1299,7 +1323,7 @@ async def respond_to_question(
             )
             if additional:
                 evidence = [*baseline, *additional]
-                if payload.history and investigation.question != scoped:
+                if not periods and payload.history and investigation.question != scoped:
                     follow_up_context = (
                         f"\nResolved follow-up context: {investigation.question}"
                     )
@@ -1332,7 +1356,7 @@ async def respond_to_question(
             )
             generated = await generate(
                 state,
-                f"{ANSWER_INSTRUCTIONS} {COMPARISON_ANSWER_INSTRUCTIONS}",
+                f"{ANSWER_INSTRUCTIONS} {PERIOD_ANSWER_INSTRUCTIONS}",
                 f"Question: {scoped}{follow_up_context}\n\nDocument excerpts:\n{excerpts}\n\n"
                 f"Question: {scoped}",
                 answer_tokens=1600,
