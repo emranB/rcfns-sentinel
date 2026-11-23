@@ -4,6 +4,7 @@ interface RollCallScope {
   document_id: string;
   group: string;
   year: number;
+  members?: 'all' | 'present' | 'absent';
 }
 
 export interface ChatMessage {
@@ -64,11 +65,16 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function readRollCall(value: unknown): RollCallScope | undefined {
   if (!isObject(value)) return undefined;
-  const { document_id, group, year } = value;
+  const { document_id, group, year, members } = value;
   if (typeof document_id !== 'string' || typeof group !== 'string' || typeof year !== 'number') {
     return undefined;
   }
-  return { document_id, group, year };
+  return {
+    document_id,
+    group,
+    year,
+    members: members === 'present' || members === 'absent' ? members : 'all',
+  };
 }
 
 function isCoordinate(value: unknown): value is number {

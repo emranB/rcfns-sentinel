@@ -69,7 +69,9 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Noor Khan", response.answer)
         self.assertNotIn("Mei Tan", response.answer)
         self.assertEqual(response.sources, [original])
-        self.assertEqual(response.roll_call, scope)
+        self.assertEqual(
+            response.roll_call, scope.model_copy(update={"members": "absent"})
+        )
         load.assert_awaited_once_with(state, scope)
 
     # Preserve a low-ranking field passage within the document budget.

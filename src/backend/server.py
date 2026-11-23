@@ -371,10 +371,14 @@ class Citation(BaseModel):
     regions: list[Region] = Field(default_factory=list)
 
 
+RollCallMembers = Literal["all", "present", "absent"]
+
+
 class RollCallScope(BaseModel):
     document_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,96}$")
     group: str = Field(min_length=1, max_length=100)
     year: int = Field(ge=1900, le=2099)
+    members: RollCallMembers = "all"
 
 
 class ChatResponse(BaseModel):
@@ -422,8 +426,20 @@ class FollowUpPlan(BaseModel):
 
 
 class RollCallView(BaseModel):
-    output: Literal["count", "names", "record", "other"]
-    members: Literal["all", "present", "absent"]
+    output: Literal["count", "names", "record", "other"] = Field(
+        description=(
+            "What the current question requests. Names identifies people or gives a roster. "
+            "Count gives a number only when a quantity is requested. Record concerns other "
+            "meeting facts. Other means a different topic."
+        )
+    )
+    members: Literal["all", "present", "absent", "inherit"] = Field(
+        description=(
+            "The attendance status requested in the current question. "
+            "Present means attended. Absent means did not or could not attend. "
+            "All includes both groups. Inherit is for a pronoun without a new filter."
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1464,7 +1480,10 @@ def roll_call_reply(
 ) -> ChatResponse:
     call = record.call
     heading = f"The {record.day:%B} {record.day.day}, {record.day.year} {call.group} roll call"
-    if view is None or (view.output == "count" and view.members == "all"):
+    members: RollCallMembers = "all"
+    if view is not None:
+        members = record.scope.members if view.members == "inherit" else view.members
+    if view is None or (view.output == "count" and members == "all"):
         count = call.count
         answer = (
             f"{heading} records **{count.total} members** "
@@ -1474,7 +1493,7 @@ def roll_call_reply(
         sections = tuple(
             (label, names)
             for label, names in (("present", call.present), ("absent", call.absent))
-            if view.members in ("all", label)
+            if members in ("all", label)
         )
         if view.output == "count":
             label, names = sections[0]
@@ -1487,7 +1506,10 @@ def roll_call_reply(
             )
             answer = f"{heading} [1].\n\n{roster}"
     return ChatResponse(
-        answer=answer, sources=[record.source], mode_used=mode, roll_call=record.scope
+        answer=answer,
+        sources=[record.source],
+        mode_used=mode,
+        roll_call=record.scope.model_copy(update={"members": members}),
     )
 
 
@@ -1522,19 +1544,27 @@ async def roll_call_follow_up(
         return None
     record = None
     view = None
+    intervening = conversation(history[index + 2 :])
+    context_text = (
+        f"The conversation was about the verified {group} roll call for {year}.\n"
+    )
+    if intervening:
+        context_text += f"Intervening conversation:\n{intervening}\n"
     with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
         async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
             raw = await generate(
                 state,
-                "Classify the current request in relation to the previous verified roll call. "
-                "A request for the people, names, membership list or roster means names. "
-                "A question asking how many means count. Select all unless the user asks "
-                "only for those who attended or those who were absent. Use record for other "
-                "questions about the same meeting. Use other for a different subject, group or meeting. "
-                "Check the intervening turns for a change of subject before resolving a pronoun. "
-                "Return only the classification and follow the schema.",
-                f"Roll call group: {group}\nYear: {year}\nConversation:\n{conversation(history[index:])}\n"
-                f"Current user request: {question}",
+                "Classify a follow-up in a chat about a verified meeting roll call. Assume the "
+                "user is still talking about this roll call unless they change the subject. "
+                "For output, choose names when the user asks who, which ones, names, or a roster. "
+                "A request for a roster is a request for names. Choose count only for an explicit "
+                "quantity request. Requests for identities need names. Choose record for other "
+                "details about the meeting, and other only for a different subject or meeting. "
+                "For members, use the attendance meaning of the current request: present means "
+                "they attended, absent means they did not or could not attend, and all means the full group. "
+                "Use inherit when the user refers to the previously discussed people with no new filter. "
+                "Return only the classification.",
+                f"{context_text}Current user request: {question}",
                 output_format=RollCallView.model_json_schema(),
                 answer_tokens=80,
             )
