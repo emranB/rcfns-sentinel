@@ -31,6 +31,68 @@ def literal_claims(*passages: str) -> str:
 
 
 class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
+    # Preserve a low-ranking field passage within the document budget.
+    def test_requested_field_survives_chunk_budget(self) -> None:
+        noise = "The project pilot duration will be specialized later. " * 400
+        reporting = "The group provides quarterly written updates to both committees."
+        chunks = [
+            server.Excerpt(
+                server.RetrievedChunk(document_id="record", content=text), text
+            )
+            for text in (noise, reporting)
+        ]
+        retained = server.precise_evidence(
+            "What is the pilot duration and reporting cadence?",
+            chunks,
+        )
+        self.assertTrue(any(reporting in item.text for item in retained))
+        self.assertLessEqual(
+            sum(len(item.text) for item in retained), server.PERIOD_EVIDENCE_BUDGET
+        )
+
+    # Carry the last cited originals across multiple user turns and ignore draft answer claims.
+    async def test_record_follow_up_keeps_only_the_latest_request(self) -> None:
+        subject = "Use Maintenance Handbook.docx. How long are service records kept?"
+        part = "And what is the effective date for that same policy?"
+        history = [
+            server.ChatMessage(role="user", content=subject),
+            server.ChatMessage(role="assistant", content="Use Employee Manual.docx."),
+            server.ChatMessage(role="user", content="What about the review interval?"),
+            server.ChatMessage(role="assistant", content="The date was August 21."),
+        ]
+        async with httpx.AsyncClient() as client:
+            state = RagflowSession(
+                client, documents={"maintenance": "Maintenance Handbook.docx"}
+            )
+            with (
+                patch.object(
+                    server,
+                    "select_records",
+                    AsyncMock(
+                        side_effect=[
+                            server.RecordSelection(),
+                            server.RecordSelection(requested=True),
+                        ]
+                    ),
+                ) as select,
+                patch.object(
+                    server,
+                    "answer_records",
+                    AsyncMock(
+                        return_value=server.ChatResponse(
+                            answer="checked", sources=[], mode_used="standard"
+                        )
+                    ),
+                ) as answer,
+            ):
+                await server.respond_to_question(
+                    state, part, server.Question(question=part, history=history)
+                )
+        self.assertEqual(
+            [call.args[1] for call in select.await_args_list], [part, subject]
+        )
+        self.assertEqual(answer.await_args_list[0].args[1], part)
+
     # Clear a draft warning only after checking the actual requested details.
     async def test_scoped_coverage_preserves_genuine_gaps(self) -> None:
         decisions = "Replace the aging pump and inspect the outlet valve."

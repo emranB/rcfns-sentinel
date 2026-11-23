@@ -150,21 +150,22 @@ PART_NOISE = frozenset(
     ]
 )
 NUMERIC_PART = re.compile(
-    r"\b(?:amount|count|total|ceiling|cap|maximum|range|limit|disbursement|quantity|number)\b",
+    r"\b(?:amount|count|total|ceiling|cap|maximum|range|limits?|disbursement|quantity|number)\b",
     re.IGNORECASE,
 )
 REQUESTED_LABEL = re.compile(r"\b(?:deadline|update)\b", re.IGNORECASE)
 CAP_TERMS = frozenset({"ceiling", "cap", "maximum", "limit"})
 FIELD_JOIN = re.compile(
-    r"[,;]?\s+and\s+(?=(?:what|when|where|who|how|whether)\b"
-    r"|the\s+(?:(?:actual|approved|exact|recorded|specific)\s+)?"
-    r"(?:date|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|vote (?:count|tally))\b)",
+    r"[,;]?\s+and\s+(?=(?:what|when|where|who|how|whether|did|does|were)\b"
+    r"|(?:the\s+)?(?:(?:actual|approved|exact|recorded|specific|annual)\s+)?"
+    r"(?:dates?|(?:[\w-]+\s+){1,3}?date|dollar amount|number of|vote (?:count|tally)"
+    r"|hours? (?:cap|limit)|reporting (?:cadence|frequency)|review interval)\b)",
     re.IGNORECASE,
 )
 EVENT_DATE_FIELD = re.compile(
-    r"^(?:(?:what|which|give|report)\s+)?(?:the\s+)?"
+    r"^(?:(?:what|which|give|report)(?:['\u2019]s|\s+is)?\s+)?(?:the\s+)?"
     r"(?:(?:exact|calendar|actual|specific|scheduled|recorded)\s+)?"
-    r"(?P<event>(?:[\w-]+\s+){0,3}?)date\b",
+    r"(?P<event>(?:[\w-]+\s+){0,3}?)dates?\b",
     re.IGNORECASE,
 )
 PERIOD_FIELD = re.compile(
@@ -181,6 +182,27 @@ VOTE_LABEL = r"(?:votes?|ballots?|for|in favou?r|against|opposed|abstentions?)"
 TALLY_NUMBER = (
     r"(?:\d+(?:,\d{3})*|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
 )
+SMALL_NUMBERS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+)
+MEASURED_TIME = re.compile(
+    r"\b(?P<value>\d+(?:,\d{3})*(?:\.\d+)?|"
+    + "|".join(SMALL_NUMBERS)
+    + r")[- ]+(?P<unit>minutes?|hours?|days?|weeks?|months?|years?)\b",
+    re.IGNORECASE,
+)
 TALLY_VALUE = re.compile(
     rf"\b{TALLY_NUMBER}\s+(?!for\b){VOTE_LABEL}\b|\b{VOTE_LABEL}\s*[:=]\s*{TALLY_NUMBER}\b",
     re.IGNORECASE,
@@ -194,6 +216,65 @@ ROLE_ACCEPTANCE = re.compile(
     re.IGNORECASE,
 )
 ACCEPTED_ROLE = re.compile(r"\baccept(?:ed|s)\b", re.IGNORECASE)
+AWARD_AMOUNT = re.compile(
+    r"\b(?:how much|amount|total)\b[^?]{0,100}\b(?:awarded|disbursed|paid out)\b",
+    re.IGNORECASE,
+)
+REALIZED_PAYMENT = re.compile(r"\b(?:awarded|disbursed|paid out)\b", re.IGNORECASE)
+REQUEST_AMOUNT = re.compile(
+    r"\b(?:how much|what amount)\b[^?]{0,120}\brequest\w*\b", re.IGNORECASE
+)
+REQUESTED_PAYMENT = re.compile(r"\brequest\w*\b", re.IGNORECASE)
+PENDING_PAYMENT = re.compile(
+    r"\b(?:will|may|would|could|if|pending|maximum|up to)\b", re.IGNORECASE
+)
+UNIT_FIELD = re.compile(
+    r"\b(?:how many\s+(?P<count>hours?|days?)|(?:annual\s+)?(?P<limit>hours?)\s+(?:cap|limit))\b",
+    re.IGNORECASE,
+)
+FREQUENCY = re.compile(
+    r"\b(?:daily|weekly|fortnightly|monthly|quarterly|annually|yearly|"
+    rf"(?:once|twice|every|each)\s+(?:a\s+|{TALLY_NUMBER}\s+)?(?:days?|weeks?|months?|quarters?|years?))\b",
+    re.IGNORECASE,
+)
+CADENCE_FIELD = re.compile(
+    r"\b(?P<label>reporting|review|meeting) (?:cadence|frequency|interval)\b"
+    r"|\bhow often\b[^?]*\b(?P<verb>report|review|meet)\w*\b",
+    re.IGNORECASE,
+)
+DURATION_FIELD = re.compile(r"\b(?P<subject>[\w-]+) duration\b", re.IGNORECASE)
+DURATION_VALUE = re.compile(
+    rf"\b{TALLY_NUMBER}[- ]+(?:days?|weeks?|months?|years?|hours?)\b", re.IGNORECASE
+)
+APPROVAL_AUTHORITY = re.compile(
+    r"\bwho\b[^?]{0,100}\b(?:approv\w*|authoriz\w*)\b", re.IGNORECASE
+)
+APPROVAL_WORD = re.compile(r"\b(?:approv\w*|authoriz\w*)\b", re.IGNORECASE)
+THRESHOLD_SIDE = (
+    re.compile(r"\b(?:over|above|more than|greater than)\b", re.IGNORECASE),
+    re.compile(r"\b(?:under|below|less than)\b", re.IGNORECASE),
+)
+FIELD_TERMS = frozenset(
+    {
+        "a",
+        "an",
+        "of",
+        "to",
+        "at",
+        "on",
+        "in",
+        "the",
+        "it",
+        "exact",
+        "date",
+        "did",
+        "does",
+        "is",
+        "was",
+        "give",
+        "that",
+    }
+)
 
 INSTRUCTIONS = (
     "Answer with brief factual claims that address the question. Use one claim per finding "
@@ -294,7 +375,7 @@ def requested_parts(question: str) -> list[str]:
 def requested_fields(part: str) -> list[str]:
     return [
         re.sub(
-            r"^(?:give|report|list)\s+(?=(?:who|what|when|where|how)\b)",
+            r"^(?:give|report|list|and|also)\s+(?=(?:who|what|when|where|how)\b)",
             "",
             piece.strip().rstrip(" ?,.;"),
             flags=re.IGNORECASE,
@@ -307,16 +388,17 @@ def requested_fields(part: str) -> list[str]:
 def field_evidence(question: str, text: str) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if match := EVENT_DATE_FIELD.match(question):
+        tail = question[match.end() :].casefold()
         event = (
             match["event"]
             or re.split(
                 r"\s+(?:on|in|according to)\s+",
-                question[match.end() :].casefold().partition(" for ")[2],
+                tail.partition(" for ")[2] or tail,
                 maxsplit=1,
                 flags=re.IGNORECASE,
             )[0]
         )
-        terms = source_terms(event) - STOP - {"a", "an", "of", "the", "to", "exact"}
+        terms = source_terms(event) - STOP - FIELD_TERMS
         if terms:
             dated = [
                 line
@@ -333,6 +415,48 @@ def field_evidence(question: str, text: str) -> str | None:
                 and focus_matches(frozenset(source_terms(heading)), terms) == len(terms)
             )
             return "\n".join(dated)
+    if AWARD_AMOUNT.search(question):
+        return "\n".join(
+            line
+            for line in lines
+            if CURRENCY_VALUE.search(line)
+            and REALIZED_PAYMENT.search(line)
+            and not PENDING_PAYMENT.search(line)
+        )
+    if REQUEST_AMOUNT.search(question):
+        stated = [
+            line
+            for line in lines
+            if CURRENCY_VALUE.search(line) and REQUESTED_PAYMENT.search(line)
+        ]
+        stated.extend(
+            f"{heading}\n{value}"
+            for heading, value in pairwise(lines)
+            if len(heading) <= 100
+            and REQUESTED_PAYMENT.search(heading)
+            and CURRENCY_VALUE.match(value)
+        )
+        return "\n".join(dict.fromkeys(stated))
+    if unit := UNIT_FIELD.search(question):
+        label = (unit["count"] or unit["limit"]).casefold().rstrip("s")
+        measurement = re.compile(rf"\b{TALLY_NUMBER}[- ]+{label}s?\b", re.IGNORECASE)
+        return "\n".join(line for line in lines if measurement.search(line))
+    if cadence := CADENCE_FIELD.search(question):
+        activity = (cadence["label"] or cadence["verb"]).casefold().removesuffix("ing")
+        event = r"(?:updates?|report\w*)" if activity == "report" else rf"{activity}\w*"
+        return "\n".join(
+            line
+            for line in lines
+            if FREQUENCY.search(line)
+            and re.search(rf"\b{event}\b", line, re.IGNORECASE)
+        )
+    if duration := DURATION_FIELD.search(question):
+        terms = source_terms(duration["subject"])
+        return "\n".join(
+            line
+            for line in lines
+            if DURATION_VALUE.search(line) and terms <= source_terms(line)
+        )
     if VOTE_FIELD.search(question):
         direction = next(
             (
@@ -413,6 +537,18 @@ def requested_part_score(question: str, item: EvidenceText) -> tuple[int, int, i
 
 # Preserve short heading-value passages and literal updates in named records.
 def labeled_passage(question: str, text: str) -> str:
+    if APPROVAL_AUTHORITY.search(question) and (thresholds := values(question)):
+        side = next((term for term in THRESHOLD_SIDE if term.search(question)), None)
+        approvals = {
+            line.strip()
+            for line in text.splitlines()
+            if len(line) <= 480
+            and APPROVAL_WORD.search(line)
+            and thresholds <= values(line)
+            and (side is None or side.search(line))
+        }
+        if len(approvals) == 1:
+            return next(iter(approvals))
     if acceptance := ROLE_ACCEPTANCE.search(question):
         role = (
             source_terms(acceptance[1])
@@ -557,6 +693,20 @@ def values(text: str) -> set[Decimal]:
     }
 
 
+# Keep each duration attached to its unit within the quoted evidence.
+def time_measurements(text: str) -> set[tuple[Decimal, str]]:
+    measurements: set[tuple[Decimal, str]] = set()
+    for match in MEASURED_TIME.finditer(text):
+        amount = match["value"].casefold()
+        value = (
+            Decimal(amount.replace(",", ""))
+            if amount[0].isdigit()
+            else Decimal(SMALL_NUMBERS.index(amount))
+        )
+        measurements.add((value, match["unit"].casefold().rstrip("s")))
+    return measurements
+
+
 # Require a source of the document type that a claim credits.
 def correct_attribution(text: str, labels: list[str]) -> bool:
     if not (attribution := ATTRIBUTED_KIND.search(text)):
@@ -679,6 +829,7 @@ def verified_answer(
         if (
             len(shared) < min(2, len(words))
             or not values(claim.text) <= values(support)
+            or not time_measurements(claim.text) <= time_measurements(quotations)
             or not claim_dates <= proof_dates
             or not correct_attribution(claim.text, labels)
             or any(

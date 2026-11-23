@@ -284,6 +284,14 @@ REFERENTIAL_QUESTION = re.compile(
     r"how much did (?:it|that|this) change|what about (?:it|that|the previous))\b",
     re.IGNORECASE,
 )
+RECORD_FOLLOW_UP = re.compile(
+    r"^\s*(?:and|also|what about|how about)\b|\b(?:that|this|the same|the earlier|the other) "
+    r"(?:record|document|report|policy|proposal|guidelines|minutes|version|file|package|terms)\b",
+    re.IGNORECASE,
+)
+COMPARISON_PART = re.compile(
+    r"\b(?:compare|changed?|versus|difference)\b", re.IGNORECASE
+)
 MEETING_INTERSECTION = re.compile(r"\bwhich\b.{0,100}\broll call\b", re.IGNORECASE)
 COLUMN_YEAR = re.compile(r"\b((?:19|20)\d{2})\s+column\b", re.IGNORECASE)
 REPLACEMENT_TERMS = r"(?:supersed\w*|replac\w*|overrid\w*|rescind\w*|revok\w*)"
@@ -1127,6 +1135,18 @@ def scoped_question(question: str, history: list[ChatMessage]) -> str | None:
     return None
 
 
+# Find the last user-specified originals without turning earlier questions into current requests.
+def earlier_record_scope(state: RagflowSession, history: list[ChatMessage]) -> str:
+    originals = list(indexed_originals(state))
+    for message in reversed(history):
+        if message.role == "user" and (
+            explicit_ids(message.content, originals)
+            or dated_references(message.content, originals)
+        ):
+            return message.content
+    return ""
+
+
 # Keep only the sources used in the answer and align their visible citation numbers.
 def cited_answer(answer: str, sources: list[Citation]) -> tuple[str, list[Citation]]:
     numbers: dict[int, int] = {}
@@ -1611,6 +1631,12 @@ def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
     budget = PERIOD_EVIDENCE_BUDGET // len(documents)
     terms = set(title_tokens(scoped)) - UNSCOPED_WORDS
     numeric = {word for word in terms if word.isdecimal() and len(word) < 4}
+    fields = [
+        field
+        for part in requested_parts(scoped)
+        for field in requested_fields(part)
+        if field_evidence(field, "") is not None
+    ]
     retained = []
     for items in documents.values():
         # Put reconstructed data rows in context together with their column labels.
@@ -1640,6 +1666,32 @@ def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
                 reverse=True,
             )
         available = budget
+        if chosen is not items:
+            reserved: set[str] = set()
+            # Preserve a bounded quote for each requested field before whole chunks consume the budget.
+            for field in fields:
+                matches = [
+                    (item, proof)
+                    for item in items
+                    if (proof := field_evidence(field, item.text))
+                ]
+                if not matches:
+                    continue
+                item, proof = max(
+                    matches,
+                    key=lambda match: requested_part_score(
+                        field, EvidenceText("", match[1])
+                    )[1],
+                )
+                proof = proof[: min(960, budget // 6)]
+                if (
+                    proof
+                    and proof not in reserved
+                    and available - len(proof) >= budget // 2
+                ):
+                    retained.append(Excerpt(item.chunk, proof))
+                    reserved.add(proof)
+                    available -= len(proof)
         for item in chosen:
             text = item.text[:available]
             if not text:
@@ -1647,8 +1699,10 @@ def precise_evidence(scoped: str, evidence: list[Excerpt]) -> list[Excerpt]:
             retained.append(Excerpt(item.chunk, text))
             available -= len(text)
     # Preserve a matched comparison even when the surrounding chunk exceeded its quota.
-    proof = [EvidenceText(item.chunk.document_id, item.text) for item in evidence]
-    for passage in comparison_passages(scoped, proof):
+    comparison_text = [
+        EvidenceText(item.chunk.document_id, item.text) for item in evidence
+    ]
+    for passage in comparison_passages(scoped, comparison_text):
         chunk = evidence[passage.index].chunk
         if not any(
             item.chunk.document_id == chunk.document_id
@@ -1853,6 +1907,7 @@ async def answer_parts(
     text: list[EvidenceText],
     sources: list[Citation],
     paired: list[MetricPassage],
+    baseline: int | None = None,
 ) -> RecordAnswer:
     parts = requested_parts(scoped)
     by_source: dict[str, list[int]] = {}
@@ -1863,23 +1918,32 @@ async def answer_parts(
         or field_evidence(fields[0], "") is not None
         for part in parts
     )
-    if (len(parts) < 2 or len(by_source) < 3) and not scoped_fields:
+    if not parts:
         return RecordAnswer()
 
     originals = [(url, sources[indices[0]].path) for url, indices in by_source.items()]
-    plan: list[tuple[str, str]] = []
+    plan: list[tuple[tuple[str, ...], str]] = []
+    opening = re.split(r"(?<=[.?!])\s+", scoped.strip(), maxsplit=1)[0]
+    comparison_ids = (
+        tuple(explicit_ids(opening, originals))
+        if COMPARISON_PART.search(opening)
+        else ()
+    )
     for part in parts:
         if paired and comparison_focus(part):
             continue
         direct = explicit_ids(part, originals)
-        if len(direct) == 1:
-            plan.append((direct[0], part))
+        if direct:
+            plan.append((tuple(direct), part))
+            continue
+        if len(comparison_ids) > 1 and COMPARISON_PART.search(part):
+            plan.append((comparison_ids, part))
             continue
         dated = {
             key for item in dated_references(part, originals) for key in item.exact
         }
         if len(dated) == 1:
-            plan.append((next(iter(dated)), part))
+            plan.append(((next(iter(dated)),), part))
             continue
         words = f" {' '.join(title_tokens(part))} "
         versions = [
@@ -1891,7 +1955,7 @@ async def answer_parts(
             and f" {tokens[0]} {tokens[1]} " in words
         ]
         if len(versions) == 1:
-            plan.append((versions[0], part))
+            plan.append(((versions[0],), part))
             continue
         name_tables = [
             url
@@ -1899,28 +1963,36 @@ async def answer_parts(
             if any(table_person_names(part, text[index].content) for index in indices)
         ]
         if len(name_tables) == 1:
-            plan.append((name_tables[0], part))
+            plan.append(((name_tables[0],), part))
             continue
         candidates = []
         for url, indices in by_source.items():
+            route = [index for index in indices if baseline is None or index < baseline]
             label, passage, heading = max(
-                (requested_part_score(part, text[index]) for index in indices),
+                (requested_part_score(part, text[index]) for index in route or indices),
                 key=lambda score: (score[2], score[0] + score[1], score[1]),
             )
             candidates.append(((heading, label + passage, passage), url))
         candidates.sort(reverse=True)
         best, url = candidates[0]
         if len(candidates) > 1 and (best[1] < 2 or best == candidates[1][0]):
-            return RecordAnswer()
-        plan.append((url, part))
+            plan.append(
+                (tuple(key for score, key in candidates if score == best), part)
+            )
+            continue
+        plan.append(((url,), part))
     if not plan or (
-        not scoped_fields and len({url for url, _ in plan}) < 2 and not paired
+        not scoped_fields
+        and len(parts) > 1
+        and len({key for keys, _ in plan for key in keys}) < 2
+        and len(by_source) > 1
+        and not paired
     ):
         return RecordAnswer()
 
     # Preserve the parent question's source and section across all its requested fields.
-    async def find(url: str, question: str) -> RecordAnswer:
-        indices = by_source[url]
+    async def find(urls: tuple[str, ...], question: str) -> RecordAnswer:
+        indices = [index for url in urls for index in by_source[url]]
         excerpts = text
         first = indices[0]
         fields = requested_fields(question)
@@ -1928,7 +2000,8 @@ async def answer_parts(
         original = evidence[first].chunk.document_id
         slide = ""
         if (
-            file_type == ".pptx"
+            len(urls) == 1
+            and file_type == ".pptx"
             and SLIDE_REFERENCE.search(question)
             and (slide := await slide_text(state, original, question))
         ):
@@ -1936,8 +2009,10 @@ async def answer_parts(
             excerpts[first] = EvidenceText(text[first].label, slide)
             indices = [first]
         original_text = ""
-        if file_type == ".docx" and any(
-            field_evidence(part, "") is not None for part in fields
+        if (
+            len(urls) == 1
+            and file_type == ".docx"
+            and any(field_evidence(part, "") is not None for part in fields)
         ):
             with suppress(httpx.HTTPError, OSError, TimeoutError):
                 async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):
@@ -1947,6 +2022,30 @@ async def answer_parts(
 
         # Validate each requested value against its own supporting passage.
         async def find_field(part: str) -> RecordAnswer:
+            if len(urls) > 1 and COMPARISON_PART.search(part):
+                matching: dict[str, list[tuple[int, str]]] = {}
+                for url in urls:
+                    passages = [
+                        (match[0], index, match[1])
+                        for index in by_source[url]
+                        if (match := part_quantity(part, excerpts[index].content))
+                    ]
+                    if passages:
+                        _, index, quote = max(passages, key=lambda match: match[0])
+                        matching.setdefault(normalized_evidence(quote), []).append(
+                            (index, quote)
+                        )
+                common = next(
+                    (rows for rows in matching.values() if len(rows) == len(urls)), []
+                )
+                if common:
+                    refs = " ".join(f"[{index + 1}]" for index, _ in common)
+                    return RecordAnswer(
+                        f"The originals give the same figures.\n\n> {common[0][1]} {refs}"
+                    )
+                return await read_claims(
+                    state, part, excerpts, indices, coverage="always"
+                )
             if field_evidence(part, "") is not None:
                 proof = (
                     [(first, field_evidence(part, original_text))]
@@ -1962,6 +2061,12 @@ async def answer_parts(
                 chosen = excerpts.copy()
                 for index, value in grounded:
                     chosen[index] = EvidenceText(excerpts[index].label, value)
+                if len(grounded) == 1:
+                    index, value = grounded[0]
+                    if len(value.splitlines()) <= 2:
+                        return RecordAnswer(
+                            f"> {' '.join(value.splitlines())} [{index + 1}]"
+                        )
                 answer = await read_claims(
                     state, part, chosen, [index for index, _ in grounded]
                 )
@@ -1999,7 +2104,7 @@ async def answer_parts(
                 excerpts,
                 indices,
                 limit=1000,
-                coverage="always" if slide else "partial",
+                coverage="always" if slide or len(urls) > 1 else "partial",
                 literal_passage=quantity,
             )
             return (
@@ -2023,6 +2128,7 @@ async def record_claims(
     evidence: list[Excerpt],
     sources: list[Citation],
     dates: dict[str, date],
+    baseline: int | None = None,
 ) -> RecordAnswer:
     text = [
         EvidenceText(
@@ -2043,11 +2149,13 @@ async def record_claims(
     ):
         return RecordAnswer(measured_comparison(paired, sources))
 
-    answer = await answer_parts(state, scoped, evidence, text, sources, paired)
+    answer = await answer_parts(
+        state, scoped, evidence, text, sources, paired, baseline
+    )
     planned = bool(answer.text or answer.missing)
     if not planned:
         answer = await read_claims(
-            state, scoped, text, range(len(text)), coverage="partial"
+            state, scoped, text, range(len(text)), coverage="always"
         )
     if paired and not covers_comparison(answer.text, paired, sources):
         answer = RecordAnswer(answer.text, answer.missing).combined_with(
@@ -2114,6 +2222,7 @@ async def answer_records(
         answer, sources = direct
     else:
         evidence = precise_evidence(scoped, selection.evidence)
+        baseline = len(evidence)
         if evidence and payload.mode == "agentic":
             try:
                 async with asyncio.timeout(AGENTIC_TIMEOUT_SECONDS):
@@ -2131,7 +2240,9 @@ async def answer_records(
                 )
         sources = [citation(state, item.chunk) for item in evidence]
         record = (
-            await record_claims(state, scoped, evidence, sources, selection.dates)
+            await record_claims(
+                state, scoped, evidence, sources, selection.dates, baseline
+            )
             if evidence
             else RecordAnswer()
         )
@@ -2317,10 +2428,24 @@ async def respond_to_question(
             sources=[],
             mode_used="standard",
         )
+    record_question = question
     async with asyncio.timeout(25):
-        records = await select_records(state, scoped)
+        records = await select_records(state, question)
+        if (
+            not records.requested
+            and payload.history
+            and (
+                RECORD_FOLLOW_UP.search(question)
+                or REFERENTIAL_QUESTION.search(question)
+            )
+            and (earlier := earlier_record_scope(state, payload.history))
+        ):
+            records = await select_records(state, earlier)
+        if not records.requested and scoped != question:
+            records = await select_records(state, scoped)
+            record_question = scoped
     if records.requested:
-        return await answer_records(state, scoped, payload, records)
+        return await answer_records(state, record_question, payload, records)
     recent_hits = await retrieve_recent(state, scoped)
     membership = documented_membership(state, question, recent_hits)
     if membership is not None:

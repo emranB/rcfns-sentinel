@@ -22,6 +22,57 @@ from src.backend.tabular import count_named_rows, requested_table, table_person_
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Match a duration to its unit and keep financial phases separate.
+    def test_field_evidence_binds_requested_units_and_payment_status(self) -> None:
+        self.assertEqual(
+            field_evidence(
+                "annual hours cap for volunteers",
+                "Appointments last two years.\nA volunteer may serve up to 26 hours per year.",
+            ),
+            "A volunteer may serve up to 26 hours per year.",
+        )
+        records = "The applicant requested $8,500.\nMaximum awards may be $9,000."
+        self.assertEqual(
+            field_evidence("How much was ultimately awarded?", records), ""
+        )
+        self.assertEqual(
+            field_evidence(
+                "How much was ultimately awarded?",
+                records + "\nThe panel awarded $7,200.",
+            ),
+            "The panel awarded $7,200.",
+        )
+        self.assertEqual(
+            field_evidence(
+                "What amount does the application request?",
+                "Total cost\n$9,200\nAmount requested\n$7,200",
+            ),
+            "Amount requested\n$7,200",
+        )
+        self.assertEqual(
+            field_evidence(
+                "The review interval for that policy",
+                "Archives are kept for six years.\nReview the policy every three years.",
+            ),
+            "Review the policy every three years.",
+        )
+
+    # Literal proof for a number cannot support a claim with a different unit.
+    def test_verified_quantity_preserves_unit(self) -> None:
+        proof = "The audit took 12 hours after a two-day preparation period."
+        draft = ClaimAnswer.model_validate(
+            {
+                "claims": [
+                    {
+                        "text": "The audit took 12 days.",
+                        "proofs": [{"source": 1, "quote": proof}],
+                    }
+                ],
+                "incomplete": False,
+            }
+        )
+        self.assertEqual(verified_answer(draft, [EvidenceText("Audit", proof)]), "")
+
     # A full filename next to another filename keeps priority over its shorter suffix.
     def test_adjacent_filenames_do_not_select_a_suffix(self) -> None:
         originals = [
