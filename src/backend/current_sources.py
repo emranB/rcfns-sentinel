@@ -80,6 +80,7 @@ class DatedSource:
     title_matches: int
     folder_matches: int
     month_known: bool = True
+    day_known: bool = True
 
 
 # Treat common singular and plural forms as the same search term.
@@ -134,7 +135,7 @@ def match_source(
 ) -> DatedSource | None:
     original = PurePosixPath(path.replace("\\", "/"))
     record_date = filename_date(original.stem)
-    month_known = record_date is not None
+    day_known = month_known = record_date is not None
     if record_date is None and year_only:
         parts = (original.stem, *reversed(original.parts[:-1]))
         for index, part in enumerate(parts):
@@ -167,7 +168,14 @@ def match_source(
         proximity * len(terms) for proximity, terms in enumerate(folders, 1)
     )
     return DatedSource(
-        document_id, path, record_date, matches, len(title), folder_score, month_known
+        document_id,
+        path,
+        record_date,
+        matches,
+        len(title),
+        folder_score,
+        month_known,
+        day_known,
     )
 
 
@@ -240,7 +248,11 @@ def source_series(path: str, year: int) -> tuple[str, ...]:
 
 # Keep a comparable record series when available and cover each year's timeline.
 def dated_document_ids(
-    question: str, documents: Iterable[tuple[str, str]], *, today: date | None = None
+    question: str,
+    documents: Iterable[tuple[str, str]],
+    *,
+    today: date | None = None,
+    exact_dates_only: bool = False,
 ) -> dict[int, list[str]]:
     years = requested_years(question)
     if not years:
@@ -251,13 +263,17 @@ def dated_document_ids(
     series: dict[tuple[str, ...], list[DatedSource]] = defaultdict(list)
     for document_id, path in documents:
         source = match_source(document_id, path, topics, as_of, year_only=True)
-        if source is not None and source.record_date.year in periods:
+        if (
+            source is not None
+            and source.record_date.year in periods
+            and (source.day_known or not exact_dates_only)
+        ):
             periods[source.record_date.year].append(source)
             series[source_series(path, source.record_date.year)].append(source)
 
     recurring = []
     for records in series.values():
-        dates = {record.record_date for record in records}
+        dates = {record.record_date for record in records if record.day_known}
         if all(sum(day.year == year for day in dates) >= 2 for year in years):
             recurring.append((len(dates), records))
     if recurring:

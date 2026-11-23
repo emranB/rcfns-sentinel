@@ -1620,7 +1620,9 @@ async def dated_roll_call(
     state: RagflowSession, group: str, year: int
 ) -> RollCallRecord | None:
     periods = dated_document_ids(
-        f"{group} meeting minutes in {year}", indexed_originals(state)
+        f"{group} meeting minutes in {year}",
+        indexed_originals(state),
+        exact_dates_only=True,
     )
     with suppress(httpx.HTTPError, OSError, TimeoutError, ValueError, RuntimeError):
         async with asyncio.timeout(RECENT_SEARCH_TIMEOUT_SECONDS):

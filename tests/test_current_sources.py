@@ -20,6 +20,21 @@ class CurrentSourceTests(unittest.TestCase):
         )
         self.assertEqual(set(result[2020]), {"march", "july", "scans", "supplement"})
 
+    # Inferred dates cannot displace originals for a path that requires a specific meeting day.
+    def test_exact_record_search_excludes_month_hints(self) -> None:
+        documents = [
+            ("minutes", "Council/Meetings/2020/20201018 Council Minutes.pdf"),
+            ("march", "Council/2020/March/Council Meeting Log.pdf"),
+            ("july", "Council/2020/July/Council Meeting Log.pdf"),
+        ]
+        result = dated_document_ids(
+            "Council meeting minutes in 2020",
+            documents,
+            today=date(2021, 1, 1),
+            exact_dates_only=True,
+        )
+        self.assertEqual(result, {2020: ["minutes"]})
+
     # Keep records from both years, including older entries that fall outside a recent lookup.
     def test_comparison_covers_each_year_and_prefers_a_consistent_series(self) -> None:
         documents = [
