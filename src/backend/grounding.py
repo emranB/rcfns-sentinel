@@ -7,7 +7,8 @@ from unicodedata import normalize
 
 from pydantic import BaseModel, Field
 
-from src.backend.record_lookup import mentioned_dates
+from src.backend.current_sources import source_terms
+from src.backend.record_lookup import DATE, mentioned_dates, title_tokens
 
 NUMBER = re.compile(r"(?<![\w])([$])?([-+]?\d+(?:,\d{3})*(?:\.\d+)?)([KMBkmb])?")
 SCALE = {"k": 1000, "m": 1000000, "b": 1000000000}
@@ -78,6 +79,39 @@ KIND_EXTENSIONS = {
 }
 CONDITION = re.compile(
     r"^(except [^,.!?]{5,100}|unless [^,.!?]{5,100}),", re.IGNORECASE
+)
+QUANTITY_REQUEST = re.compile(
+    r"\b(?:how (?:many|much)|what (?:amount|value)|number of)\b", re.IGNORECASE
+)
+QUANTITY_NOISE = frozenset(
+    [
+        "about",
+        "amount",
+        "describes",
+        "document",
+        "does",
+        "executive",
+        "give",
+        "how",
+        "many",
+        "minutes",
+        "much",
+        "number",
+        "presentation",
+        "report",
+        "say",
+        "shown",
+        "slide",
+        "what",
+        "which",
+    ]
+)
+FOCUS_CLAUSE = re.compile(
+    r"\bwhat did [^?!.\n]{1,100}?\s+(?:add to|change about|say about)\s+([^?!.\n]+)",
+    re.IGNORECASE,
+)
+FOCUS_NOISE = frozenset(
+    {"goal", "plan", "change", "part", "section", "target", "document"}
 )
 
 INSTRUCTIONS = (
@@ -170,6 +204,29 @@ def qualified_sentence(
     return sentence
 
 
+# Recover a literal quantitative passage when a generated part has no valid proof.
+def quantitative_passage(question: str, text: str) -> tuple[int, str] | None:
+    subject = set(title_tokens(DATE.sub(" ", question)))
+    anchors = {word for word in subject if word.isdecimal() and len(word) <= 3}
+    if not anchors and not QUANTITY_REQUEST.search(question):
+        return None
+    terms = {word for word in subject - STOP - QUANTITY_NOISE if len(word) >= 3}
+    best = None
+    for line in text.splitlines():
+        quote = line.strip()
+        if not 12 <= len(quote) <= 480 or not NUMBER.search(quote):
+            continue
+        words = set(title_tokens(quote))
+        matched = terms & words
+        numeric = anchors & words
+        if len(matched) < 3 or (anchors and not numeric):
+            continue
+        score = len(matched) + 4 * len(numeric)
+        if best is None or score > best[0]:
+            best = (score, quote)
+    return best
+
+
 # Preserve source wording when a question asks to trace named subjects across records.
 def timeline_passages(question: str, text: str) -> list[str]:
     match = TIMELINE_SUBJECTS.search(question)
@@ -208,10 +265,16 @@ def timeline_passages(question: str, text: str) -> list[str]:
 
 
 # Return only claims with literal quotations and supported numeric or status anchors.
-def verified_answer(draft: ClaimAnswer, evidence: list[EvidenceText]) -> str:
+def verified_answer(
+    draft: ClaimAnswer, evidence: list[EvidenceText], question: str = ""
+) -> str:
     accepted = []
     incomplete = draft.incomplete
+    match = FOCUS_CLAUSE.search(question)
+    focus = source_terms(match[1]) - STOP - FOCUS_NOISE if match else set()
     for claim in draft.claims:
+        if focus and not (source_terms(claim.text) & focus):
+            continue
         if any(
             proof.source > len(evidence)
             or normalized(proof.quote)

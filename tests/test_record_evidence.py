@@ -5,12 +5,56 @@ from datetime import date
 from io import BytesIO
 from zipfile import ZipFile
 
-from src.backend.grounding import ClaimAnswer, EvidenceText, values, verified_answer
+from src.backend.grounding import (
+    ClaimAnswer,
+    EvidenceText,
+    quantitative_passage,
+    values,
+    verified_answer,
+)
 from src.backend.record_lookup import dated_references, explicit_ids, has_record_date
 from src.backend.tabular import count_named_rows, requested_table
 
 
 class RecordEvidenceTests(unittest.TestCase):
+    # Keep a version comparison focused on the requested part of the revision.
+    def test_discards_supported_but_unrelated_changes(self) -> None:
+        training = "The medical training goal increased to 100%."
+        events = "Event publications increased to 6 per year."
+        draft = ClaimAnswer.model_validate(
+            {
+                "claims": [
+                    {"text": text, "proofs": [{"source": 1, "quote": text}]}
+                    for text in (training, events)
+                ],
+                "incomplete": False,
+            }
+        )
+        answer = verified_answer(
+            draft,
+            [EvidenceText("Operations plan", f"{training}\n{events}")],
+            "What did V3 add to the medical training goals?",
+        )
+        self.assertIn(training, answer)
+        self.assertNotIn(events, answer)
+
+    # Recover the relevant fact from a literal source passage when a model omitted it.
+    def test_numeric_passages_keep_topic_and_quantity_together(self) -> None:
+        answer = quantitative_passage(
+            "What does the March 7, 2022 report say about the 12 insulated equipment sheds?",
+            "Approved 19 staff passes.\nApproved twelve kits.\n"
+            "The committee funded all 12 insulated equipment sheds for $31,400.",
+        )
+        self.assertIsNotNone(answer)
+        assert answer is not None
+        self.assertIn("$31,400", answer[1])
+        self.assertIsNone(
+            quantitative_passage(
+                "What does the report say about 12 insulated equipment sheds?",
+                "Approved 19 staff passes.",
+            )
+        )
+
     # A real quotation from one file cannot be attributed to another type of source.
     def test_rejects_proof_credited_to_a_different_document_type(self) -> None:
         line = "The new field kit weighs 8 kilograms."

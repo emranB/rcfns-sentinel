@@ -39,6 +39,7 @@ from src.backend.grounding import (
     INCOMPLETE_TEXT,
     ClaimAnswer,
     EvidenceText,
+    quantitative_passage,
     timeline_passages,
     verified_answer,
 )
@@ -1576,6 +1577,7 @@ async def checked_claims(
     *,
     limit: int = 1400,
     instructions: str = "",
+    question: str = "",
 ) -> str:
     result = await generate(
         state,
@@ -1594,7 +1596,7 @@ async def checked_claims(
         for claim in draft.claims
         if all(proof.source in allowed for proof in claim.proofs)
     ]
-    return verified_answer(draft, excerpts)
+    return verified_answer(draft, excerpts, question)
 
 
 # Generate claims using only the supplied source numbers.
@@ -1617,6 +1619,7 @@ async def read_claims(
         excerpts,
         {index + 1 for index in selected},
         limit=limit,
+        question=question,
     )
 
 
@@ -1638,8 +1641,6 @@ async def record_claims(
         for source, item in zip(sources, evidence, strict=True)
     ]
     answer = await read_claims(state, scoped, text, range(len(text)))
-    if len({source.url for source in sources}) == 1:
-        return answer
     covered = {sources[int(i) - 1].url for i in CITATION_MARKER.findall(answer)}
     missing: dict[str, list[int]] = {}
     for index, source in enumerate(sources):
@@ -1650,6 +1651,16 @@ async def record_claims(
 
     # Keep each recovery request constrained to the omitted original.
     async def fill(indices: list[int]) -> str:
+        passages = [
+            (match[0], index, match[1])
+            for index in indices
+            if (match := quantitative_passage(scoped, text[index].content)) is not None
+        ]
+        if passages:
+            _, index, passage = max(passages, key=lambda item: item[0])
+            return f"**{sources[index].name}**\n\n> {passage} [{index + 1}]"
+        if len(missing) == 1 and not answer:
+            return ""
         return await read_claims(
             state,
             f"{scoped}\n\nGive one or two findings for the part addressed by "
