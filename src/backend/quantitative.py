@@ -12,8 +12,8 @@ from src.backend.tabular import Worksheet, worksheet_tables
 
 CALCULATION_REQUEST = re.compile(
     r"\b(?:calculat\w*|comput\w*|subtract\w*|divid\w*|multiply|ratio|working capital|"
-    r"variance|percentage (?:change|of|increase|decrease)|percent change|difference|"
-    r"what (?:share|proportion|fraction) of|"
+    r"variance|percent(?:age)? (?:change|of|increase|decrease)|difference|"
+    r"(?:what|as a) (?:share|proportion|fraction) of|"
     r"how much [^?!.]{0,45}\b(?:higher|lower|more|less|change[ds]?|increas\w*|decreas\w*)|"
     r"add(?:s|ed)? up|tie(?:s)? out|reconcil(?:e|es|ed|ing))\b",
     re.IGNORECASE,
@@ -36,6 +36,29 @@ OPERATORS = {
     "share": "/",
     "percent_change": "-",
 }
+
+
+# Preserve an explicitly requested operation when the question asks for one calculation.
+def requested_operation(question: str) -> str:
+    if re.search(
+        r"\b(?:percent(?:age)? change|percent(?:age)? (?:increase|decrease))\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return ""  # A request can ask for both the amount and percent change.
+    if re.search(
+        r"\b(?:percentage|percent|share|fraction|proportion) of\b",
+        question,
+        re.IGNORECASE,
+    ) and not re.search(
+        r"\b(?:variance|above budget|below budget|in dollars)\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return "share"
+    if re.search(r"\b(?:divide|ratio)\b", question, re.IGNORECASE):
+        return "ratio"
+    return ""
 
 
 class OperandSource(BaseModel):

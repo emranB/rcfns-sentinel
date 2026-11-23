@@ -92,6 +92,7 @@ from src.backend.quantitative import (
     numeric_layout,
     numeric_workbook,
     quantity_rows,
+    requested_operation,
 )
 from src.backend.ragflow import (
     CHAT_MODEL,
@@ -1980,6 +1981,7 @@ async def quantify(
         for key in (previous.document_ids if previous else [])
         if key in originals
     ]
+    operation = requested_operation(question)
     try:
         raw = await generate(
             state,
@@ -2000,7 +2002,9 @@ async def quantify(
             "Ratio is a quotient. Share is a quotient shown as a percent. Percent_change is (new minus old) divided by old, "
             "so 'how far above budget as a percentage of budget' uses percent_change with [actual, budget]. "
             "The same measures can appear in several equations. Do not assume alternate inputs when the requested ones are unavailable.",
-            f"Conversation:\n{conversation(payload.history)}\nPrevious originals: {', '.join(references)}\nQuestion: {question}",
+            f"Conversation:\n{conversation(payload.history)}\nPrevious originals: {', '.join(references)}\n"
+            f"Question: {question}"
+            + (f"\nRequested operation: {operation}." if operation else ""),
             output_format=QuantityPlan.model_json_schema(),
             answer_tokens=1050,
             reasoning=True,
@@ -2225,10 +2229,8 @@ async def quantify(
             for index in equation.inputs
             if 1 <= index <= len(chosen) and (row := chosen[index - 1]) is not None
         ]
-        if equation.operation == "ratio" and re.search(
-            r"\b(?:percentage|percent|share|proportion) of\b", question, re.IGNORECASE
-        ):
-            equation = equation.model_copy(update={"operation": "share"})
+        if operation and len(plan.equations) == 1:
+            equation = equation.model_copy(update={"operation": operation})
         if len(bound) == len(equation.inputs) and (
             result := calculate(equation.model_copy(update={"inputs": bound}), amounts)
         ):

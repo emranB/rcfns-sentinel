@@ -12,6 +12,7 @@ from src.backend.quantitative import (
     numeric_layout,
     numeric_workbook,
     quantity_rows,
+    requested_operation,
 )
 from src.backend.tabular import Worksheet
 
@@ -57,11 +58,33 @@ class QuantityTests(unittest.TestCase):
         workbook = quantity_rows(
             "Total Payroll | West / Actual | Costs!D18 | 415.00\n"
             "Total Payroll | East / Actual | Costs!H18 | 997.00\n"
-            "Total Payroll | East / Budget | Costs!I18 | 600.00",
+            "Total Payroll | East / Budget | Costs!I18 | 600.00\n"
+            "Total Payroll | East / % of Budget | Costs!J18 | 166.17%",
             1,
         )
         payroll = Measure(row="East Actual Payroll", column="Actual", record=1)
         self.assertEqual(measure_rows(payroll, workbook, 1, ["Employee Costs"]), [2])
+        budget = Measure(row="East Payroll Budget", column="", record=1)
+        self.assertEqual(measure_rows(budget, workbook, 1, ["Employee Costs"]), [3])
+
+    # Keep a percentage request distinct from a ratio or a compound variance question.
+    def test_preserves_explicit_operation(self) -> None:
+        self.assertEqual(
+            requested_operation("Express attended visits as a share of all visits."),
+            "share",
+        )
+        self.assertEqual(
+            requested_operation(
+                "What was the ratio of tendered contracts to signed contracts?"
+            ),
+            "ratio",
+        )
+        self.assertEqual(
+            requested_operation(
+                "Give the change in dollars and as a percentage of budget."
+            ),
+            "",
+        )
 
     # Preserve merged worksheet headers and distinguish cached zero from a blank.
     def test_workbook_uses_group_and_row_labels(self) -> None:
