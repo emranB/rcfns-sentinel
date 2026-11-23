@@ -50,6 +50,43 @@ class StatementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed.adjustment(), Decimal("-55.00"))
         self.assertEqual(parsed.differences(), {})
 
+    # Keep a current-period amount even when the rightmost figure is for the prior year.
+    def test_comparative_statement_uses_current_period(self) -> None:
+        text = "\n".join(
+            [
+                "Profit and Loss",
+                "January - March, 2021",
+                f"{'TOTAL':>52}",
+                f"{'MAR. 2021':>41}{'MAR. 2020 (PY)':>23}",
+                f"{'Total Income':30}{'$5.00':>11}{'$100.00':>23}",
+                f"{'Total Expenses':30}{'$10.00':>11}{'$30.00':>23}",
+                f"{'Profit':30}{'$ -5.00':>11}{'$70.00':>23}",
+            ]
+        )
+        parsed = parse_statement(text)
+        assert parsed is not None
+        self.assertEqual(parsed.rows["income"], Decimal("5.00"))
+        self.assertEqual(parsed.rows["net"], Decimal("-5.00"))
+        self.assertEqual(parsed.differences(), {})
+
+    # Preserve a printed negative amount that wraps below its original row.
+    def test_wrapped_negative_total(self) -> None:
+        text = (
+            report(
+                "March 2021",
+                {
+                    "Total Income": "$35.00",
+                    "Total Expenses": "$50,035.00",
+                    "Profit": "$ -",
+                },
+            )
+            + f"\n{'50,000.00':>58}"
+        )
+        parsed = parse_statement(text)
+        assert parsed is not None
+        self.assertEqual(parsed.rows["net"], Decimal("-50000.00"))
+        self.assertEqual(parsed.differences(), {})
+
     # Reconcile original reports across folders and flag a real discrepancy and a missing total.
     async def test_same_annual_check_in_both_modes(self) -> None:
         question = "For 2024, do the numbers in the P/L reports add up?"

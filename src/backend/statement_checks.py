@@ -38,7 +38,11 @@ PERIOD = re.compile(
     re.IGNORECASE,
 )
 TOTAL_COLUMN = re.compile(r"(?:^| {2,})total\s*$", re.IGNORECASE)
-AMOUNT = re.compile(r"(?<!\S)(?P<value>\(?-?\$?\d[\d,]*\.\d{2}\)?)\s*$")
+COMPARISON_COLUMN = re.compile(
+    r"\((?:py|pp)\)|\b(?:previous|prior) (?:year|period)\b", re.IGNORECASE
+)
+AMOUNT = re.compile(r"(?<!\S)\(?(?:-?\$?|\$ ?-)\d[\d,]*\.\d{2}\)?(?!\S)")
+WRAPPED_NEGATIVE = re.compile(r"(?<!\S)(?:\$ ?)?-\s*$")
 ROW_NAMES = {
     "income": "income",
     "revenue": "income",
@@ -156,29 +160,64 @@ def parse_statement(text: str) -> Statement | None:
     rows: dict[str, Decimal] = {}
     conflicts: set[str] = set()
     for lines in pages:
-        column = next(
-            (len(line.rstrip()) for line in lines if TOTAL_COLUMN.search(line)), None
-        )
-        if column is None:
+        if (column := statement_column(lines)) is None:
             continue
-        for line in lines:
+        for index, line in enumerate(lines):
             label = line.lstrip().partition("  ")[0].casefold()
             total = label.startswith("total ")
             key = ROW_NAMES.get(label.removeprefix("total ").removeprefix("for "))
             if key is None or (not total and key not in DIRECT_TOTALS):
                 continue
-            match = AMOUNT.search(line)
-            if match is None or abs(match.end("value") - column) > 4:
+            following = lines[index + 1] if index + 1 < len(lines) else ""
+            if (value := statement_amount(line, following, column)) is None:
                 continue
-            raw = match["value"]
-            value = Decimal(raw.strip("()").replace("$", "").replace(",", ""))
-            if raw.startswith("(") or (label == "net loss" and value > 0):
-                value = -value
+            if label == "net loss":
+                value = -abs(value)
             if key in rows and rows[key] != value:
                 conflicts.add(key)
             rows[key] = value
     start, end = statement_period(heading)
     return Statement(start, end, rows, frozenset(conflicts))
+
+
+# Locate the current-period column when a total is split into current and prior figures.
+def statement_column(lines: list[str]) -> int | None:
+    for index, line in enumerate(lines):
+        if not TOTAL_COLUMN.search(line):
+            continue
+        following = next(
+            (row.rstrip() for row in lines[index + 1 : index + 4] if row.strip()), ""
+        )
+        if COMPARISON_COLUMN.search(following) and (
+            current := re.search(r"\S.*?(?= {2,}|$)", following)
+        ):
+            return current.end()
+        return len(line.rstrip())
+    return None
+
+
+# Read the amount aligned with the selected column, including a wrapped negative value.
+def statement_amount(line: str, following: str, column: int) -> Decimal | None:
+    if (
+        match := min(
+            AMOUNT.finditer(line),
+            key=lambda item: abs(item.end() - column),
+            default=None,
+        )
+    ) and abs(match.end() - column) <= 4:
+        raw = match[0]
+        value = Decimal(
+            raw.strip("()").replace("$", "").replace(",", "").replace(" ", "")
+        )
+        return -abs(value) if raw.startswith("(") else value
+    if (
+        WRAPPED_NEGATIVE.search(line)
+        and abs(len(line.rstrip()) - column) <= 4
+        and abs(len(following.rstrip()) - column) <= 4
+        and re.fullmatch(r"\d[\d,]*\.\d{2}", following.strip())
+    ):
+        return -Decimal(following.strip().replace(",", ""))
+    return None
 
 
 # Label whole months compactly and preserve exact partial-month or cross-year dates.
